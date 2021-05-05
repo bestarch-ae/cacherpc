@@ -1,5 +1,5 @@
-use std::borrow::Cow;
 use std::collections::HashMap;
+use std::sync::atomic::{self, AtomicU64};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,14 +15,14 @@ use tokio::sync::mpsc;
 use tokio::time::{DelayQueue, Instant};
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{value::RawValue, Value};
 
 use tracing::info;
 use tracing_subscriber;
 
 use structopt::StructOpt;
 
-const PURGE_TIMEOUT: Duration = Duration::from_secs(10);
+const PURGE_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Hash, Eq, PartialEq, Copy, Clone, Debug)]
 struct Pubkey([u8; 32]);
@@ -71,6 +71,84 @@ impl<'de> Deserialize<'de> for Pubkey {
     }
 }
 
+#[derive(Debug)]
+struct AccountData {
+    data: Bytes,
+}
+
+impl<'de> Deserialize<'de> for AccountData {
+    fn deserialize<D>(deserializer: D) -> Result<AccountData, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct AccountDataVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for AccountDataVisitor {
+            type Value = AccountData;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("[]")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let dat: &str = seq.next_element()?.ok_or_else(|| todo!())?;
+                let encoding: &str = seq.next_element()?.ok_or_else(|| todo!())?;
+                let data = match encoding {
+                    "base58" => bs58::decode(&dat).into_vec().unwrap(),
+                    "base64" => base64::decode(&dat).unwrap(),
+                    "base64+zstd" => {
+                        let vec = base64::decode(&dat).unwrap();
+                        zstd::decode_all(std::io::Cursor::new(vec)).unwrap()
+                    }
+                    _ => todo!(),
+                };
+                Ok(AccountData {
+                    data: Bytes::from(data),
+                })
+            }
+        }
+        deserializer.deserialize_seq(AccountDataVisitor)
+    }
+}
+
+impl Serialize for AccountData {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeSeq;
+        let mut seq = serializer.serialize_seq(Some(2))?;
+        seq.serialize_element(&bs58::encode(&self.data).into_string())?;
+        seq.serialize_element("base58")?;
+        seq.end()
+    }
+}
+
+#[test]
+fn data() {
+    let dat = r#"["2UzHM","base58"]"#;
+    let data: AccountData = serde_json::from_str(&dat).unwrap();
+    println!("{:?}", data);
+}
+
+#[test]
+fn kek() {
+    let dat = r#"{"data":["2UzHM","base58"],"executable":false,"lamports":918720,"owner":"pdRUarXshQQAumQ12xntHo7xppX6Au9NdSskmWpahLJ","rentEpoch":0}"#;
+    let data: AccountInfo = serde_json::from_str(&dat).unwrap();
+    println!("{:?}", data);
+}
+
+#[test]
+fn pooq() {
+    let dat = r#"{"data":["2UzHM","base58"],"executable":false,"lamports":918720,"owner":"pdRUarXshQQAumQ12xntHo7xppX6Au9NdSskmWpahLJ","rentEpoch":0}"#;
+    let val: serde_json::Value = serde_json::from_str(&dat).unwrap();
+    let data: AccountInfo = serde_json::from_value(val).unwrap();
+    println!("{:?}", data);
+}
+
 #[derive(Default, Debug)]
 struct EmptyMarker;
 
@@ -91,8 +169,7 @@ impl Serialize for EmptyMarker {
 #[serde(rename_all = "camelCase")]
 struct AccountInfo {
     lamports: u64,
-    #[serde(skip_deserializing)]
-    data: EmptyMarker,
+    data: AccountData,
     owner: Pubkey,
     executable: bool,
     rent_epoch: u64,
@@ -115,15 +192,34 @@ struct State {
     client: Client,
     tx: Addr<AccountUpdateManager>,
     rpc_url: String,
+    slot: Arc<AtomicU64>,
 }
 
+impl std::fmt::Debug for State {
+    fn fmt(&self, w: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        w.write_str("State{}")
+    }
+}
+
+impl State {
+    fn get(&self, key: &Pubkey) -> Option<dashmap::mapref::one::Ref<'_, Pubkey, AccountContext>> {
+        let tx = &self.tx;
+        self.map.get(key).map(|v| {
+            tx.do_send(AccountCommand::Reset(*key));
+            v
+        })
+    }
+}
+
+#[tracing::instrument]
 async fn handler(body: Bytes, app_state: web::Data<State>) -> Result<HttpResponse, Error> {
     #[derive(Deserialize, Serialize, Debug)]
     struct Request<'a> {
-        jsonrpc: Cow<'a, str>,
+        jsonrpc: &'a str,
         id: u64,
-        method: Cow<'a, str>,
-        params: [Value; 2],
+        method: &'a str,
+        #[serde(borrow)]
+        params: [&'a RawValue; 2],
     }
     let req: Request = serde_json::from_slice(&body).unwrap();
 
@@ -133,26 +229,30 @@ async fn handler(body: Bytes, app_state: web::Data<State>) -> Result<HttpRespons
         "getAccountInfo" => {
             #[derive(Deserialize, Serialize, Debug)]
             struct Params<'a> {
-                encoding: Cow<'a, str>,
-                commitment: Option<Cow<'a, str>>,
+                encoding: &'a str,
+                commitment: &'a str,
             }
-            let pubkey = match &req.params[0] {
-                Value::String(pubkey) => {
-                    let mut buf = [0; 32];
-                    bs58::decode(&pubkey).into(&mut buf).unwrap();
-                    Pubkey(buf)
-                }
-                _ => panic!(),
+            let param: &str = serde_json::from_str(req.params[0].get()).unwrap();
+            let pubkey = {
+                let mut buf = [0; 32];
+                bs58::decode(&param).into(&mut buf).unwrap();
+                Pubkey(buf)
             };
 
-            match app_state.map.get(&pubkey) {
+            match app_state.get(&pubkey) {
                 Some(data) => {
                     let data = data.value();
-                    let resp = serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "result": data,
-                        "id": req.id,
-                    });
+                    #[derive(Serialize)]
+                    struct Resp<'a> {
+                        jsonrpc: &'a str,
+                        result: &'a AccountContext,
+                        id: u64,
+                    }
+                    let resp = Resp {
+                        jsonrpc: "2.0",
+                        result: data,
+                        id: req.id,
+                    };
 
                     info!("cache hit for {}", pubkey);
                     return Ok(HttpResponse::Ok()
@@ -178,25 +278,26 @@ async fn handler(body: Bytes, app_state: web::Data<State>) -> Result<HttpRespons
         .send_json(&req)
         .await
         .unwrap();
-    let resp: Value = resp.json().await.unwrap();
+    let resp = resp.body().await.unwrap();
 
     if let Some(pubkey) = cacheable_for_key {
-        #[derive(Deserialize, Serialize, Debug)]
+        #[derive(Deserialize)]
         struct Resp {
             result: AccountContext,
         }
-        let info: Resp = serde_json::from_value(resp.clone()).unwrap();
+        let info: Resp = serde_json::from_slice(&resp).unwrap();
         app_state.map.insert(pubkey, info.result);
     }
 
     Ok(HttpResponse::Ok()
         .content_type("application/json")
-        .json(&resp))
+        .body(resp))
 }
 
 enum InflightRequest {
     Sub(Pubkey),
     Unsub(Pubkey),
+    SlotSub(u64),
 }
 
 struct AccountUpdateManager {
@@ -213,9 +314,25 @@ struct AccountUpdateManager {
     >,
     map: Arc<DashMap<Pubkey, AccountContext>>,
     purge_queue: DelayQueueHandle<Pubkey>,
+    slot: Arc<AtomicU64>,
+}
+
+impl std::fmt::Debug for AccountUpdateManager {
+    fn fmt(&self, w: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        w.write_str("AccountUpdateManager{}")
+    }
+}
+
+impl AccountUpdateManager {
+    fn next_request_id(&mut self) -> u64 {
+        let request_id = self.request_id;
+        self.request_id += 1;
+        request_id
+    }
 }
 
 impl StreamHandler<AccountCommand> for AccountUpdateManager {
+    #[tracing::instrument]
     fn handle(&mut self, item: AccountCommand, ctx: &mut Context<Self>) {
         <Self as Handler<AccountCommand>>::handle(self, item, ctx)
     }
@@ -224,9 +341,9 @@ impl StreamHandler<AccountCommand> for AccountUpdateManager {
 impl Handler<AccountCommand> for AccountUpdateManager {
     type Result = ();
 
+    #[tracing::instrument]
     fn handle(&mut self, item: AccountCommand, _ctx: &mut Context<Self>) {
-        let request_id = self.request_id;
-        self.request_id += 1;
+        let request_id = self.next_request_id();
         match item {
             AccountCommand::Subscribe(key) => {
                 info!("subscribe to {}", key);
@@ -259,69 +376,89 @@ impl Handler<AccountCommand> for AccountUpdateManager {
                 }
                 self.map.remove(&key);
             }
+            AccountCommand::Reset(key) => {
+                self.purge_queue.reset(key, PURGE_TIMEOUT);
+            }
         }
     }
 }
 
 impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
+    #[tracing::instrument]
     fn handle(&mut self, item: awc::ws::Frame, _ctx: &mut Context<Self>) {
         use awc::ws::Frame;
         match item {
             Frame::Text(text) => {
-                let value: serde_json::Value = serde_json::from_slice(&text).unwrap();
-                match &value {
-                    serde_json::Value::Object(obj) => {
-                        if obj.get("result").is_some() {
-                            #[derive(Deserialize)]
-                            struct Res {
-                                result: serde_json::Value,
-                                id: u64,
+                #[derive(Deserialize)]
+                struct AnyMessage<'a> {
+                    #[serde(borrow)]
+                    result: Option<&'a RawValue>,
+                    #[serde(borrow)]
+                    method: Option<&'a str>,
+                    id: Option<u64>,
+                    #[serde(borrow)]
+                    params: Option<&'a RawValue>,
+                }
+                let value: AnyMessage = serde_json::from_slice(&text).unwrap();
+                // subscription response
+                if let (Some(result), Some(id)) = (value.result, value.id) {
+                    if let Some(req) = self.inflight.remove(&id) {
+                        match req {
+                            InflightRequest::Sub(key) => {
+                                let sub_id: u64 = serde_json::from_str(result.get()).unwrap();
+                                self.sub_to_key.insert(sub_id, key);
+                                self.key_to_sub.insert(key, sub_id);
+                                info!(message = "subscribed to stream", sub = sub_id, key = %key);
                             }
-                            let res: Res = serde_json::from_value(value).unwrap();
-                            if let Some(req) = self.inflight.remove(&res.id) {
-                                match req {
-                                    InflightRequest::Sub(key) => {
-                                        let sub_id: u64 =
-                                            serde_json::from_value(res.result).unwrap();
-                                        self.sub_to_key.insert(sub_id, key);
-                                        self.key_to_sub.insert(key, sub_id);
-                                        info!(message = "subscribed to stream", sub = sub_id, key = %key);
-                                    }
-                                    InflightRequest::Unsub(key) => {
-                                        let _is_ok: bool =
-                                            serde_json::from_value(res.result).unwrap();
-                                        if let Some(sub) = self.key_to_sub.remove(&key) {
-                                            self.sub_to_key.remove(&sub);
-                                            info!(
-                                                message = "unsubscribed from stream",
-                                                sub = sub,
-                                                key = %key,
-                                            );
-                                        }
-                                    }
+                            InflightRequest::Unsub(key) => {
+                                //let _is_ok: bool = serde_json::from_str(result.get()).unwrap();
+                                if let Some(sub) = self.key_to_sub.remove(&key) {
+                                    self.sub_to_key.remove(&sub);
+                                    info!(
+                                        message = "unsubscribed from stream",
+                                        sub = sub,
+                                        key = %key,
+                                    );
                                 }
                             }
+                            InflightRequest::SlotSub(_) => {
+                                info!(message = "subscribed to slot");
+                            }
+                        }
+                    }
 
-                            // TODO: method response
-                            return;
-                        };
-                        if obj.get("method").is_some() {
+                    // TODO: method response
+                    return;
+                };
+                // notification
+                if let (Some(method), Some(params)) = (value.method, value.params) {
+                    match method {
+                        "accountNotification" => {
                             #[derive(Deserialize)]
                             struct Params {
                                 result: AccountContext,
                                 subscription: u64,
                             }
-                            #[derive(Deserialize)]
-                            struct Notification {
-                                params: Params,
-                            }
-                            let resp: Notification = serde_json::from_value(value).unwrap();
-                            if let Some(key) = self.sub_to_key.get(&resp.params.subscription) {
-                                self.map.insert(*key, resp.params.result);
+                            let params: Params = serde_json::from_str(params.get()).unwrap();
+                            if let Some(key) = self.sub_to_key.get(&params.subscription) {
+                                self.map.insert(*key, params.result);
                             }
                         }
+                        "slotNotification" => {
+                            #[derive(Deserialize)]
+                            struct SlotInfo {
+                                slot: u64,
+                            }
+                            #[derive(Deserialize)]
+                            struct Params {
+                                result: SlotInfo,
+                            }
+                            let params: Params = serde_json::from_str(params.get()).unwrap();
+                            let slot = params.result.slot;
+                            self.slot.store(slot, atomic::Ordering::SeqCst);
+                        }
+                        _ => {}
                     }
-                    _ => return,
                 }
             }
             _ => return,
@@ -332,7 +469,21 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
 impl Actor for AccountUpdateManager {
     type Context = Context<Self>;
 
-    fn started(&mut self, _ctx: &mut Context<Self>) {}
+    #[tracing::instrument]
+    fn started(&mut self, _ctx: &mut Context<Self>) {
+        // subscribe to slots
+        let request_id = self.next_request_id();
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "slotSubscribe",
+        });
+        self.inflight
+            .insert(request_id, InflightRequest::SlotSub(request_id));
+        self.sink.write(awc::ws::Message::Text(
+            serde_json::to_string(&request).unwrap(),
+        ));
+    }
 }
 
 impl actix::io::WriteHandler<awc::error::WsProtocolError> for AccountUpdateManager {}
@@ -341,6 +492,7 @@ impl actix::io::WriteHandler<awc::error::WsProtocolError> for AccountUpdateManag
 #[rtype(result = "()")]
 enum AccountCommand {
     Subscribe(Pubkey),
+    Reset(Pubkey),
     Purge(Pubkey),
 }
 
@@ -350,20 +502,32 @@ fn make_client() -> Client {
         .finish()
 }
 
-struct DelayQueueHandle<T>(mpsc::UnboundedSender<(T, Instant)>);
+enum DelayQueueCommand<T> {
+    Insert(T, Instant),
+    Reset(T, Instant),
+}
+
+struct DelayQueueHandle<T>(mpsc::UnboundedSender<DelayQueueCommand<T>>);
 
 impl<T> DelayQueueHandle<T> {
     fn insert_at(&self, item: T, time: Instant) {
-        let _ = self.0.send((item, time));
+        let _ = self.0.send(DelayQueueCommand::Insert(item, time));
     }
 
     fn insert(&self, item: T, dur: Duration) {
         self.insert_at(item, Instant::now() + dur)
     }
+
+    fn reset(&self, item: T, dur: Duration) {
+        let _ = self
+            .0
+            .send(DelayQueueCommand::Reset(item, Instant::now() + dur));
+    }
 }
 
-fn delay_queue<T>() -> (DelayQueueHandle<T>, impl Stream<Item = T>) {
-    let (sender, incoming) = mpsc::unbounded_channel();
+fn delay_queue<T: Clone + std::hash::Hash + Eq>() -> (DelayQueueHandle<T>, impl Stream<Item = T>) {
+    let (sender, incoming) = mpsc::unbounded_channel::<DelayQueueCommand<T>>();
+    let mut map: HashMap<T, _> = HashMap::default();
     let stream = stream_generator::generate_stream(|mut stream| async move {
         let mut delay_queue = DelayQueue::new();
         tokio::pin!(incoming);
@@ -371,8 +535,17 @@ fn delay_queue<T>() -> (DelayQueueHandle<T>, impl Stream<Item = T>) {
         loop {
             tokio::select! {
                 item = incoming.next() => {
-                    if let Some((item, time)) = item {
-                        delay_queue.insert_at(item, time);
+                    if let Some(item) = item {
+                        match item {
+                            DelayQueueCommand::Insert(item, time) => {
+                                map.insert(item.clone(), delay_queue.insert_at(item, time));
+                            },
+                            DelayQueueCommand::Reset(item, time) => {
+                                if let Some(key) = map.remove(&item) {
+                                    delay_queue.reset_at(&key, time);
+                                }
+                            }
+                        }
                     } else {
                         break;
                     }
@@ -420,8 +593,7 @@ async fn main() {
 
 async fn run(options: Options) {
     let map = Arc::new(DashMap::new());
-
-    //let (tx, rx) = mpsc::unbounded_channel();
+    let current_slot = Arc::new(AtomicU64::new(0));
 
     let (_, conn) = make_client().ws(&options.ws_url).connect().await.unwrap();
 
@@ -436,7 +608,6 @@ async fn run(options: Options) {
         let sink = SinkWrite::new(sink, ctx);
         AccountUpdateManager::add_stream(stream, ctx);
         AccountUpdateManager::add_stream(purge_stream, ctx);
-        //AccountUpdateManager::add_stream(rx, ctx);
         AccountUpdateManager {
             sink,
             sub_to_key: HashMap::default(),
@@ -445,6 +616,7 @@ async fn run(options: Options) {
             request_id: 1,
             map: map.clone(),
             purge_queue: handle,
+            slot: current_slot.clone(),
         }
     });
 
@@ -455,6 +627,7 @@ async fn run(options: Options) {
             client: Client::default(),
             tx: addr.clone(),
             rpc_url: rpc_url.clone(),
+            slot: current_slot.clone(),
         };
         App::new()
             .data(state)
