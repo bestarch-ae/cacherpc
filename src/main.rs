@@ -149,18 +149,72 @@ fn pooq() {
     println!("{:?}", data);
 }
 
-#[derive(Default, Debug)]
-struct EmptyMarker;
+#[derive(Serialize, Debug, Deserialize, Copy, Clone)]
+enum Encoding {
+    #[serde(rename = "base58")]
+    Base58,
+    #[serde(rename = "base64")]
+    Base64,
+    #[serde(rename = "base64+zstd")]
+    Base64Zstd,
+}
 
-impl Serialize for EmptyMarker {
+impl Encoding {
+    fn with_account_data(self, data: &'_ AccountData) -> EncodedAccountData<'_> {
+        EncodedAccountData {
+            encoding: self,
+            data,
+            slice: None,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct EncodedAccountData<'a> {
+    encoding: Encoding,
+    data: &'a AccountData,
+    slice: Option<Slice>,
+}
+
+impl EncodedAccountData<'_> {
+    fn slice(self, slice: Option<Slice>) -> Self {
+        EncodedAccountData {
+            encoding: self.encoding,
+            data: self.data,
+            slice,
+        }
+    }
+}
+
+impl<'a> Serialize for EncodedAccountData<'a> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
         use serde::ser::SerializeSeq;
         let mut seq = serializer.serialize_seq(Some(2))?;
-        seq.serialize_element("")?;
-        seq.serialize_element("base58")?;
+        let data = if let Some(slice) = &self.slice {
+            self.data
+                .data
+                .get(slice.offset..slice.offset + slice.length)
+                .unwrap_or_else(|| todo!())
+        } else {
+            &self.data.data[..]
+        };
+        match self.encoding {
+            Encoding::Base58 => {
+                seq.serialize_element(&bs58::encode(&data).into_string())?;
+            }
+            Encoding::Base64 => {
+                seq.serialize_element(&base64::encode(&data))?;
+            }
+            Encoding::Base64Zstd => {
+                seq.serialize_element(&base64::encode(
+                    zstd::encode_all(std::io::Cursor::new(&data), 0).unwrap(),
+                ))?;
+            }
+        }
+        seq.serialize_element(&self.encoding)?;
         seq.end()
     }
 }
@@ -175,6 +229,43 @@ struct AccountInfo {
     rent_epoch: u64,
 }
 
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct EncodedAccountInfo<'a> {
+    lamports: u64,
+    data: EncodedAccountData<'a>,
+    owner: Pubkey,
+    executable: bool,
+    rent_epoch: u64,
+}
+
+impl<'a> EncodedAccountInfo<'a> {
+    fn with_context(self, ctx: &'a SolanaContext) -> EncodedAccountContext<'a> {
+        EncodedAccountContext {
+            value: self,
+            context: ctx,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct Slice {
+    offset: usize,
+    length: usize,
+}
+
+impl AccountInfo {
+    fn encode(&self, encoding: Encoding, slice: Option<Slice>) -> EncodedAccountInfo {
+        EncodedAccountInfo {
+            lamports: self.lamports,
+            owner: self.owner,
+            executable: self.executable,
+            rent_epoch: self.rent_epoch,
+            data: encoding.with_account_data(&self.data).slice(slice),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 struct SolanaContext {
     slot: u64,
@@ -184,6 +275,12 @@ struct SolanaContext {
 struct AccountContext {
     context: SolanaContext,
     value: AccountInfo,
+}
+
+#[derive(Serialize, Debug)]
+struct EncodedAccountContext<'a> {
+    context: &'a SolanaContext,
+    value: EncodedAccountInfo<'a>,
 }
 
 #[derive(Clone)]
@@ -211,7 +308,6 @@ impl State {
     }
 }
 
-#[tracing::instrument]
 async fn handler(body: Bytes, app_state: web::Data<State>) -> Result<HttpResponse, Error> {
     #[derive(Deserialize, Serialize, Debug)]
     struct Request<'a> {
@@ -227,10 +323,12 @@ async fn handler(body: Bytes, app_state: web::Data<State>) -> Result<HttpRespons
 
     match req.method.as_ref() {
         "getAccountInfo" => {
-            #[derive(Deserialize, Serialize, Debug)]
-            struct Params<'a> {
-                encoding: &'a str,
-                commitment: &'a str,
+            #[derive(Deserialize, Debug)]
+            struct Config<'a> {
+                encoding: Encoding,
+                commitment: Option<&'a str>,
+                #[serde(rename = "dataSlice")]
+                data_slice: Option<Slice>,
             }
             let param: &str = serde_json::from_str(req.params[0].get()).unwrap();
             let pubkey = {
@@ -238,6 +336,7 @@ async fn handler(body: Bytes, app_state: web::Data<State>) -> Result<HttpRespons
                 bs58::decode(&param).into(&mut buf).unwrap();
                 Pubkey(buf)
             };
+            let config: Config = serde_json::from_str(req.params[1].get()).unwrap();
 
             match app_state.get(&pubkey) {
                 Some(data) => {
@@ -245,12 +344,15 @@ async fn handler(body: Bytes, app_state: web::Data<State>) -> Result<HttpRespons
                     #[derive(Serialize)]
                     struct Resp<'a> {
                         jsonrpc: &'a str,
-                        result: &'a AccountContext,
+                        result: EncodedAccountContext<'a>, //AccountContext,
                         id: u64,
                     }
                     let resp = Resp {
                         jsonrpc: "2.0",
-                        result: data,
+                        result: data
+                            .value
+                            .encode(config.encoding, config.data_slice)
+                            .with_context(&data.context),
                         id: req.id,
                     };
 
@@ -260,7 +362,9 @@ async fn handler(body: Bytes, app_state: web::Data<State>) -> Result<HttpRespons
                         .json(&resp));
                 }
                 None => {
-                    cacheable_for_key = Some(pubkey);
+                    if config.data_slice.is_none() {
+                        cacheable_for_key = Some(pubkey);
+                    }
                     app_state
                         .tx
                         .send(AccountCommand::Subscribe(pubkey))
@@ -332,7 +436,6 @@ impl AccountUpdateManager {
 }
 
 impl StreamHandler<AccountCommand> for AccountUpdateManager {
-    #[tracing::instrument]
     fn handle(&mut self, item: AccountCommand, ctx: &mut Context<Self>) {
         <Self as Handler<AccountCommand>>::handle(self, item, ctx)
     }
@@ -341,7 +444,6 @@ impl StreamHandler<AccountCommand> for AccountUpdateManager {
 impl Handler<AccountCommand> for AccountUpdateManager {
     type Result = ();
 
-    #[tracing::instrument]
     fn handle(&mut self, item: AccountCommand, _ctx: &mut Context<Self>) {
         let request_id = self.next_request_id();
         match item {
@@ -384,7 +486,6 @@ impl Handler<AccountCommand> for AccountUpdateManager {
 }
 
 impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
-    #[tracing::instrument]
     fn handle(&mut self, item: awc::ws::Frame, _ctx: &mut Context<Self>) {
         use awc::ws::Frame;
         match item {
@@ -469,7 +570,6 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
 impl Actor for AccountUpdateManager {
     type Context = Context<Self>;
 
-    #[tracing::instrument]
     fn started(&mut self, _ctx: &mut Context<Self>) {
         // subscribe to slots
         let request_id = self.next_request_id();
