@@ -1,17 +1,28 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use actix::io::SinkWrite;
-use actix::prelude::{Actor, Context, Message, StreamHandler};
+use actix::prelude::{Actor, Addr, Context, Handler, Message, StreamHandler};
 use actix_web::{web, App, Error, HttpResponse, HttpServer};
+
 use awc::Client;
 use bytes::Bytes;
 use dashmap::DashMap;
+use tokio::stream::{Stream, StreamExt};
 use tokio::sync::mpsc;
+use tokio::time::{DelayQueue, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use tracing::info;
+use tracing_subscriber;
+
+use structopt::StructOpt;
+
+const PURGE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Hash, Eq, PartialEq, Copy, Clone, Debug)]
 struct Pubkey([u8; 32]);
@@ -102,7 +113,8 @@ struct AccountContext {
 struct State {
     map: Arc<DashMap<Pubkey, AccountContext>>,
     client: Client,
-    tx: mpsc::UnboundedSender<AccountCommand>,
+    tx: Addr<AccountUpdateManager>,
+    rpc_url: String,
 }
 
 async fn handler(body: Bytes, app_state: web::Data<State>) -> Result<HttpResponse, Error> {
@@ -115,7 +127,7 @@ async fn handler(body: Bytes, app_state: web::Data<State>) -> Result<HttpRespons
     }
     let req: Request = serde_json::from_slice(&body).unwrap();
 
-    let mut save_for_pubkey = None;
+    let mut cacheable_for_key = None;
 
     match req.method.as_ref() {
         "getAccountInfo" => {
@@ -137,21 +149,22 @@ async fn handler(body: Bytes, app_state: web::Data<State>) -> Result<HttpRespons
                 Some(data) => {
                     let data = data.value();
                     let resp = serde_json::json!({
-                        "id": req.id,
                         "jsonrpc": "2.0",
                         "result": data,
+                        "id": req.id,
                     });
 
-                    println!("cache hit");
+                    info!("cache hit for {}", pubkey);
                     return Ok(HttpResponse::Ok()
                         .content_type("application/json")
-                        .body(serde_json::to_string(&resp).unwrap()));
+                        .json(&resp));
                 }
                 None => {
-                    save_for_pubkey = Some(pubkey);
+                    cacheable_for_key = Some(pubkey);
                     app_state
                         .tx
                         .send(AccountCommand::Subscribe(pubkey))
+                        .await
                         .unwrap();
                 }
             }
@@ -161,13 +174,13 @@ async fn handler(body: Bytes, app_state: web::Data<State>) -> Result<HttpRespons
 
     let client = &app_state.client;
     let mut resp = client
-        .post("https://solana-api.projectserum.com")
+        .post(&app_state.rpc_url)
         .send_json(&req)
         .await
         .unwrap();
     let resp: Value = resp.json().await.unwrap();
 
-    if let Some(pubkey) = save_for_pubkey {
+    if let Some(pubkey) = cacheable_for_key {
         #[derive(Deserialize, Serialize, Debug)]
         struct Resp {
             result: AccountContext,
@@ -178,13 +191,19 @@ async fn handler(body: Bytes, app_state: web::Data<State>) -> Result<HttpRespons
 
     Ok(HttpResponse::Ok()
         .content_type("application/json")
-        .body(serde_json::to_string(&resp).unwrap()))
+        .json(&resp))
+}
+
+enum InflightRequest {
+    Sub(Pubkey),
+    Unsub(Pubkey),
 }
 
 struct AccountUpdateManager {
     request_id: u64,
-    inflight: HashMap<u64, Pubkey>,
-    subscriptions: HashMap<u64, Pubkey>,
+    inflight: HashMap<u64, InflightRequest>,
+    sub_to_key: HashMap<u64, Pubkey>,
+    key_to_sub: HashMap<Pubkey, u64>,
     sink: SinkWrite<
         awc::ws::Message,
         futures_util::stream::SplitSink<
@@ -193,26 +212,52 @@ struct AccountUpdateManager {
         >,
     >,
     map: Arc<DashMap<Pubkey, AccountContext>>,
+    purge_queue: DelayQueueHandle<Pubkey>,
 }
 
 impl StreamHandler<AccountCommand> for AccountUpdateManager {
+    fn handle(&mut self, item: AccountCommand, ctx: &mut Context<Self>) {
+        <Self as Handler<AccountCommand>>::handle(self, item, ctx)
+    }
+}
+
+impl Handler<AccountCommand> for AccountUpdateManager {
+    type Result = ();
+
     fn handle(&mut self, item: AccountCommand, _ctx: &mut Context<Self>) {
-        println!("command: {:?}", item);
         let request_id = self.request_id;
         self.request_id += 1;
         match item {
             AccountCommand::Subscribe(key) => {
-                let param = bs58::encode(key.0).into_string();
+                info!("subscribe to {}", key);
                 let request = serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": request_id,
                     "method": "accountSubscribe",
-                    "params": [ param ],
+                    "params": [ key ],
                 });
-                self.inflight.insert(request_id, key);
+                self.inflight.insert(request_id, InflightRequest::Sub(key));
                 self.sink.write(awc::ws::Message::Text(
                     serde_json::to_string(&request).unwrap(),
                 ));
+                self.purge_queue.insert(key, PURGE_TIMEOUT);
+            }
+            AccountCommand::Purge(key) => {
+                info!("purging {}", key);
+                if let Some(sub_id) = self.key_to_sub.get(&key) {
+                    let request = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "method": "accountUnsubscribe",
+                        "params": [ sub_id ],
+                    });
+                    self.inflight
+                        .insert(request_id, InflightRequest::Unsub(key));
+                    self.sink.write(awc::ws::Message::Text(
+                        serde_json::to_string(&request).unwrap(),
+                    ));
+                }
+                self.map.remove(&key);
             }
         }
     }
@@ -220,7 +265,6 @@ impl StreamHandler<AccountCommand> for AccountUpdateManager {
 
 impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
     fn handle(&mut self, item: awc::ws::Frame, _ctx: &mut Context<Self>) {
-        println!("frame: {:?}", item);
         use awc::ws::Frame;
         match item {
             Frame::Text(text) => {
@@ -230,13 +274,32 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
                         if obj.get("result").is_some() {
                             #[derive(Deserialize)]
                             struct Res {
-                                result: u64,
+                                result: serde_json::Value,
                                 id: u64,
                             }
                             let res: Res = serde_json::from_value(value).unwrap();
-                            if let Some(key) = self.inflight.remove(&res.id) {
-                                self.subscriptions.insert(res.result, key);
-                                println!("subscribed to stream #{} for {}", res.result, key);
+                            if let Some(req) = self.inflight.remove(&res.id) {
+                                match req {
+                                    InflightRequest::Sub(key) => {
+                                        let sub_id: u64 =
+                                            serde_json::from_value(res.result).unwrap();
+                                        self.sub_to_key.insert(sub_id, key);
+                                        self.key_to_sub.insert(key, sub_id);
+                                        info!(message = "subscribed to stream", sub = sub_id, key = %key);
+                                    }
+                                    InflightRequest::Unsub(key) => {
+                                        let _is_ok: bool =
+                                            serde_json::from_value(res.result).unwrap();
+                                        if let Some(sub) = self.key_to_sub.remove(&key) {
+                                            self.sub_to_key.remove(&sub);
+                                            info!(
+                                                message = "unsubscribed from stream",
+                                                sub = sub,
+                                                key = %key,
+                                            );
+                                        }
+                                    }
+                                }
                             }
 
                             // TODO: method response
@@ -253,7 +316,7 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
                                 params: Params,
                             }
                             let resp: Notification = serde_json::from_value(value).unwrap();
-                            if let Some(key) = self.subscriptions.get(&resp.params.subscription) {
+                            if let Some(key) = self.sub_to_key.get(&resp.params.subscription) {
                                 self.map.insert(*key, resp.params.result);
                             }
                         }
@@ -278,6 +341,7 @@ impl actix::io::WriteHandler<awc::error::WsProtocolError> for AccountUpdateManag
 #[rtype(result = "()")]
 enum AccountCommand {
     Subscribe(Pubkey),
+    Purge(Pubkey),
 }
 
 fn make_client() -> Client {
@@ -286,45 +350,117 @@ fn make_client() -> Client {
         .finish()
 }
 
+struct DelayQueueHandle<T>(mpsc::UnboundedSender<(T, Instant)>);
+
+impl<T> DelayQueueHandle<T> {
+    fn insert_at(&self, item: T, time: Instant) {
+        let _ = self.0.send((item, time));
+    }
+
+    fn insert(&self, item: T, dur: Duration) {
+        self.insert_at(item, Instant::now() + dur)
+    }
+}
+
+fn delay_queue<T>() -> (DelayQueueHandle<T>, impl Stream<Item = T>) {
+    let (sender, incoming) = mpsc::unbounded_channel();
+    let stream = stream_generator::generate_stream(|mut stream| async move {
+        let mut delay_queue = DelayQueue::new();
+        tokio::pin!(incoming);
+
+        loop {
+            tokio::select! {
+                item = incoming.next() => {
+                    if let Some((item, time)) = item {
+                        delay_queue.insert_at(item, time);
+                    } else {
+                        break;
+                    }
+                }
+                out = delay_queue.next(), if !delay_queue.is_empty() => {
+                    if let Some(Ok(out)) = out {
+                        stream.send(out.into_inner()).await;
+                    }
+                }
+            }
+        }
+    });
+    (DelayQueueHandle(sender), stream)
+}
+
+#[derive(Debug, structopt::StructOpt)]
+struct Options {
+    #[structopt(
+        short = "w",
+        long = "websocket-url",
+        default_value = "wss://solana-api.projectserum.com"
+    )]
+    ws_url: String,
+    #[structopt(
+        short = "r",
+        long = "rpc-api-url",
+        default_value = "https://solana-api.projectserum.com"
+    )]
+    rpc_url: String,
+    #[structopt(short = "l", long = "listen", default_value = "127.0.0.1:8080")]
+    addr: String,
+}
+
 #[actix_web::main]
 async fn main() {
-    use tokio::stream::StreamExt;
+    let options = Options::from_args();
+
+    let subscriber = tracing_subscriber::FmtSubscriber::new();
+    tracing::subscriber::set_global_default(subscriber).unwrap();
+
+    info!("options: {:?}", options);
+
+    run(options).await;
+}
+
+async fn run(options: Options) {
     let map = Arc::new(DashMap::new());
 
-    let (tx, rx) = mpsc::unbounded_channel();
+    //let (tx, rx) = mpsc::unbounded_channel();
 
-    let (_, conn) = make_client()
-        .ws("wss://solana-api.projectserum.com")
-        .connect()
-        .await
-        .unwrap();
+    let (_, conn) = make_client().ws(&options.ws_url).connect().await.unwrap();
 
-    let _addr = AccountUpdateManager::create(|ctx| {
-        AccountUpdateManager::add_stream(rx, ctx);
+    info!("connected to websocket rpc @ {}", options.ws_url);
+
+    let (handle, stream) = delay_queue();
+    let purge_stream = stream.map(|item| AccountCommand::Purge(item));
+
+    let addr = AccountUpdateManager::create(|ctx| {
         let (sink, stream) = futures_util::stream::StreamExt::split(conn);
         let (sink, stream) = (sink, stream.filter_map(Result::ok));
         let sink = SinkWrite::new(sink, ctx);
         AccountUpdateManager::add_stream(stream, ctx);
+        AccountUpdateManager::add_stream(purge_stream, ctx);
+        //AccountUpdateManager::add_stream(rx, ctx);
         AccountUpdateManager {
             sink,
-            subscriptions: HashMap::default(),
+            sub_to_key: HashMap::default(),
+            key_to_sub: HashMap::default(),
             inflight: HashMap::default(),
             request_id: 1,
             map: map.clone(),
+            purge_queue: handle,
         }
     });
 
+    let rpc_url = options.rpc_url;
     HttpServer::new(move || {
         let state = State {
             map: map.clone(),
             client: Client::default(),
-            tx: tx.clone(),
+            tx: addr.clone(),
+            rpc_url: rpc_url.clone(),
         };
         App::new()
             .data(state)
             .service(web::resource("/").route(web::post().to(handler)))
     })
-    .bind("127.0.0.1:8080")
+    .bind(options.addr)
     .unwrap()
     .run()
     .await
