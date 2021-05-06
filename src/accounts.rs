@@ -226,14 +226,17 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
                             "slotNotification" => {
                                 #[derive(Deserialize)]
                                 struct SlotInfo {
-                                    slot: u64,
+                                    //slot: u64,
+                                    root: u64,
+                                    //parent: u64,
                                 }
                                 #[derive(Deserialize)]
                                 struct Params {
                                     result: SlotInfo,
                                 }
                                 let params: Params = serde_json::from_str(params.get())?;
-                                let slot = params.result.slot;
+                                //info!("slot {} root {} parent {}", params.result.slot, params.result.root, params.result.parent);
+                                let slot = params.result.root - 1; // TODO: figure out which slot validator *actually* reports
                                 self.slot.store(slot, atomic::Ordering::SeqCst);
                             }
                             _ => {}
