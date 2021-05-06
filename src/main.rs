@@ -17,7 +17,7 @@ use tokio::time::{DelayQueue, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::{value::RawValue, Value};
 
-use tracing::info;
+use tracing::{error, info};
 use tracing_subscriber;
 
 use structopt::StructOpt;
@@ -38,8 +38,11 @@ impl Serialize for Pubkey {
     where
         S: serde::Serializer,
     {
+        use serde::ser::Error;
         let mut buf = [0; 64];
-        let len = bs58::encode(self.0).into(&mut buf[..]).unwrap();
+        let len = bs58::encode(self.0)
+            .into(&mut buf[..])
+            .map_err(|_| Error::custom("can't b58encode"))?;
         serializer.serialize_str(unsafe { std::str::from_utf8_unchecked(&buf[..len]) })
     }
 }
@@ -61,8 +64,11 @@ impl<'de> Deserialize<'de> for Pubkey {
             where
                 E: serde::de::Error,
             {
+                use serde::de::Error;
                 let mut buf = [0; 32];
-                bs58::decode(v).into(&mut buf).unwrap();
+                bs58::decode(v)
+                    .into(&mut buf)
+                    .map_err(|_| Error::custom("can't b58decode"))?;
                 Ok(Pubkey(buf))
             }
         }
@@ -94,16 +100,17 @@ impl<'de> Deserialize<'de> for AccountData {
             where
                 A: serde::de::SeqAccess<'de>,
             {
+                let err = || serde::de::Error::custom("can't decode");
                 let dat: &str = seq.next_element()?.ok_or_else(|| todo!())?;
                 let encoding: &str = seq.next_element()?.ok_or_else(|| todo!())?;
                 let data = match encoding {
-                    "base58" => bs58::decode(&dat).into_vec().unwrap(),
-                    "base64" => base64::decode(&dat).unwrap(),
+                    "base58" => bs58::decode(&dat).into_vec().map_err(|_| err())?,
+                    "base64" => base64::decode(&dat).map_err(|_| err())?,
                     "base64+zstd" => {
-                        let vec = base64::decode(&dat).unwrap();
-                        zstd::decode_all(std::io::Cursor::new(vec)).unwrap()
+                        let vec = base64::decode(&dat).map_err(|_| err())?;
+                        zstd::decode_all(std::io::Cursor::new(vec)).map_err(|_| err())?
                     }
-                    _ => todo!(),
+                    _ => return Err(serde::de::Error::custom("unsupported encoding")),
                 };
                 Ok(AccountData {
                     data: Bytes::from(data),
@@ -191,13 +198,13 @@ impl<'a> Serialize for EncodedAccountData<'a> {
     where
         S: serde::Serializer,
     {
-        use serde::ser::SerializeSeq;
+        use serde::ser::{Error, SerializeSeq};
         let mut seq = serializer.serialize_seq(Some(2))?;
         let data = if let Some(slice) = &self.slice {
             self.data
                 .data
                 .get(slice.offset..slice.offset + slice.length)
-                .unwrap_or_else(|| todo!())
+                .ok_or(Error::custom("bad slice"))?
         } else {
             &self.data.data[..]
         };
@@ -210,7 +217,8 @@ impl<'a> Serialize for EncodedAccountData<'a> {
             }
             Encoding::Base64Zstd => {
                 seq.serialize_element(&base64::encode(
-                    zstd::encode_all(std::io::Cursor::new(&data), 0).unwrap(),
+                    zstd::encode_all(std::io::Cursor::new(&data), 0)
+                        .map_err(|_| Error::custom("can't compress"))?,
                 ))?;
             }
         }
@@ -317,7 +325,7 @@ async fn handler(body: Bytes, app_state: web::Data<State>) -> Result<HttpRespons
         #[serde(borrow)]
         params: [&'a RawValue; 2],
     }
-    let req: Request = serde_json::from_slice(&body).unwrap();
+    let req: Request = serde_json::from_slice(&body)?;
 
     let mut cacheable_for_key = None;
 
@@ -330,13 +338,8 @@ async fn handler(body: Bytes, app_state: web::Data<State>) -> Result<HttpRespons
                 #[serde(rename = "dataSlice")]
                 data_slice: Option<Slice>,
             }
-            let param: &str = serde_json::from_str(req.params[0].get()).unwrap();
-            let pubkey = {
-                let mut buf = [0; 32];
-                bs58::decode(&param).into(&mut buf).unwrap();
-                Pubkey(buf)
-            };
-            let config: Config = serde_json::from_str(req.params[1].get()).unwrap();
+            let pubkey: Pubkey = serde_json::from_str(req.params[0].get())?;
+            let config: Config = serde_json::from_str(req.params[1].get())?;
 
             match app_state.get(&pubkey) {
                 Some(data) => {
@@ -382,14 +385,14 @@ async fn handler(body: Bytes, app_state: web::Data<State>) -> Result<HttpRespons
         .send_json(&req)
         .await
         .unwrap();
-    let resp = resp.body().await.unwrap();
+    let resp = resp.body().await?;
 
     if let Some(pubkey) = cacheable_for_key {
         #[derive(Deserialize)]
         struct Resp {
             result: AccountContext,
         }
-        let info: Resp = serde_json::from_slice(&resp).unwrap();
+        let info: Resp = serde_json::from_slice(&resp)?;
         app_state.map.insert(pubkey, info.result);
     }
 
@@ -437,7 +440,7 @@ impl AccountUpdateManager {
 
 impl StreamHandler<AccountCommand> for AccountUpdateManager {
     fn handle(&mut self, item: AccountCommand, ctx: &mut Context<Self>) {
-        <Self as Handler<AccountCommand>>::handle(self, item, ctx)
+        let _ = <Self as Handler<AccountCommand>>::handle(self, item, ctx);
     }
 }
 
@@ -445,125 +448,152 @@ impl Handler<AccountCommand> for AccountUpdateManager {
     type Result = ();
 
     fn handle(&mut self, item: AccountCommand, _ctx: &mut Context<Self>) {
-        let request_id = self.next_request_id();
-        match item {
-            AccountCommand::Subscribe(key) => {
-                info!("subscribe to {}", key);
-                let request = serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": request_id,
-                    "method": "accountSubscribe",
-                    "params": [ key ],
-                });
-                self.inflight.insert(request_id, InflightRequest::Sub(key));
-                self.sink.write(awc::ws::Message::Text(
-                    serde_json::to_string(&request).unwrap(),
-                ));
-                self.purge_queue.insert(key, PURGE_TIMEOUT);
-            }
-            AccountCommand::Purge(key) => {
-                info!("purging {}", key);
-                if let Some(sub_id) = self.key_to_sub.get(&key) {
-                    let request = serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": request_id,
-                        "method": "accountUnsubscribe",
-                        "params": [ sub_id ],
-                    });
-                    self.inflight
-                        .insert(request_id, InflightRequest::Unsub(key));
-                    self.sink.write(awc::ws::Message::Text(
-                        serde_json::to_string(&request).unwrap(),
-                    ));
+        let _ = (|| -> Result<(), serde_json::Error> {
+            let request_id = self.next_request_id();
+            match item {
+                AccountCommand::Subscribe(key) => {
+                    info!("subscribe to {}", key);
+
+                    #[derive(Serialize)]
+                    struct Request<'a> {
+                        jsonrpc: &'a str,
+                        id: u64,
+                        method: &'a str,
+                        params: [Pubkey; 1],
+                    }
+                    let request = Request {
+                        jsonrpc: "2.0",
+                        id: request_id,
+                        method: "accountSubscribe",
+                        params: [key],
+                    };
+
+                    self.inflight.insert(request_id, InflightRequest::Sub(key));
+                    self.sink
+                        .write(awc::ws::Message::Text(serde_json::to_string(&request)?));
+                    self.purge_queue.insert(key, PURGE_TIMEOUT);
                 }
-                self.map.remove(&key);
+                AccountCommand::Purge(key) => {
+                    info!("purging {}", key);
+
+                    #[derive(Serialize)]
+                    struct Request<'a> {
+                        jsonrpc: &'a str,
+                        id: u64,
+                        method: &'a str,
+                        params: [u64; 1],
+                    }
+
+                    if let Some(sub_id) = self.key_to_sub.get(&key) {
+                        let request = Request {
+                            jsonrpc: "2.0",
+                            id: request_id,
+                            method: "accountUnsubscribe",
+                            params: [*sub_id],
+                        };
+                        self.inflight
+                            .insert(request_id, InflightRequest::Unsub(key));
+                        self.sink
+                            .write(awc::ws::Message::Text(serde_json::to_string(&request)?));
+                    }
+                    self.map.remove(&key);
+                }
+                AccountCommand::Reset(key) => {
+                    self.purge_queue.reset(key, PURGE_TIMEOUT);
+                }
             }
-            AccountCommand::Reset(key) => {
-                self.purge_queue.reset(key, PURGE_TIMEOUT);
-            }
-        }
+            Ok(())
+        })()
+        .map_err(|err| {
+            error!("error handling AccountCommand: {}", err);
+        });
     }
 }
 
 impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
     fn handle(&mut self, item: awc::ws::Frame, _ctx: &mut Context<Self>) {
-        use awc::ws::Frame;
-        match item {
-            Frame::Text(text) => {
-                #[derive(Deserialize)]
-                struct AnyMessage<'a> {
-                    #[serde(borrow)]
-                    result: Option<&'a RawValue>,
-                    #[serde(borrow)]
-                    method: Option<&'a str>,
-                    id: Option<u64>,
-                    #[serde(borrow)]
-                    params: Option<&'a RawValue>,
-                }
-                let value: AnyMessage = serde_json::from_slice(&text).unwrap();
-                // subscription response
-                if let (Some(result), Some(id)) = (value.result, value.id) {
-                    if let Some(req) = self.inflight.remove(&id) {
-                        match req {
-                            InflightRequest::Sub(key) => {
-                                let sub_id: u64 = serde_json::from_str(result.get()).unwrap();
-                                self.sub_to_key.insert(sub_id, key);
-                                self.key_to_sub.insert(key, sub_id);
-                                info!(message = "subscribed to stream", sub = sub_id, key = %key);
-                            }
-                            InflightRequest::Unsub(key) => {
-                                //let _is_ok: bool = serde_json::from_str(result.get()).unwrap();
-                                if let Some(sub) = self.key_to_sub.remove(&key) {
-                                    self.sub_to_key.remove(&sub);
-                                    info!(
-                                        message = "unsubscribed from stream",
-                                        sub = sub,
-                                        key = %key,
-                                    );
+        let _ = (|| -> Result<(), serde_json::Error> {
+            use awc::ws::Frame;
+            match item {
+                Frame::Text(text) => {
+                    #[derive(Deserialize)]
+                    struct AnyMessage<'a> {
+                        #[serde(borrow)]
+                        result: Option<&'a RawValue>,
+                        #[serde(borrow)]
+                        method: Option<&'a str>,
+                        id: Option<u64>,
+                        #[serde(borrow)]
+                        params: Option<&'a RawValue>,
+                    }
+                    let value: AnyMessage = serde_json::from_slice(&text)?;
+                    // subscription response
+                    if let (Some(result), Some(id)) = (value.result, value.id) {
+                        if let Some(req) = self.inflight.remove(&id) {
+                            match req {
+                                InflightRequest::Sub(key) => {
+                                    let sub_id: u64 = serde_json::from_str(result.get())?;
+                                    self.sub_to_key.insert(sub_id, key);
+                                    self.key_to_sub.insert(key, sub_id);
+                                    info!(message = "subscribed to stream", sub = sub_id, key = %key);
+                                }
+                                InflightRequest::Unsub(key) => {
+                                    //let _is_ok: bool = serde_json::from_str(result.get()).unwrap();
+                                    if let Some(sub) = self.key_to_sub.remove(&key) {
+                                        self.sub_to_key.remove(&sub);
+                                        info!(
+                                            message = "unsubscribed from stream",
+                                            sub = sub,
+                                            key = %key,
+                                        );
+                                    }
+                                }
+                                InflightRequest::SlotSub(_) => {
+                                    info!(message = "subscribed to slot");
                                 }
                             }
-                            InflightRequest::SlotSub(_) => {
-                                info!(message = "subscribed to slot");
-                            }
                         }
-                    }
 
-                    // TODO: method response
-                    return;
-                };
-                // notification
-                if let (Some(method), Some(params)) = (value.method, value.params) {
-                    match method {
-                        "accountNotification" => {
-                            #[derive(Deserialize)]
-                            struct Params {
-                                result: AccountContext,
-                                subscription: u64,
+                        // TODO: method response
+                        return Ok(());
+                    };
+                    // notification
+                    if let (Some(method), Some(params)) = (value.method, value.params) {
+                        match method {
+                            "accountNotification" => {
+                                #[derive(Deserialize)]
+                                struct Params {
+                                    result: AccountContext,
+                                    subscription: u64,
+                                }
+                                let params: Params = serde_json::from_str(params.get())?;
+                                if let Some(key) = self.sub_to_key.get(&params.subscription) {
+                                    self.map.insert(*key, params.result);
+                                }
                             }
-                            let params: Params = serde_json::from_str(params.get()).unwrap();
-                            if let Some(key) = self.sub_to_key.get(&params.subscription) {
-                                self.map.insert(*key, params.result);
+                            "slotNotification" => {
+                                #[derive(Deserialize)]
+                                struct SlotInfo {
+                                    slot: u64,
+                                }
+                                #[derive(Deserialize)]
+                                struct Params {
+                                    result: SlotInfo,
+                                }
+                                let params: Params = serde_json::from_str(params.get())?;
+                                let slot = params.result.slot;
+                                self.slot.store(slot, atomic::Ordering::SeqCst);
                             }
+                            _ => {}
                         }
-                        "slotNotification" => {
-                            #[derive(Deserialize)]
-                            struct SlotInfo {
-                                slot: u64,
-                            }
-                            #[derive(Deserialize)]
-                            struct Params {
-                                result: SlotInfo,
-                            }
-                            let params: Params = serde_json::from_str(params.get()).unwrap();
-                            let slot = params.result.slot;
-                            self.slot.store(slot, atomic::Ordering::SeqCst);
-                        }
-                        _ => {}
                     }
                 }
+                _ => return Ok(()),
             }
-            _ => return,
-        }
+            Ok(())
+        })().map_err(|err| {
+            error!("error handling Frame: {}", err);
+        });
     }
 }
 
@@ -594,12 +624,6 @@ enum AccountCommand {
     Subscribe(Pubkey),
     Reset(Pubkey),
     Purge(Pubkey),
-}
-
-fn make_client() -> Client {
-    Client::builder()
-        .max_http_version(awc::http::Version::HTTP_11)
-        .finish()
 }
 
 enum DelayQueueCommand<T> {
@@ -695,7 +719,13 @@ async fn run(options: Options) {
     let map = Arc::new(DashMap::new());
     let current_slot = Arc::new(AtomicU64::new(0));
 
-    let (_, conn) = make_client().ws(&options.ws_url).connect().await.unwrap();
+    let (_, conn) = Client::builder()
+        .max_http_version(awc::http::Version::HTTP_11)
+        .finish()
+        .ws(&options.ws_url)
+        .connect()
+        .await
+        .unwrap();
 
     info!("connected to websocket rpc @ {}", options.ws_url);
 
