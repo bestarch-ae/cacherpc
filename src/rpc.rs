@@ -12,8 +12,8 @@ use serde_json::value::RawValue;
 use tokio::sync::{Notify, Semaphore};
 use tracing::info;
 
+use crate::accounts::{AccountCommand, AccountUpdateManager};
 use crate::types::{AccountContext, AccountData, AccountInfo, Pubkey, SolanaContext};
-use crate::updater::{AccountCommand, AccountUpdateManager};
 
 impl AccountInfo {
     fn encode(&self, encoding: Encoding, slice: Option<Slice>) -> EncodedAccountInfo {

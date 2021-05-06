@@ -12,11 +12,11 @@ use tracing_subscriber;
 
 use structopt::StructOpt;
 
+mod accounts;
 mod rpc;
 mod types;
-mod updater;
 
-use updater::AccountUpdateManager;
+use accounts::AccountUpdateManager;
 
 #[derive(Debug, structopt::StructOpt)]
 struct Options {
