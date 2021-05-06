@@ -25,3 +25,4 @@ tracing-futures = "0.2"
 structopt = "0.3"
 base64 = "0.13"
 zstd = "0.8"
+smallvec = { version = "1.6", features = ["serde", "union"] }

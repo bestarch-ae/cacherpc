@@ -9,6 +9,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
+use smallvec::SmallVec;
 use tokio::sync::{Notify, Semaphore};
 use tracing::info;
 
@@ -156,7 +157,33 @@ struct Request<'a> {
     id: u64,
     method: &'a str,
     #[serde(borrow)]
-    params: [&'a RawValue; 2],
+    params: &'a RawValue,
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+struct RpcError<'a> {
+    code: i64,
+    message: &'a str,
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+struct ErrorResponse<'a> {
+    jsonrpc: &'a str,
+    error: RpcError<'a>,
+    id: u64,
+}
+
+impl ErrorResponse<'static> {
+    fn not_enough_arguments(id: u64) -> ErrorResponse<'static> {
+        ErrorResponse {
+            jsonrpc: "2.0",
+            id,
+            error: RpcError {
+                code: -32602,
+                message: "`params` should have at least 1 argument(s)",
+            },
+        }
+    }
 }
 
 async fn get_account_info<'a>(
@@ -195,8 +222,30 @@ async fn get_account_info<'a>(
         #[serde(rename = "dataSlice")]
         data_slice: Option<Slice>,
     }
-    let pubkey: Pubkey = serde_json::from_str(req.params[0].get())?;
-    let config: Config = serde_json::from_str(req.params[1].get())?;
+    impl Default for Config<'static> {
+        fn default() -> Self {
+            Config {
+                encoding: Encoding::Base58,
+                commitment: None,
+                data_slice: None,
+            }
+        }
+    }
+
+    let params: SmallVec<[&RawValue; 2]> = serde_json::from_str(req.params.get())?;
+    if params.is_empty() {
+        return Ok(HttpResponse::Ok()
+            .content_type("application/json")
+            .json(ErrorResponse::not_enough_arguments(req.id)));
+    }
+    let pubkey: Pubkey = serde_json::from_str(params[0].get())?;
+    let config: Config = {
+        if let Some(param) = params.get(1) {
+            serde_json::from_str(param.get())?
+        } else {
+            Config::default()
+        }
+    };
 
     let mut cacheable_for_key = None;
 
