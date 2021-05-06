@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{self, AtomicU64};
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,6 +12,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use tokio::stream::{Stream, StreamExt};
 use tokio::sync::mpsc;
+use tokio::sync::Notify;
 use tokio::time::{DelayQueue, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -298,6 +299,7 @@ struct State {
     tx: Addr<AccountUpdateManager>,
     rpc_url: String,
     slot: Arc<AtomicU64>,
+    map_updated: Arc<Notify>,
 }
 
 impl std::fmt::Debug for State {
@@ -316,76 +318,119 @@ impl State {
     }
 }
 
-async fn handler(body: Bytes, app_state: web::Data<State>) -> Result<HttpResponse, Error> {
-    #[derive(Deserialize, Serialize, Debug)]
-    struct Request<'a> {
-        jsonrpc: &'a str,
-        id: u64,
-        method: &'a str,
-        #[serde(borrow)]
-        params: [&'a RawValue; 2],
+#[derive(Deserialize, Serialize, Debug)]
+struct Request<'a> {
+    jsonrpc: &'a str,
+    id: u64,
+    method: &'a str,
+    #[serde(borrow)]
+    params: [&'a RawValue; 2],
+}
+
+async fn get_account_info<'a>(
+    req: Request<'a>,
+    app_state: web::Data<State>,
+) -> Result<HttpResponse, Error> {
+    #[inline]
+    fn account_response(
+        req_id: u64,
+        acc: &AccountInfo,
+        ctx: &SolanaContext,
+        encoding: Encoding,
+        slice: Option<Slice>,
+    ) -> HttpResponse {
+        #[derive(Serialize)]
+        struct Resp<'a> {
+            jsonrpc: &'a str,
+            result: EncodedAccountContext<'a>, //AccountContext,
+            id: u64,
+        }
+        let resp = Resp {
+            jsonrpc: "2.0",
+            result: acc.encode(encoding, slice).with_context(&ctx),
+            id: req_id,
+        };
+
+        HttpResponse::Ok()
+            .content_type("application/json")
+            .json(&resp)
     }
-    let req: Request = serde_json::from_slice(&body)?;
+
+    #[derive(Deserialize, Debug)]
+    struct Config<'a> {
+        encoding: Encoding,
+        commitment: Option<&'a str>,
+        #[serde(rename = "dataSlice")]
+        data_slice: Option<Slice>,
+    }
+    let pubkey: Pubkey = serde_json::from_str(req.params[0].get())?;
+    let config: Config = serde_json::from_str(req.params[1].get())?;
 
     let mut cacheable_for_key = None;
 
-    match req.method.as_ref() {
-        "getAccountInfo" => {
-            #[derive(Deserialize, Debug)]
-            struct Config<'a> {
-                encoding: Encoding,
-                commitment: Option<&'a str>,
-                #[serde(rename = "dataSlice")]
-                data_slice: Option<Slice>,
-            }
-            let pubkey: Pubkey = serde_json::from_str(req.params[0].get())?;
-            let config: Config = serde_json::from_str(req.params[1].get())?;
-
-            match app_state.get(&pubkey) {
-                Some(data) => {
-                    let data = data.value();
-                    #[derive(Serialize)]
-                    struct Resp<'a> {
-                        jsonrpc: &'a str,
-                        result: EncodedAccountContext<'a>, //AccountContext,
-                        id: u64,
-                    }
-                    let resp = Resp {
-                        jsonrpc: "2.0",
-                        result: data
-                            .value
-                            .encode(config.encoding, config.data_slice)
-                            .with_context(&data.context),
-                        id: req.id,
-                    };
-
-                    info!("cache hit for {}", pubkey);
-                    return Ok(HttpResponse::Ok()
-                        .content_type("application/json")
-                        .json(&resp));
-                }
-                None => {
-                    if config.data_slice.is_none() {
-                        cacheable_for_key = Some(pubkey);
-                    }
-                    app_state
-                        .tx
-                        .send(AccountCommand::Subscribe(pubkey))
-                        .await
-                        .unwrap();
-                }
-            }
+    match app_state.get(&pubkey) {
+        Some(data) => {
+            let data = data.value();
+            info!("cache hit for {}", pubkey);
+            return Ok(account_response(
+                req.id,
+                &data.value,
+                &data.context,
+                config.encoding,
+                config.data_slice,
+            ));
         }
-        _ => {}
+        None => {
+            if config.data_slice.is_none() {
+                cacheable_for_key = Some(pubkey);
+            }
+            app_state
+                .tx
+                .send(AccountCommand::Subscribe(pubkey))
+                .await
+                .unwrap();
+        }
     }
 
     let client = &app_state.client;
-    let mut resp = client
-        .post(&app_state.rpc_url)
-        .send_json(&req)
-        .await
-        .unwrap();
-    let resp = resp.body().await?;
+    let wait_for_response = async {
+        let mut resp = client
+            .post(&app_state.rpc_url)
+            .send_json(&req)
+            .await
+            .unwrap();
+        resp.body().await.unwrap()
+    };
+
+    tokio::pin!(wait_for_response);
+
+    let resp = loop {
+        let notified = app_state.map_updated.notified();
+        tokio::select! {
+            body = &mut wait_for_response => {
+                break body;
+            }
+            _ = notified => {
+                if let Some(pubkey) = cacheable_for_key {
+                    match app_state.get(&pubkey) {
+                        Some(data) => {
+                            let data = data.value();
+                            info!("got hit in map while waiting!");
+                            return Ok(account_response(
+                                req.id,
+                                &data.value,
+                                &data.context,
+                                config.encoding,
+                                config.data_slice,
+                            ));
+                        },
+                        None => {},
+                    }
+                }
+                continue;
+            }
+        }
+    };
 
     if let Some(pubkey) = cacheable_for_key {
         #[derive(Deserialize)]
@@ -394,11 +439,34 @@ async fn handler(body: Bytes, app_state: web::Data<State>) -> Result<HttpRespons
         }
         let info: Resp = serde_json::from_slice(&resp)?;
         app_state.map.insert(pubkey, info.result);
+        app_state.map_updated.notify();
     }
 
     Ok(HttpResponse::Ok()
         .content_type("application/json")
         .body(resp))
+}
+
+async fn rpc_handler(body: Bytes, app_state: web::Data<State>) -> Result<HttpResponse, Error> {
+    let req: Request = serde_json::from_slice(&body)?;
+
+    match req.method.as_ref() {
+        "getAccountInfo" => {
+            return get_account_info(req, app_state).await;
+        }
+        _ => {}
+    }
+
+    let client = &app_state.client;
+    let resp = client
+        .post(&app_state.rpc_url)
+        .send_json(&req)
+        .await
+        .unwrap();
+
+    Ok(HttpResponse::Ok()
+        .content_type("application/json")
+        .streaming(resp))
 }
 
 enum InflightRequest {
@@ -410,6 +478,7 @@ enum InflightRequest {
 struct AccountUpdateManager {
     request_id: u64,
     inflight: HashMap<u64, InflightRequest>,
+    subs: HashSet<Pubkey>,
     sub_to_key: HashMap<u64, Pubkey>,
     key_to_sub: HashMap<Pubkey, u64>,
     sink: SinkWrite<
@@ -452,6 +521,11 @@ impl Handler<AccountCommand> for AccountUpdateManager {
             let request_id = self.next_request_id();
             match item {
                 AccountCommand::Subscribe(key) => {
+                    if self.subs.contains(&key) {
+                        info!("already trying to subscribe to {}", key);
+                        return Ok(());
+                    }
+
                     info!("subscribe to {}", key);
 
                     #[derive(Serialize)]
@@ -469,6 +543,7 @@ impl Handler<AccountCommand> for AccountUpdateManager {
                     };
 
                     self.inflight.insert(request_id, InflightRequest::Sub(key));
+                    self.subs.insert(key);
                     self.sink
                         .write(awc::ws::Message::Text(serde_json::to_string(&request)?));
                     self.purge_queue.insert(key, PURGE_TIMEOUT);
@@ -540,6 +615,7 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
                                 InflightRequest::Unsub(key) => {
                                     //let _is_ok: bool = serde_json::from_str(result.get()).unwrap();
                                     if let Some(sub) = self.key_to_sub.remove(&key) {
+                                        self.subs.remove(&key);
                                         self.sub_to_key.remove(&sub);
                                         info!(
                                             message = "unsubscribed from stream",
@@ -743,6 +819,7 @@ async fn run(options: Options) {
             sub_to_key: HashMap::default(),
             key_to_sub: HashMap::default(),
             inflight: HashMap::default(),
+            subs: HashSet::default(),
             request_id: 1,
             map: map.clone(),
             purge_queue: handle,
@@ -751,6 +828,7 @@ async fn run(options: Options) {
     });
 
     let rpc_url = options.rpc_url;
+    let notify = Arc::new(Notify::new());
     HttpServer::new(move || {
         let state = State {
             map: map.clone(),
@@ -758,10 +836,11 @@ async fn run(options: Options) {
             tx: addr.clone(),
             rpc_url: rpc_url.clone(),
             slot: current_slot.clone(),
+            map_updated: notify.clone(),
         };
         App::new()
             .data(state)
-            .service(web::resource("/").route(web::post().to(handler)))
+            .service(web::resource("/").route(web::post().to(rpc_handler)))
     })
     .bind(options.addr)
     .unwrap()
