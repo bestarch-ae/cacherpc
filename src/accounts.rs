@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 use tokio::time::{DelayQueue, Instant};
 use tracing::{error, info};
 
-use crate::types::{AccountContext, Pubkey};
+use crate::types::{AccountContext, AccountInfo, Pubkey};
 
 const PURGE_TIMEOUT: Duration = Duration::from_secs(600);
 
@@ -36,7 +36,7 @@ pub(crate) struct AccountUpdateManager {
             awc::ws::Message,
         >,
     >,
-    map: Arc<DashMap<Pubkey, AccountContext>>,
+    map: Arc<DashMap<Pubkey, Option<AccountInfo>>>,
     purge_queue: DelayQueueHandle<Pubkey>,
     slot: Arc<AtomicU64>,
 }
@@ -50,7 +50,7 @@ impl std::fmt::Debug for AccountUpdateManager {
 impl AccountUpdateManager {
     pub fn init(
         current_slot: Arc<AtomicU64>,
-        map: Arc<DashMap<Pubkey, AccountContext>>,
+        map: Arc<DashMap<Pubkey, Option<AccountInfo>>>,
         conn: actix_codec::Framed<awc::BoxedSocket, awc::ws::Codec>,
     ) -> Addr<Self> {
         AccountUpdateManager::create(|ctx| {
@@ -220,7 +220,7 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
                                 }
                                 let params: Params = serde_json::from_str(params.get())?;
                                 if let Some(key) = self.sub_to_key.get(&params.subscription) {
-                                    self.map.insert(*key, params.result);
+                                    self.map.insert(*key, params.result.value);
                                 }
                             }
                             "slotNotification" => {

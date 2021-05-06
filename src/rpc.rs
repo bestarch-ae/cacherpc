@@ -1,4 +1,5 @@
 use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use actix::prelude::Addr;
@@ -67,7 +68,7 @@ struct EncodedAccountInfo<'a> {
 impl<'a> EncodedAccountInfo<'a> {
     fn with_context(self, ctx: &'a SolanaContext) -> EncodedAccountContext<'a> {
         EncodedAccountContext {
-            value: self,
+            value: Some(self),
             context: ctx,
         }
     }
@@ -76,7 +77,16 @@ impl<'a> EncodedAccountInfo<'a> {
 #[derive(Serialize, Debug)]
 struct EncodedAccountContext<'a> {
     context: &'a SolanaContext,
-    value: EncodedAccountInfo<'a>,
+    value: Option<EncodedAccountInfo<'a>>,
+}
+
+impl<'a> EncodedAccountContext<'a> {
+    fn empty(ctx: &'a SolanaContext) -> EncodedAccountContext {
+        EncodedAccountContext {
+            context: ctx,
+            value: None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -132,17 +142,20 @@ impl<'a> Serialize for EncodedAccountData<'a> {
 
 #[derive(Clone)]
 pub(crate) struct State {
-    pub map: Arc<DashMap<Pubkey, AccountContext>>,
+    pub map: Arc<DashMap<Pubkey, Option<AccountInfo>>>,
     pub client: Client,
     pub tx: Addr<AccountUpdateManager>,
     pub rpc_url: String,
-    pub slot: Arc<AtomicU64>,
+    pub current_slot: Arc<AtomicU64>,
     pub map_updated: Arc<Notify>,
     pub request_limit: Arc<Semaphore>,
 }
 
 impl State {
-    fn get(&self, key: &Pubkey) -> Option<dashmap::mapref::one::Ref<'_, Pubkey, AccountContext>> {
+    fn get(
+        &self,
+        key: &Pubkey,
+    ) -> Option<dashmap::mapref::one::Ref<'_, Pubkey, Option<AccountInfo>>> {
         let tx = &self.tx;
         self.map.get(key).map(|v| {
             tx.do_send(AccountCommand::Reset(*key));
@@ -193,8 +206,8 @@ async fn get_account_info<'a>(
     #[inline]
     fn account_response(
         req_id: u64,
-        acc: &AccountInfo,
-        ctx: &SolanaContext,
+        acc: &Option<AccountInfo>,
+        slot: u64,
         encoding: Encoding,
         slice: Option<Slice>,
     ) -> HttpResponse {
@@ -204,9 +217,13 @@ async fn get_account_info<'a>(
             result: EncodedAccountContext<'a>, //AccountContext,
             id: u64,
         }
+        let ctx = SolanaContext { slot };
         let resp = Resp {
             jsonrpc: "2.0",
-            result: acc.encode(encoding, slice).with_context(&ctx),
+            result: acc
+                .as_ref()
+                .map(|acc| acc.encode(encoding, slice).with_context(&ctx))
+                .unwrap_or(EncodedAccountContext::empty(&ctx)),
             id: req_id,
         };
 
@@ -255,8 +272,8 @@ async fn get_account_info<'a>(
             info!("cache hit for {}", pubkey);
             return Ok(account_response(
                 req.id,
-                &data.value,
-                &data.context,
+                &data,
+                app_state.current_slot.load(Ordering::SeqCst),
                 config.encoding,
                 config.data_slice,
             ));
@@ -317,8 +334,8 @@ async fn get_account_info<'a>(
                             info!("got hit in map while waiting!");
                             return Ok(account_response(
                                 req.id,
-                                &data.value,
-                                &data.context,
+                                &data,
+                                app_state.current_slot.load(Ordering::SeqCst),
                                 config.encoding,
                                 config.data_slice,
                             ));
@@ -337,7 +354,7 @@ async fn get_account_info<'a>(
             result: AccountContext,
         }
         let info: Resp = serde_json::from_slice(&resp)?;
-        app_state.map.insert(pubkey, info.result);
+        app_state.map.insert(pubkey, info.result.value);
         app_state.map_updated.notify();
     }
 

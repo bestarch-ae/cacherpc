@@ -124,7 +124,7 @@ impl Serialize for AccountData {
 #[derive(Serialize, Deserialize, Debug)]
 pub(crate) struct AccountContext {
     pub context: SolanaContext,
-    pub value: AccountInfo,
+    pub value: Option<AccountInfo>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

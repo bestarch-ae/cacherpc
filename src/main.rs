@@ -75,7 +75,7 @@ async fn run(options: Options) {
             client: Client::default(),
             tx: addr.clone(),
             rpc_url: rpc_url.clone(),
-            slot: current_slot.clone(),
+            current_slot: current_slot.clone(),
             map_updated: notify.clone(),
             request_limit: semaphore.clone(),
         };
