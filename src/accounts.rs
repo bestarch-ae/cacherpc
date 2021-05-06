@@ -15,7 +15,7 @@ use tracing::{error, info};
 
 use crate::types::{AccountContext, Pubkey};
 
-const PURGE_TIMEOUT: Duration = Duration::from_secs(60);
+const PURGE_TIMEOUT: Duration = Duration::from_secs(600);
 
 enum InflightRequest {
     Sub(Pubkey),

@@ -276,13 +276,25 @@ async fn get_account_info<'a>(
     let client = &app_state.client;
     let limit = &app_state.request_limit;
     let wait_for_response = async {
-        let _permit = limit.acquire().await;
-        let mut resp = client
-            .post(&app_state.rpc_url)
-            .send_json(&req)
-            .await
-            .unwrap();
-        resp.body().await.unwrap()
+        let mut retries = 10; // todo: proper backoff
+        loop {
+            retries -= 1;
+            let _permit = limit.acquire().await;
+            let mut resp = client.post(&app_state.rpc_url).send_json(&req).await?;
+            let body = resp
+                .body()
+                .await
+                .map_err(|_| awc::error::SendRequestError::Timeout); // todo
+            match body {
+                Ok(body) => break Ok(body),
+                Err(_) => {
+                    tokio::time::delay_for(std::time::Duration::from_millis(100)).await;
+                    if retries == 0 {
+                        break Err(awc::error::SendRequestError::Timeout);
+                    }
+                }
+            }
+        }
     };
 
     tokio::pin!(wait_for_response);
@@ -291,7 +303,11 @@ async fn get_account_info<'a>(
         let notified = app_state.map_updated.notified();
         tokio::select! {
             body = &mut wait_for_response => {
-                break body;
+                if let Ok(body) = body {
+                    break body;
+                } else {
+                    return Ok(HttpResponse::GatewayTimeout().finish());
+                }
             }
             _ = notified => {
                 if let Some(pubkey) = cacheable_for_key {
