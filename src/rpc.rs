@@ -142,7 +142,7 @@ impl<'a> Serialize for EncodedAccountData<'a> {
 
 #[derive(Clone)]
 pub(crate) struct State {
-    pub map: Arc<DashMap<Pubkey, Option<AccountInfo>>>,
+    pub accounts_map: Arc<DashMap<Pubkey, Option<AccountInfo>>>,
     pub client: Client,
     pub tx: Addr<AccountUpdateManager>,
     pub rpc_url: String,
@@ -157,7 +157,7 @@ impl State {
         key: &Pubkey,
     ) -> Option<dashmap::mapref::one::Ref<'_, Pubkey, Option<AccountInfo>>> {
         let tx = &self.tx;
-        self.map.get(key).map(|v| {
+        self.accounts_map.get(key).map(|v| {
             tx.do_send(AccountCommand::Reset(*key));
             v
         })
@@ -354,7 +354,7 @@ async fn get_account_info<'a>(
             result: AccountContext,
         }
         let info: Resp = serde_json::from_slice(&resp)?;
-        app_state.map.insert(pubkey, info.result.value);
+        app_state.accounts_map.insert(pubkey, info.result.value);
         app_state.map_updated.notify();
     }
 
@@ -373,6 +373,11 @@ pub(crate) async fn rpc_handler(
         "getAccountInfo" => {
             return get_account_info(req, app_state).await;
         }
+        /*
+        "getProgramAccounts" => {
+            return get_program_accounts(req, app_state).await;
+        }
+        */
         _ => {}
     }
 

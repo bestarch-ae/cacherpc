@@ -36,7 +36,7 @@ pub(crate) struct AccountUpdateManager {
             awc::ws::Message,
         >,
     >,
-    map: Arc<DashMap<Pubkey, Option<AccountInfo>>>,
+    accounts_map: Arc<DashMap<Pubkey, Option<AccountInfo>>>,
     purge_queue: DelayQueueHandle<Pubkey>,
     slot: Arc<AtomicU64>,
 }
@@ -50,7 +50,7 @@ impl std::fmt::Debug for AccountUpdateManager {
 impl AccountUpdateManager {
     pub fn init(
         current_slot: Arc<AtomicU64>,
-        map: Arc<DashMap<Pubkey, Option<AccountInfo>>>,
+        accounts_map: Arc<DashMap<Pubkey, Option<AccountInfo>>>,
         conn: actix_codec::Framed<awc::BoxedSocket, awc::ws::Codec>,
     ) -> Addr<Self> {
         AccountUpdateManager::create(|ctx| {
@@ -69,7 +69,7 @@ impl AccountUpdateManager {
                 inflight: HashMap::default(),
                 subs: HashSet::default(),
                 request_id: 1,
-                map: map.clone(),
+                accounts_map: accounts_map.clone(),
                 purge_queue: handle,
                 slot: current_slot.clone(),
             }
@@ -147,7 +147,7 @@ impl Handler<AccountCommand> for AccountUpdateManager {
                         self.sink
                             .write(awc::ws::Message::Text(serde_json::to_string(&request)?));
                     }
-                    self.map.remove(&key);
+                    self.accounts_map.remove(&key);
                 }
                 AccountCommand::Reset(key) => {
                     self.purge_queue.reset(key, PURGE_TIMEOUT);
@@ -220,7 +220,7 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
                                 }
                                 let params: Params = serde_json::from_str(params.get())?;
                                 if let Some(key) = self.sub_to_key.get(&params.subscription) {
-                                    self.map.insert(*key, params.result.value);
+                                    self.accounts_map.insert(*key, params.result.value);
                                 }
                             }
                             "slotNotification" => {
