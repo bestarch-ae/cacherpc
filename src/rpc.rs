@@ -21,17 +21,17 @@ use crate::types::{AccountContext, AccountData, AccountInfo, Pubkey, SolanaConte
 impl AccountInfo {
     fn encode(&self, encoding: Encoding, slice: Option<Slice>) -> EncodedAccountInfo {
         EncodedAccountInfo {
-            lamports: self.lamports,
-            owner: self.owner,
-            executable: self.executable,
-            rent_epoch: self.rent_epoch,
-            data: encoding.with_account_data(&self.data).slice(slice),
+            account_info: &self,
+            slice,
+            encoding,
         }
     }
 }
 
 #[derive(Serialize, Debug, Deserialize, Copy, Clone)]
 enum Encoding {
+    #[serde(skip)]
+    Default,
     #[serde(rename = "base58")]
     Base58,
     #[serde(rename = "base64")]
@@ -40,30 +40,17 @@ enum Encoding {
     Base64Zstd,
 }
 
-impl Encoding {
-    fn with_account_data(self, data: &'_ AccountData) -> EncodedAccountData<'_> {
-        EncodedAccountData {
-            encoding: self,
-            data,
-            slice: None,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Copy, Clone)]
 struct Slice {
     offset: usize,
     length: usize,
 }
 
-#[derive(Serialize, Debug)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug)]
 struct EncodedAccountInfo<'a> {
-    lamports: u64,
-    data: EncodedAccountData<'a>,
-    owner: Pubkey,
-    executable: bool,
-    rent_epoch: u64,
+    encoding: Encoding,
+    slice: Option<Slice>,
+    account_info: &'a AccountInfo,
 }
 
 impl<'a> EncodedAccountInfo<'a> {
@@ -72,6 +59,27 @@ impl<'a> EncodedAccountInfo<'a> {
             value: Some(self),
             context: ctx,
         }
+    }
+}
+
+impl<'a> Serialize for EncodedAccountInfo<'a> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut account_info = serializer.serialize_struct("AccountInfo", 5)?;
+        let encoded_data = EncodedAccountData {
+            encoding: self.encoding,
+            data: &self.account_info.data,
+            slice: self.slice,
+        };
+        account_info.serialize_field("data", &encoded_data)?;
+        account_info.serialize_field("lamports", &self.account_info.lamports)?;
+        account_info.serialize_field("owner", &self.account_info.owner)?;
+        account_info.serialize_field("executable", &self.account_info.executable)?;
+        account_info.serialize_field("rent_epoch", &self.account_info.rent_epoch)?;
+        account_info.end()
     }
 }
 
@@ -90,21 +98,10 @@ impl<'a> EncodedAccountContext<'a> {
     }
 }
 
-#[derive(Debug)]
 struct EncodedAccountData<'a> {
     encoding: Encoding,
     data: &'a AccountData,
     slice: Option<Slice>,
-}
-
-impl EncodedAccountData<'_> {
-    fn slice(self, slice: Option<Slice>) -> Self {
-        EncodedAccountData {
-            encoding: self.encoding,
-            data: self.data,
-            slice,
-        }
-    }
 }
 
 impl<'a> Serialize for EncodedAccountData<'a> {
@@ -113,7 +110,7 @@ impl<'a> Serialize for EncodedAccountData<'a> {
         S: serde::Serializer,
     {
         use serde::ser::{Error, SerializeSeq};
-        let mut seq = serializer.serialize_seq(Some(2))?;
+
         let data = if let Some(slice) = &self.slice {
             self.data
                 .data
@@ -122,6 +119,12 @@ impl<'a> Serialize for EncodedAccountData<'a> {
         } else {
             &self.data.data[..]
         };
+
+        if let Encoding::Default = self.encoding {
+            return serializer.serialize_str(&bs58::encode(&data).into_string());
+        }
+
+        let mut seq = serializer.serialize_seq(Some(2))?;
         match self.encoding {
             Encoding::Base58 => {
                 seq.serialize_element(&bs58::encode(&data).into_string())?;
@@ -135,6 +138,7 @@ impl<'a> Serialize for EncodedAccountData<'a> {
                         .map_err(|_| Error::custom("can't compress"))?,
                 ))?;
             }
+            _ => panic!("must not happen, handled above"),
         }
         seq.serialize_element(&self.encoding)?;
         seq.end()
@@ -368,6 +372,37 @@ async fn get_program_accounts<'a>(
 ) -> Result<HttpResponse, Error> {
     let mut cacheable_for_key = None;
 
+    #[derive(Deserialize, Debug)]
+    enum Filter<'a> {
+        #[serde(rename = "memcmp")]
+        Memcmp {
+            offset: usize,
+            #[serde(borrow)]
+            bytes: &'a str,
+        },
+        DataSize(u64),
+    }
+
+    #[derive(Deserialize, Debug)]
+    struct Config<'a> {
+        encoding: Encoding,
+        commitment: Option<&'a str>,
+        #[serde(rename = "dataSlice")]
+        data_slice: Option<Slice>,
+        filters: Option<&'a RawValue>,
+    }
+
+    impl Default for Config<'static> {
+        fn default() -> Self {
+            Config {
+                encoding: Encoding::Default,
+                commitment: None,
+                data_slice: None,
+                filters: None,
+            }
+        }
+    }
+
     let params: SmallVec<[&RawValue; 2]> = serde_json::from_str(req.params.get())?;
     if params.is_empty() {
         return Ok(HttpResponse::Ok()
@@ -375,6 +410,14 @@ async fn get_program_accounts<'a>(
             .json(ErrorResponse::not_enough_arguments(req.id)));
     }
     let pubkey: Pubkey = serde_json::from_str(params[0].get())?;
+    let config: Config = {
+        if let Some(val) = params.get(1) {
+            serde_json::from_str(val.get())?
+        } else {
+            Config::default()
+        }
+    };
+
     // todo: config
     //
     cacheable_for_key = Some(pubkey);
@@ -383,31 +426,47 @@ async fn get_program_accounts<'a>(
         Some(data) => {
             let accounts = data.value();
 
-            struct Unref<'a, K, V>(Ref<'a, K, V>);
+            struct Encode<'a, K> {
+                inner: Ref<'a, K, Option<AccountInfo>>,
+                encoding: Encoding,
+                slice: Option<Slice>,
+            }
 
-            impl<'a, K, V> Serialize for Unref<'a, K, V>
+            impl<'a, K> Serialize for Encode<'a, K>
             where
-                V: Serialize,
                 K: Eq + std::hash::Hash,
             {
                 fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
                 where
                     S: serde::Serializer,
                 {
-                    <V as Serialize>::serialize(self.0.value(), serializer)
+                    if let Some(value) = self.inner.value() {
+                        let encoded = value.encode(self.encoding, self.slice);
+                        encoded.serialize(serializer)
+                    } else {
+                        // shouldn't happen
+                        serializer.serialize_none()
+                    }
                 }
             }
 
             #[derive(Serialize)]
             struct AccountAndPubkey<'a> {
-                account: Unref<'a, Pubkey, Option<AccountInfo>>,
+                account: Encode<'a, Pubkey>,
                 pubkey: Pubkey,
             }
             let mut encoded_accounts = Vec::with_capacity(accounts.len());
             for key in accounts {
                 if let Some(data) = app_state.get(&key) {
+                    if data.value().is_none() {
+                        continue;
+                    }
                     encoded_accounts.push(AccountAndPubkey {
-                        account: Unref(data),
+                        account: Encode {
+                            inner: data,
+                            encoding: config.encoding,
+                            slice: config.data_slice,
+                        },
                         pubkey: *key,
                     })
                 }
@@ -429,7 +488,11 @@ async fn get_program_accounts<'a>(
                 .content_type("application/json")
                 .json(&resp));
         }
-        None => {}
+        None => {
+            if config.data_slice.is_some() || config.filters.is_some() {
+                cacheable_for_key = None;
+            }
+        }
     }
 
     let client = &app_state.client;
