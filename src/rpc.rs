@@ -40,6 +40,12 @@ enum Encoding {
     Base64Zstd,
 }
 
+impl Encoding {
+    fn default() -> Self {
+        Encoding::Default
+    }
+}
+
 #[derive(Debug, Deserialize, Copy, Clone)]
 struct Slice {
     offset: usize,
@@ -370,21 +376,44 @@ async fn get_program_accounts<'a>(
     req: Request<'a>,
     app_state: web::Data<State>,
 ) -> Result<HttpResponse, Error> {
-    let mut cacheable_for_key = None;
-
     #[derive(Deserialize, Debug)]
+    #[serde(rename_all = "camelCase")]
     enum Filter<'a> {
-        #[serde(rename = "memcmp")]
         Memcmp {
             offset: usize,
             #[serde(borrow)]
             bytes: &'a str,
         },
-        DataSize(u64),
+        DataSize(usize),
+    }
+
+    impl<'a> Filter<'a> {
+        fn matches(&self, data: &AccountData) -> bool {
+            match *self {
+                Filter::DataSize(len) => data.data.len() == len,
+                Filter::Memcmp { offset, bytes } => {
+                    // data to match, as base-58 encoded string and limited to less than 129 bytes
+                    let mut buf = [0u8; 128];
+
+                    // see rpc_filter.rs, same behaviour
+                    let len = match bs58::decode(bytes).into(&mut buf) {
+                        Ok(len) => len,
+                        Err(_) => {
+                            return false;
+                        }
+                    };
+                    match data.data.get(offset..offset + len) {
+                        Some(slice) => slice == &buf[..len],
+                        None => false,
+                    }
+                }
+            }
+        }
     }
 
     #[derive(Deserialize, Debug)]
     struct Config<'a> {
+        #[serde(default = "Encoding::default")]
         encoding: Encoding,
         commitment: Option<&'a str>,
         #[serde(rename = "dataSlice")]
@@ -418,10 +447,7 @@ async fn get_program_accounts<'a>(
         }
     };
 
-    // todo: config
-    //
-    cacheable_for_key = Some(pubkey);
-    // todo do it
+    let mut cacheable_for_key = Some(pubkey);
     match app_state.program_accounts.get(&pubkey) {
         Some(data) => {
             let accounts = data.value();
@@ -455,12 +481,33 @@ async fn get_program_accounts<'a>(
                 account: Encode<'a, Pubkey>,
                 pubkey: Pubkey,
             }
+
+            let filters: Option<SmallVec<[Filter<'a>; 2]>> = config
+                .filters
+                .map(|s| serde_json::from_str(s.get()))
+                .transpose()?;
+
             let mut encoded_accounts = Vec::with_capacity(accounts.len());
+
             for key in accounts {
                 if let Some(data) = app_state.get(&key) {
                     if data.value().is_none() {
                         continue;
                     }
+
+                    if let Some(filters) = &filters {
+                        let matches = filters.iter().all(|f| {
+                            data.value()
+                                .as_ref()
+                                .map(|val| f.matches(&val.data))
+                                .unwrap_or(false)
+                        });
+                        if !matches {
+                            info!("skipped {} because of filter", data.key());
+                            continue;
+                        }
+                    }
+
                     encoded_accounts.push(AccountAndPubkey {
                         account: Encode {
                             inner: data,
