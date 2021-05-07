@@ -51,7 +51,8 @@ async fn main() {
 }
 
 async fn run(options: Options) {
-    let accounts_map = Arc::new(DashMap::new());
+    let accounts = Arc::new(DashMap::new());
+    let program_accounts = Arc::new(DashMap::new());
     let current_slot = Arc::new(AtomicU64::new(0));
 
     let (_, conn) = Client::builder()
@@ -64,14 +65,15 @@ async fn run(options: Options) {
 
     info!("connected to websocket rpc @ {}", options.ws_url);
 
-    let addr = AccountUpdateManager::init(current_slot.clone(), accounts_map.clone(), conn);
+    let addr = AccountUpdateManager::init(current_slot.clone(), accounts.clone(), conn);
 
     let rpc_url = options.rpc_url;
     let notify = Arc::new(Notify::new());
     let semaphore = Arc::new(Semaphore::new(options.request_limit));
     HttpServer::new(move || {
         let state = rpc::State {
-            accounts_map: accounts_map.clone(),
+            accounts: accounts.clone(),
+            program_accounts: program_accounts.clone(),
             client: Client::default(),
             tx: addr.clone(),
             rpc_url: rpc_url.clone(),

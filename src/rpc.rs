@@ -7,6 +7,7 @@ use actix_web::{web, Error, HttpResponse};
 
 use awc::Client;
 use bytes::Bytes;
+use dashmap::mapref::one::Ref;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
@@ -142,7 +143,8 @@ impl<'a> Serialize for EncodedAccountData<'a> {
 
 #[derive(Clone)]
 pub(crate) struct State {
-    pub accounts_map: Arc<DashMap<Pubkey, Option<AccountInfo>>>,
+    pub accounts: Arc<DashMap<Pubkey, Option<AccountInfo>>>,
+    pub program_accounts: Arc<DashMap<Pubkey, Vec<Pubkey>>>,
     pub client: Client,
     pub tx: Addr<AccountUpdateManager>,
     pub rpc_url: String,
@@ -152,12 +154,9 @@ pub(crate) struct State {
 }
 
 impl State {
-    fn get(
-        &self,
-        key: &Pubkey,
-    ) -> Option<dashmap::mapref::one::Ref<'_, Pubkey, Option<AccountInfo>>> {
+    fn get(&self, key: &Pubkey) -> Option<Ref<'_, Pubkey, Option<AccountInfo>>> {
         let tx = &self.tx;
-        self.accounts_map.get(key).map(|v| {
+        self.accounts.get(key).map(|v| {
             tx.do_send(AccountCommand::Reset(*key));
             v
         })
@@ -354,8 +353,130 @@ async fn get_account_info<'a>(
             result: AccountContext,
         }
         let info: Resp = serde_json::from_slice(&resp)?;
-        app_state.accounts_map.insert(pubkey, info.result.value);
+        app_state.accounts.insert(pubkey, info.result.value);
         app_state.map_updated.notify();
+    }
+
+    Ok(HttpResponse::Ok()
+        .content_type("application/json")
+        .body(resp))
+}
+
+async fn get_program_accounts<'a>(
+    req: Request<'a>,
+    app_state: web::Data<State>,
+) -> Result<HttpResponse, Error> {
+    let mut cacheable_for_key = None;
+
+    let params: SmallVec<[&RawValue; 2]> = serde_json::from_str(req.params.get())?;
+    if params.is_empty() {
+        return Ok(HttpResponse::Ok()
+            .content_type("application/json")
+            .json(ErrorResponse::not_enough_arguments(req.id)));
+    }
+    let pubkey: Pubkey = serde_json::from_str(params[0].get())?;
+    // todo: config
+    //
+    cacheable_for_key = Some(pubkey);
+    // todo do it
+    match app_state.program_accounts.get(&pubkey) {
+        Some(data) => {
+            let accounts = data.value();
+
+            struct Unref<'a, K, V>(Ref<'a, K, V>);
+
+            impl<'a, K, V> Serialize for Unref<'a, K, V>
+            where
+                V: Serialize,
+                K: Eq + std::hash::Hash,
+            {
+                fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+                where
+                    S: serde::Serializer,
+                {
+                    <V as Serialize>::serialize(self.0.value(), serializer)
+                }
+            }
+
+            #[derive(Serialize)]
+            struct AccountAndPubkey<'a> {
+                account: Unref<'a, Pubkey, Option<AccountInfo>>,
+                pubkey: Pubkey,
+            }
+            let mut encoded_accounts = Vec::with_capacity(accounts.len());
+            for key in accounts {
+                if let Some(data) = app_state.get(&key) {
+                    encoded_accounts.push(AccountAndPubkey {
+                        account: Unref(data),
+                        pubkey: *key,
+                    })
+                }
+            }
+            #[derive(Serialize)]
+            struct Resp<'a> {
+                jsonrpc: &'a str,
+                result: Vec<AccountAndPubkey<'a>>,
+                id: u64,
+            }
+            let resp = Resp {
+                jsonrpc: "2.0",
+                result: encoded_accounts,
+                id: req.id,
+            };
+
+            info!("program accounts cache hit for {}", pubkey);
+            return Ok(HttpResponse::Ok()
+                .content_type("application/json")
+                .json(&resp));
+        }
+        None => {}
+    }
+
+    let client = &app_state.client;
+    let limit = &app_state.request_limit;
+    let wait_for_response = async {
+        let mut retries = 10; // todo: proper backoff
+        loop {
+            retries -= 1;
+            let _permit = limit.acquire().await;
+            let mut resp = client.post(&app_state.rpc_url).send_json(&req).await?;
+            let body = resp
+                .body()
+                .await
+                .map_err(|_| awc::error::SendRequestError::Timeout); // todo
+            match body {
+                Ok(body) => break Ok(body),
+                Err(_) => {
+                    tokio::time::delay_for(std::time::Duration::from_millis(100)).await;
+                    if retries == 0 {
+                        break Err(awc::error::SendRequestError::Timeout);
+                    }
+                }
+            }
+        }
+    };
+
+    let resp = wait_for_response.await.unwrap();
+
+    if let Some(program_pubkey) = cacheable_for_key {
+        #[derive(Deserialize)]
+        struct AccountAndPubkey {
+            account: AccountInfo,
+            pubkey: Pubkey,
+        }
+        #[derive(Deserialize)]
+        struct Resp {
+            result: Vec<AccountAndPubkey>,
+        }
+        let resp: Resp = serde_json::from_slice(&resp)?;
+        let mut keys = Vec::with_capacity(resp.result.len());
+        for acc in resp.result {
+            let AccountAndPubkey { account, pubkey } = acc;
+            app_state.accounts.insert(pubkey, Some(account));
+            app_state.map_updated.notify();
+            keys.push(pubkey);
+        }
+        app_state.program_accounts.insert(program_pubkey, keys);
     }
 
     Ok(HttpResponse::Ok()
@@ -373,11 +494,9 @@ pub(crate) async fn rpc_handler(
         "getAccountInfo" => {
             return get_account_info(req, app_state).await;
         }
-        /*
         "getProgramAccounts" => {
             return get_program_accounts(req, app_state).await;
         }
-        */
         _ => {}
     }
 

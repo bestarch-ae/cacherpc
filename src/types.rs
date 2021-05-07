@@ -83,6 +83,18 @@ impl<'de> Deserialize<'de> for AccountData {
                 formatter.write_str("[]")
             }
 
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                let data = bs58::decode(v)
+                    .into_vec()
+                    .map_err(|_| serde::de::Error::custom("can't decode"))?;
+                Ok(AccountData {
+                    data: Bytes::from(data),
+                })
+            }
+
             fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
             where
                 A: serde::de::SeqAccess<'de>,
@@ -104,7 +116,7 @@ impl<'de> Deserialize<'de> for AccountData {
                 })
             }
         }
-        deserializer.deserialize_seq(AccountDataVisitor)
+        deserializer.deserialize_any(AccountDataVisitor)
     }
 }
 
