@@ -1,4 +1,3 @@
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use actix_web::{web, App, HttpServer};
@@ -17,6 +16,7 @@ mod rpc;
 mod types;
 
 use accounts::AccountUpdateManager;
+use types::AtomicSlot;
 
 #[derive(Debug, structopt::StructOpt)]
 struct Options {
@@ -53,7 +53,7 @@ async fn main() {
 async fn run(options: Options) {
     let accounts = Arc::new(DashMap::new());
     let program_accounts = Arc::new(DashMap::new());
-    let current_slot = Arc::new(AtomicU64::new(0));
+    let current_slot = AtomicSlot::default();
 
     let (_, conn) = Client::builder()
         .max_http_version(awc::http::Version::HTTP_11)

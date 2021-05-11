@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{self, AtomicU64};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,7 +12,7 @@ use tokio::sync::mpsc;
 use tokio::time::{DelayQueue, Instant};
 use tracing::{error, info};
 
-use crate::types::{AccountContext, AccountInfo, Pubkey, SolanaContext};
+use crate::types::{AccountContext, AccountInfo, AtomicSlot, Pubkey, SolanaContext};
 
 const PURGE_TIMEOUT: Duration = Duration::from_secs(600);
 
@@ -39,7 +38,7 @@ pub(crate) struct AccountUpdateManager {
     accounts: Arc<DashMap<Pubkey, Option<AccountInfo>>>,
     program_accounts: Arc<DashMap<Pubkey, HashSet<Pubkey>>>,
     purge_queue: DelayQueueHandle<Pubkey>,
-    slot: Arc<AtomicU64>,
+    slot: AtomicSlot,
 }
 
 impl std::fmt::Debug for AccountUpdateManager {
@@ -50,7 +49,7 @@ impl std::fmt::Debug for AccountUpdateManager {
 
 impl AccountUpdateManager {
     pub fn init(
-        current_slot: Arc<AtomicU64>,
+        current_slot: AtomicSlot,
         accounts: Arc<DashMap<Pubkey, Option<AccountInfo>>>,
         program_accounts: Arc<DashMap<Pubkey, HashSet<Pubkey>>>,
         conn: actix_codec::Framed<awc::BoxedSocket, awc::ws::Codec>,
@@ -209,7 +208,7 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
                                     }
                                 }
                                 InflightRequest::SlotSub(_) => {
-                                    info!(message = "subscribed to slot");
+                                    info!(message = "subscribed to root");
                                 }
                             }
                         }
@@ -227,6 +226,7 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
                                     subscription: u64,
                                 }
                                 let params: Params = serde_json::from_str(params.get())?;
+                                self.slot.update(params.result.context.slot);
                                 if let Some(key) = self.sub_to_key.get(&params.subscription) {
                                     self.accounts.insert(*key, params.result.value);
                                 }
@@ -248,6 +248,7 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
                                     subscription: u64,
                                 }
                                 let params: Params = serde_json::from_str(params.get())?;
+                                self.slot.update(params.result.context.slot);
                                 if let Some(program_key) = self.sub_to_key.get(&params.subscription) {
                                     let key = params.result.value.pubkey;
                                     self.accounts.insert(key, Some(params.result.value.account));
@@ -256,21 +257,15 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
                                     }
                                 }
                             }
-                            "slotNotification" => {
-                                #[derive(Deserialize)]
-                                struct SlotInfo {
-                                    //slot: u64,
-                                    root: u64,
-                                    //parent: u64,
-                                }
+                            "rootNotification" => {
                                 #[derive(Deserialize)]
                                 struct Params {
-                                    result: SlotInfo,
+                                    result: u64, //SlotInfo,
                                 }
                                 let params: Params = serde_json::from_str(params.get())?;
                                 //info!("slot {} root {} parent {}", params.result.slot, params.result.root, params.result.parent);
-                                let slot = params.result.root - 1; // TODO: figure out which slot validator *actually* reports
-                                self.slot.store(slot, atomic::Ordering::SeqCst);
+                                let slot = params.result; // TODO: figure out which slot validator *actually* reports
+                                self.slot.update(slot);
                             }
                             _ => {}
                         }
@@ -294,7 +289,7 @@ impl Actor for AccountUpdateManager {
         let request = serde_json::json!({
             "jsonrpc": "2.0",
             "id": request_id,
-            "method": "slotSubscribe",
+            "method": "rootSubscribe",
         });
         self.inflight
             .insert(request_id, InflightRequest::SlotSub(request_id));

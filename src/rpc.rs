@@ -1,6 +1,4 @@
 use std::collections::HashSet;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use actix::prelude::Addr;
@@ -17,7 +15,7 @@ use tokio::sync::{Notify, Semaphore};
 use tracing::info;
 
 use crate::accounts::{AccountCommand, AccountUpdateManager, Subscription};
-use crate::types::{AccountContext, AccountData, AccountInfo, Pubkey, SolanaContext};
+use crate::types::{AccountContext, AccountData, AccountInfo, AtomicSlot, Pubkey, SolanaContext};
 
 impl AccountInfo {
     fn encode(&self, encoding: Encoding, slice: Option<Slice>) -> EncodedAccountInfo {
@@ -159,7 +157,7 @@ pub(crate) struct State {
     pub client: Client,
     pub tx: Addr<AccountUpdateManager>,
     pub rpc_url: String,
-    pub current_slot: Arc<AtomicU64>,
+    pub current_slot: AtomicSlot,
     pub map_updated: Arc<Notify>,
     pub request_limit: Arc<Semaphore>,
 }
@@ -283,7 +281,7 @@ async fn get_account_info<'a>(
             return Ok(account_response(
                 req.id,
                 &data,
-                app_state.current_slot.load(Ordering::SeqCst),
+                app_state.current_slot.get(),
                 config.encoding,
                 config.data_slice,
             ));
@@ -345,7 +343,7 @@ async fn get_account_info<'a>(
                             return Ok(account_response(
                                 req.id,
                                 &data,
-                                app_state.current_slot.load(Ordering::SeqCst),
+                                app_state.current_slot.get(),
                                 config.encoding,
                                 config.data_slice,
                             ));
@@ -366,6 +364,7 @@ async fn get_account_info<'a>(
         let info: Resp = serde_json::from_slice(&resp)?;
         app_state.accounts.insert(pubkey, info.result.value);
         app_state.map_updated.notify();
+        app_state.current_slot.update(info.result.context.slot);
     }
 
     Ok(HttpResponse::Ok()

@@ -1,5 +1,26 @@
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+#[derive(Clone)]
+pub(crate) struct AtomicSlot(Arc<AtomicU64>);
+
+impl Default for AtomicSlot {
+    fn default() -> Self {
+        AtomicSlot(Arc::new(AtomicU64::new(1)))
+    }
+}
+
+impl AtomicSlot {
+    pub fn get(&self) -> u64 {
+        self.0.load(Ordering::Acquire)
+    }
+
+    pub fn update(&self, value: u64) {
+        self.0.fetch_max(value, Ordering::AcqRel);
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
