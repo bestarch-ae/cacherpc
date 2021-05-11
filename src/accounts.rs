@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 use tokio::time::{DelayQueue, Instant};
 use tracing::{error, info};
 
-use crate::types::{AccountContext, AccountInfo, Pubkey};
+use crate::types::{AccountContext, AccountInfo, Pubkey, SolanaContext};
 
 const PURGE_TIMEOUT: Duration = Duration::from_secs(600);
 
@@ -36,7 +36,8 @@ pub(crate) struct AccountUpdateManager {
             awc::ws::Message,
         >,
     >,
-    accounts_map: Arc<DashMap<Pubkey, Option<AccountInfo>>>,
+    accounts: Arc<DashMap<Pubkey, Option<AccountInfo>>>,
+    program_accounts: Arc<DashMap<Pubkey, HashSet<Pubkey>>>,
     purge_queue: DelayQueueHandle<Pubkey>,
     slot: Arc<AtomicU64>,
 }
@@ -50,7 +51,8 @@ impl std::fmt::Debug for AccountUpdateManager {
 impl AccountUpdateManager {
     pub fn init(
         current_slot: Arc<AtomicU64>,
-        accounts_map: Arc<DashMap<Pubkey, Option<AccountInfo>>>,
+        accounts: Arc<DashMap<Pubkey, Option<AccountInfo>>>,
+        program_accounts: Arc<DashMap<Pubkey, HashSet<Pubkey>>>,
         conn: actix_codec::Framed<awc::BoxedSocket, awc::ws::Codec>,
     ) -> Addr<Self> {
         AccountUpdateManager::create(|ctx| {
@@ -69,7 +71,8 @@ impl AccountUpdateManager {
                 inflight: HashMap::default(),
                 subs: HashSet::default(),
                 request_id: 1,
-                accounts_map: accounts_map.clone(),
+                accounts: accounts.clone(),
+                program_accounts: program_accounts.clone(),
                 purge_queue: handle,
                 slot: current_slot.clone(),
             }
@@ -96,25 +99,30 @@ impl Handler<AccountCommand> for AccountUpdateManager {
         let _ = (|| -> Result<(), serde_json::Error> {
             let request_id = self.next_request_id();
             match item {
-                AccountCommand::Subscribe(key) => {
-                    if self.subs.contains(&key) {
-                        info!("already trying to subscribe to {}", key);
-                        return Ok(());
-                    }
-
-                    info!("subscribe to {}", key);
-
+                AccountCommand::Subscribe(sub) => {
                     #[derive(Serialize)]
                     struct Request<'a> {
                         jsonrpc: &'a str,
                         id: u64,
                         method: &'a str,
-                        params: [Pubkey; 1],
+                        params: [Pubkey; 1], // TODO: commitment and other params
                     }
+
+                    let (key, method) = match sub {
+                        Subscription::Account(key) => (key, "accountSubscribe"),
+                        Subscription::Program(key) => (key, "programSubscribe"),
+                    };
+                    if self.subs.contains(&key) {
+                        info!("already trying to subscribe to {}", key);
+                        return Ok(());
+                    }
+
+                    info!("subscribe to {} ({})", key, method);
+
                     let request = Request {
                         jsonrpc: "2.0",
                         id: request_id,
-                        method: "accountSubscribe",
+                        method,
                         params: [key],
                     };
 
@@ -147,7 +155,7 @@ impl Handler<AccountCommand> for AccountUpdateManager {
                         self.sink
                             .write(awc::ws::Message::Text(serde_json::to_string(&request)?));
                     }
-                    self.accounts_map.remove(&key);
+                    self.accounts.remove(&key);
                 }
                 AccountCommand::Reset(key) => {
                     self.purge_queue.reset(key, PURGE_TIMEOUT);
@@ -220,7 +228,32 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
                                 }
                                 let params: Params = serde_json::from_str(params.get())?;
                                 if let Some(key) = self.sub_to_key.get(&params.subscription) {
-                                    self.accounts_map.insert(*key, params.result.value);
+                                    self.accounts.insert(*key, params.result.value);
+                                }
+                            }
+                            "programNotification" => {
+                                #[derive(Deserialize, Debug)]
+                                struct Value {
+                                    account: AccountInfo,
+                                    pubkey: Pubkey,
+                                }
+                                #[derive(Deserialize, Debug)]
+                                struct Result {
+                                    context: SolanaContext,
+                                    value: Value,
+                                }
+                                #[derive(Deserialize, Debug)]
+                                struct Params {
+                                    result: Result,
+                                    subscription: u64,
+                                }
+                                let params: Params = serde_json::from_str(params.get())?;
+                                if let Some(program_key) = self.sub_to_key.get(&params.subscription) {
+                                    let key = params.result.value.pubkey;
+                                    self.accounts.insert(key, Some(params.result.value.account));
+                                    if let Some(mut keys) = self.program_accounts.get_mut(program_key) {
+                                        keys.insert(params.result.value.pubkey);
+                                    }
                                 }
                             }
                             "slotNotification" => {
@@ -273,10 +306,16 @@ impl Actor for AccountUpdateManager {
 
 impl actix::io::WriteHandler<awc::error::WsProtocolError> for AccountUpdateManager {}
 
+#[derive(Debug)]
+pub(crate) enum Subscription {
+    Account(Pubkey),
+    Program(Pubkey),
+}
+
 #[derive(Message, Debug)]
 #[rtype(result = "()")]
 pub(crate) enum AccountCommand {
-    Subscribe(Pubkey),
+    Subscribe(Subscription),
     Reset(Pubkey),
     Purge(Pubkey),
 }

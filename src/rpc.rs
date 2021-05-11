@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -15,7 +16,7 @@ use smallvec::SmallVec;
 use tokio::sync::{Notify, Semaphore};
 use tracing::info;
 
-use crate::accounts::{AccountCommand, AccountUpdateManager};
+use crate::accounts::{AccountCommand, AccountUpdateManager, Subscription};
 use crate::types::{AccountContext, AccountData, AccountInfo, Pubkey, SolanaContext};
 
 impl AccountInfo {
@@ -154,7 +155,7 @@ impl<'a> Serialize for EncodedAccountData<'a> {
 #[derive(Clone)]
 pub(crate) struct State {
     pub accounts: Arc<DashMap<Pubkey, Option<AccountInfo>>>,
-    pub program_accounts: Arc<DashMap<Pubkey, Vec<Pubkey>>>,
+    pub program_accounts: Arc<DashMap<Pubkey, HashSet<Pubkey>>>,
     pub client: Client,
     pub tx: Addr<AccountUpdateManager>,
     pub rpc_url: String,
@@ -293,7 +294,7 @@ async fn get_account_info<'a>(
             }
             app_state
                 .tx
-                .send(AccountCommand::Subscribe(pubkey))
+                .send(AccountCommand::Subscribe(Subscription::Account(pubkey)))
                 .await
                 .unwrap();
         }
@@ -539,6 +540,11 @@ async fn get_program_accounts<'a>(
             if config.data_slice.is_some() || config.filters.is_some() {
                 cacheable_for_key = None;
             }
+            app_state
+                .tx
+                .send(AccountCommand::Subscribe(Subscription::Program(pubkey)))
+                .await
+                .unwrap();
         }
     }
 
@@ -579,12 +585,12 @@ async fn get_program_accounts<'a>(
             result: Vec<AccountAndPubkey>,
         }
         let resp: Resp = serde_json::from_slice(&resp)?;
-        let mut keys = Vec::with_capacity(resp.result.len());
+        let mut keys = HashSet::with_capacity(resp.result.len());
         for acc in resp.result {
             let AccountAndPubkey { account, pubkey } = acc;
             app_state.accounts.insert(pubkey, Some(account));
             app_state.map_updated.notify();
-            keys.push(pubkey);
+            keys.insert(pubkey);
         }
         app_state.program_accounts.insert(program_pubkey, keys);
     }

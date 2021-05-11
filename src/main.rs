@@ -65,7 +65,12 @@ async fn run(options: Options) {
 
     info!("connected to websocket rpc @ {}", options.ws_url);
 
-    let addr = AccountUpdateManager::init(current_slot.clone(), accounts.clone(), conn);
+    let addr = AccountUpdateManager::init(
+        current_slot.clone(),
+        accounts.clone(),
+        program_accounts.clone(),
+        conn,
+    );
 
     let rpc_url = options.rpc_url;
     let notify = Arc::new(Notify::new());
