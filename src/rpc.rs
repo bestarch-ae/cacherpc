@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use smallvec::SmallVec;
 use tokio::sync::{Notify, Semaphore};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::accounts::{AccountCommand, AccountUpdateManager, Subscription};
 use crate::types::{AccountContext, AccountData, AccountInfo, AtomicSlot, Pubkey, SolanaContext};
@@ -331,6 +331,7 @@ async fn get_account_info<'a>(
                 if let Ok(body) = body {
                     break body;
                 } else {
+                    warn!("gateway timeout");
                     return Ok(HttpResponse::GatewayTimeout().finish());
                 }
             }
@@ -358,13 +359,18 @@ async fn get_account_info<'a>(
 
     if let Some(pubkey) = cacheable_for_key {
         #[derive(Deserialize)]
-        struct Resp {
-            result: AccountContext,
+        struct Resp<'a> {
+            result: Option<AccountContext>,
+            #[serde(borrow)]
+            #[serde(rename = "error")] // TODO: handle
+            _error: Option<RpcError<'a>>,
         }
-        let info: Resp = serde_json::from_slice(&resp)?;
-        app_state.accounts.insert(pubkey, info.result.value);
-        app_state.map_updated.notify();
-        app_state.current_slot.update(info.result.context.slot);
+        let resp: Resp = serde_json::from_slice(&resp)?;
+        if let Some(info) = resp.result {
+            app_state.accounts.insert(pubkey, info.value);
+            app_state.map_updated.notify();
+            app_state.current_slot.update(info.context.slot);
+        }
     }
 
     Ok(HttpResponse::Ok()
