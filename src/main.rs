@@ -1,15 +1,13 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use actix_web::{web, App, HttpServer};
-
 use awc::Client;
 use dashmap::DashMap;
+use structopt::StructOpt;
 use tokio::sync::{Notify, Semaphore};
-
 use tracing::info;
 use tracing_subscriber;
-
-use structopt::StructOpt;
 
 mod accounts;
 mod rpc;
@@ -80,6 +78,7 @@ async fn run(options: Options) {
         let client = Client::builder()
             .connector(
                 awc::Connector::new()
+                    .timeout(Duration::from_secs(60))
                     .max_http_version(awc::http::Version::HTTP_11)
                     .limit(limit)
                     //.conn_keep_alive(Duration::from_secs(0))
