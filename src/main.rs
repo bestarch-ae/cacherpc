@@ -74,12 +74,23 @@ async fn run(options: Options) {
 
     let rpc_url = options.rpc_url;
     let notify = Arc::new(Notify::new());
+    let limit = options.request_limit;
     let semaphore = Arc::new(Semaphore::new(options.request_limit));
     HttpServer::new(move || {
+        let client = Client::builder()
+            .connector(
+                awc::Connector::new()
+                    .max_http_version(awc::http::Version::HTTP_11)
+                    .limit(limit)
+                    //.conn_keep_alive(Duration::from_secs(0))
+                    //.conn_lifetime(Duration::from_secs(0))
+                    .finish(),
+            )
+            .finish();
         let state = rpc::State {
             accounts: accounts.clone(),
             program_accounts: program_accounts.clone(),
-            client: Client::default(),
+            client,
             tx: addr.clone(),
             rpc_url: rpc_url.clone(),
             current_slot: current_slot.clone(),

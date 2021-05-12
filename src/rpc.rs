@@ -367,9 +367,12 @@ async fn get_account_info<'a>(
         }
         let resp: Resp = serde_json::from_slice(&resp)?;
         if let Some(info) = resp.result {
+            info!("cached for key {}", pubkey);
             app_state.accounts.insert(pubkey, info.value);
             app_state.map_updated.notify();
             app_state.current_slot.update(info.context.slot);
+        } else {
+            info!("cant cache for key {} because {:?}", pubkey, resp._error);
         }
     }
 
