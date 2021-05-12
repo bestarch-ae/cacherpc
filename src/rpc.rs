@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use actix::prelude::Addr;
-use actix_web::{web, Error, HttpResponse};
+use actix_web::{web, HttpResponse};
 
 use awc::Client;
 use bytes::Bytes;
@@ -11,6 +11,7 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use smallvec::SmallVec;
+use thiserror::Error;
 use tokio::sync::{Notify, Semaphore};
 use tracing::{info, warn};
 
@@ -191,18 +192,56 @@ struct RpcError<'a> {
 struct ErrorResponse<'a> {
     jsonrpc: &'a str,
     error: RpcError<'a>,
-    id: u64,
+    id: Option<u64>,
 }
 
 impl ErrorResponse<'static> {
     fn not_enough_arguments(id: u64) -> ErrorResponse<'static> {
         ErrorResponse {
             jsonrpc: "2.0",
-            id,
+            id: Some(id),
             error: RpcError {
                 code: -32602,
                 message: "`params` should have at least 1 argument(s)",
             },
+        }
+    }
+
+    fn invalid_request(id: Option<u64>) -> ErrorResponse<'static> {
+        ErrorResponse {
+            jsonrpc: "2.0",
+            id,
+            error: RpcError {
+                code: -32600,
+                message: "Invalid request",
+            },
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum Error {
+    #[error("invalid request")]
+    InvalidRequest(Option<u64>),
+    #[error("not enough arguments")]
+    NotEnoughArguments(u64),
+}
+
+impl From<serde_json::Error> for Error {
+    fn from(_err: serde_json::Error) -> Self {
+        Error::InvalidRequest(None)
+    }
+}
+
+impl actix_web::error::ResponseError for Error {
+    fn error_response(&self) -> HttpResponse {
+        match *self {
+            Error::InvalidRequest(req_id) => HttpResponse::Ok()
+                .content_type("application/json")
+                .json(&ErrorResponse::invalid_request(req_id)),
+            Error::NotEnoughArguments(req_id) => HttpResponse::Ok()
+                .content_type("application/json")
+                .json(&ErrorResponse::not_enough_arguments(req_id)),
         }
     }
 }
@@ -259,9 +298,7 @@ async fn get_account_info<'a>(
 
     let params: SmallVec<[&RawValue; 2]> = serde_json::from_str(req.params.get())?;
     if params.is_empty() {
-        return Ok(HttpResponse::Ok()
-            .content_type("application/json")
-            .json(ErrorResponse::not_enough_arguments(req.id)));
+        return Err(Error::NotEnoughArguments(req.id));
     }
     let pubkey: Pubkey = serde_json::from_str(params[0].get())?;
     let config: Config = {
