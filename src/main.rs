@@ -99,6 +99,7 @@ async fn run(options: Options) {
         App::new()
             .data(state)
             .service(web::resource("/").route(web::post().to(rpc::rpc_handler)))
+            .service(web::resource("/metrics").route(web::get().to(rpc::metrics_handler)))
     })
     .bind(options.addr)
     .unwrap()

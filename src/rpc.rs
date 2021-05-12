@@ -8,6 +8,11 @@ use awc::Client;
 use bytes::Bytes;
 use dashmap::mapref::one::Ref;
 use dashmap::DashMap;
+use once_cell::sync::Lazy;
+use prometheus::{
+    register_histogram_vec, register_int_counter, register_int_counter_vec, HistogramVec,
+    IntCounter, IntCounterVec,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use smallvec::SmallVec;
@@ -17,6 +22,60 @@ use tracing::{info, warn};
 
 use crate::accounts::{AccountCommand, AccountUpdateManager, Subscription};
 use crate::types::{AccountContext, AccountData, AccountInfo, AtomicSlot, Pubkey, SolanaContext};
+
+struct RpcMetrics {
+    request_types: IntCounterVec,
+    account_cache_hits: IntCounter,
+    account_cache_filled: IntCounter,
+    program_accounts_cache_hits: IntCounter,
+    program_accounts_cache_filled: IntCounter,
+    response_uncacheable: IntCounter,
+    backend_response_time: HistogramVec,
+}
+
+fn metrics() -> &'static RpcMetrics {
+    static METRICS: Lazy<RpcMetrics> = Lazy::new(|| RpcMetrics {
+        request_types: register_int_counter_vec!(
+            "request_types",
+            "Request counts by type",
+            &["type"]
+        )
+        .unwrap(),
+        account_cache_hits: register_int_counter!(
+            "program_accounts_cache_hits",
+            "Accounts cache hit"
+        )
+        .unwrap(),
+        account_cache_filled: register_int_counter!(
+            "accounts_cache_filled",
+            "Accounts cache filled while waiting for response"
+        )
+        .unwrap(),
+        program_accounts_cache_hits: register_int_counter!(
+            "program_accounts_cache_hits",
+            "Accounts cache hit"
+        )
+        .unwrap(),
+        program_accounts_cache_filled: register_int_counter!(
+            "accounts_cache_filled",
+            "Accounts cache filled while waiting for response"
+        )
+        .unwrap(),
+        response_uncacheable: register_int_counter!(
+            "response_uncacheable",
+            "Could not cache response"
+        )
+        .unwrap(),
+        backend_response_time: register_histogram_vec!(
+            "backend_response_time",
+            "Response time by type",
+            &["type"]
+        )
+        .unwrap(),
+    });
+
+    &METRICS
+}
 
 impl AccountInfo {
     fn encode(&self, encoding: Encoding, slice: Option<Slice>) -> EncodedAccountInfo {
@@ -309,12 +368,12 @@ async fn get_account_info<'a>(
         }
     };
 
-    let mut cacheable_for_key = None;
+    let mut cacheable_for_key = Some(pubkey);
 
     match app_state.get(&pubkey) {
         Some(data) => {
             let data = data.value();
-            info!("cache hit for {}", pubkey);
+            metrics().account_cache_hits.inc();
             return Ok(account_response(
                 req.id,
                 &data,
@@ -324,8 +383,9 @@ async fn get_account_info<'a>(
             ));
         }
         None => {
-            if config.data_slice.is_none() {
-                cacheable_for_key = Some(pubkey);
+            if config.data_slice.is_some() {
+                cacheable_for_key = None;
+                metrics().response_uncacheable.inc();
             }
             app_state
                 .tx
@@ -343,10 +403,12 @@ async fn get_account_info<'a>(
             retries -= 1;
             let _permit = limit.acquire().await;
             let mut resp = client.post(&app_state.rpc_url).send_json(&req).await?;
-            let body = resp
-                .body()
-                .await
-                .map_err(|_| awc::error::SendRequestError::Timeout); // todo
+            let timer = metrics()
+                .backend_response_time
+                .with_label_values(&["getAccountInfo"])
+                .start_timer();
+            let body = resp.body().await;
+            timer.observe_duration();
             match body {
                 Ok(body) => break Ok(body),
                 Err(_) => {
@@ -377,7 +439,8 @@ async fn get_account_info<'a>(
                     match app_state.get(&pubkey) {
                         Some(data) => {
                             let data = data.value();
-                            info!("got hit in map while waiting!");
+                            metrics().account_cache_hits.inc();
+                            metrics().account_cache_filled.inc();
                             return Ok(account_response(
                                 req.id,
                                 &data,
@@ -585,13 +648,12 @@ async fn get_program_accounts<'a>(
     match app_state.program_accounts.get(&pubkey) {
         Some(data) => {
             let accounts = data.value();
-
-            info!("program accounts cache hit for {}", pubkey);
+            metrics().program_accounts_cache_hits.inc();
             return program_accounts_response(req.id, &accounts, &config, &app_state);
         }
         None => {
             if config.data_slice.is_some() || config.filters.is_some() {
-                warn!("{} not cacheable: {:?}", pubkey, config);
+                metrics().response_uncacheable.inc();
                 cacheable_for_key = None;
             }
             app_state
@@ -609,12 +671,17 @@ async fn get_program_accounts<'a>(
         loop {
             retries -= 1;
             let _permit = limit.acquire().await;
+            let timer = metrics()
+                .backend_response_time
+                .with_label_values(&["getProgramAccounts"])
+                .start_timer();
             let mut resp = client
                 .post(&app_state.rpc_url)
                 .timeout(std::time::Duration::from_secs(30))
                 .send_json(&req)
                 .await?;
             let body = resp.body().limit(1024 * 1024 * 100).await;
+            timer.observe_duration();
             match body {
                 Ok(body) => {
                     break Ok(body);
@@ -647,7 +714,7 @@ async fn get_program_accounts<'a>(
                     match app_state.program_accounts.get(&program_pubkey) {
                         Some(data) => {
                             let data = data.value();
-                            info!("got hit in map while waiting!");
+                            metrics().program_accounts_cache_filled.inc();
                             return program_accounts_response(
                                 req.id,
                                 &data,
@@ -697,12 +764,22 @@ pub(crate) async fn rpc_handler(
 
     match req.method.as_ref() {
         "getAccountInfo" => {
+            metrics()
+                .request_types
+                .with_label_values(&["getAccountInfo"])
+                .inc();
             return get_account_info(req, app_state).await;
         }
         "getProgramAccounts" => {
+            metrics()
+                .request_types
+                .with_label_values(&["getProgramAccounts"])
+                .inc();
             return get_program_accounts(req, app_state).await;
         }
-        _ => {}
+        _ => {
+            metrics().request_types.with_label_values(&["other"]).inc();
+        }
     }
 
     let client = &app_state.client;
@@ -710,9 +787,21 @@ pub(crate) async fn rpc_handler(
         .post(&app_state.rpc_url)
         .send_json(&req)
         .await
-        .unwrap();
+        .unwrap(); // TODO
 
     Ok(HttpResponse::Ok()
         .content_type("application/json")
         .streaming(resp))
+}
+
+pub(crate) async fn metrics_handler(
+    _body: Bytes,
+    _app_state: web::Data<State>,
+) -> Result<HttpResponse, Error> {
+    use prometheus::{Encoder, TextEncoder};
+    let encoder = TextEncoder::new();
+    let mut buffer = Vec::new();
+    let families = prometheus::gather();
+    let _ = encoder.encode(&families, &mut buffer);
+    Ok(HttpResponse::Ok().content_type("text/plain").body(buffer))
 }
