@@ -76,9 +76,9 @@ async fn run(options: Options) {
     let semaphore = Arc::new(Semaphore::new(options.request_limit));
     HttpServer::new(move || {
         let client = Client::builder()
+            .timeout(Duration::from_secs(60))
             .connector(
                 awc::Connector::new()
-                    .timeout(Duration::from_secs(60))
                     .max_http_version(awc::http::Version::HTTP_11)
                     .limit(limit)
                     //.conn_keep_alive(Duration::from_secs(0))

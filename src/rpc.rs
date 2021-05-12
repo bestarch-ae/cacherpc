@@ -478,11 +478,99 @@ async fn get_program_accounts<'a>(
         }
     }
 
+    fn program_accounts_response<'a>(
+        req_id: u64,
+        accounts: &HashSet<Pubkey>,
+        config: &'a Config,
+        app_state: &web::Data<State>,
+    ) -> Result<HttpResponse, Error> {
+        struct Encode<'a, K> {
+            inner: Ref<'a, K, Option<AccountInfo>>,
+            encoding: Encoding,
+            slice: Option<Slice>,
+        }
+
+        impl<'a, K> Serialize for Encode<'a, K>
+        where
+            K: Eq + std::hash::Hash,
+        {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                if let Some(value) = self.inner.value() {
+                    let encoded = value.encode(self.encoding, self.slice);
+                    encoded.serialize(serializer)
+                } else {
+                    // shouldn't happen
+                    serializer.serialize_none()
+                }
+            }
+        }
+
+        #[derive(Serialize)]
+        struct AccountAndPubkey<'a> {
+            account: Encode<'a, Pubkey>,
+            pubkey: Pubkey,
+        }
+
+        let filters: Option<SmallVec<[Filter<'a>; 2]>> = config
+            .filters
+            .map(|s| serde_json::from_str(s.get()))
+            .transpose()?;
+
+        let mut encoded_accounts = Vec::with_capacity(accounts.len());
+
+        for key in accounts {
+            if let Some(data) = app_state.get(&key) {
+                if data.value().is_none() {
+                    continue;
+                }
+
+                if let Some(filters) = &filters {
+                    let matches = filters.iter().all(|f| {
+                        data.value()
+                            .as_ref()
+                            .map(|val| f.matches(&val.data))
+                            .unwrap_or(false)
+                    });
+                    if !matches {
+                        info!("skipped {} because of filter", data.key());
+                        continue;
+                    }
+                }
+
+                encoded_accounts.push(AccountAndPubkey {
+                    account: Encode {
+                        inner: data,
+                        encoding: config.encoding,
+                        slice: config.data_slice,
+                    },
+                    pubkey: *key,
+                })
+            }
+        }
+        #[derive(Serialize)]
+        struct Resp<'a> {
+            jsonrpc: &'a str,
+            result: Vec<AccountAndPubkey<'a>>,
+            id: u64,
+        }
+        let resp = Resp {
+            jsonrpc: "2.0",
+            result: encoded_accounts,
+            id: req_id,
+        };
+
+        //info!("program accounts cache hit for {}", pubkey);
+        Ok(HttpResponse::Ok()
+            .content_type("application/json")
+            .json(&resp))
+    }
+
     let params: SmallVec<[&RawValue; 2]> = serde_json::from_str(req.params.get())?;
     if params.is_empty() {
-        return Ok(HttpResponse::Ok()
-            .content_type("application/json")
-            .json(ErrorResponse::not_enough_arguments(req.id)));
+        return Err(Error::NotEnoughArguments(req.id));
     }
     let pubkey: Pubkey = serde_json::from_str(params[0].get())?;
     let config: Config = {
@@ -498,91 +586,12 @@ async fn get_program_accounts<'a>(
         Some(data) => {
             let accounts = data.value();
 
-            struct Encode<'a, K> {
-                inner: Ref<'a, K, Option<AccountInfo>>,
-                encoding: Encoding,
-                slice: Option<Slice>,
-            }
-
-            impl<'a, K> Serialize for Encode<'a, K>
-            where
-                K: Eq + std::hash::Hash,
-            {
-                fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-                where
-                    S: serde::Serializer,
-                {
-                    if let Some(value) = self.inner.value() {
-                        let encoded = value.encode(self.encoding, self.slice);
-                        encoded.serialize(serializer)
-                    } else {
-                        // shouldn't happen
-                        serializer.serialize_none()
-                    }
-                }
-            }
-
-            #[derive(Serialize)]
-            struct AccountAndPubkey<'a> {
-                account: Encode<'a, Pubkey>,
-                pubkey: Pubkey,
-            }
-
-            let filters: Option<SmallVec<[Filter<'a>; 2]>> = config
-                .filters
-                .map(|s| serde_json::from_str(s.get()))
-                .transpose()?;
-
-            let mut encoded_accounts = Vec::with_capacity(accounts.len());
-
-            for key in accounts {
-                if let Some(data) = app_state.get(&key) {
-                    if data.value().is_none() {
-                        continue;
-                    }
-
-                    if let Some(filters) = &filters {
-                        let matches = filters.iter().all(|f| {
-                            data.value()
-                                .as_ref()
-                                .map(|val| f.matches(&val.data))
-                                .unwrap_or(false)
-                        });
-                        if !matches {
-                            info!("skipped {} because of filter", data.key());
-                            continue;
-                        }
-                    }
-
-                    encoded_accounts.push(AccountAndPubkey {
-                        account: Encode {
-                            inner: data,
-                            encoding: config.encoding,
-                            slice: config.data_slice,
-                        },
-                        pubkey: *key,
-                    })
-                }
-            }
-            #[derive(Serialize)]
-            struct Resp<'a> {
-                jsonrpc: &'a str,
-                result: Vec<AccountAndPubkey<'a>>,
-                id: u64,
-            }
-            let resp = Resp {
-                jsonrpc: "2.0",
-                result: encoded_accounts,
-                id: req.id,
-            };
-
             info!("program accounts cache hit for {}", pubkey);
-            return Ok(HttpResponse::Ok()
-                .content_type("application/json")
-                .json(&resp));
+            return program_accounts_response(req.id, &accounts, &config, &app_state);
         }
         None => {
             if config.data_slice.is_some() || config.filters.is_some() {
+                warn!("{} not cacheable: {:?}", pubkey, config);
                 cacheable_for_key = None;
             }
             app_state
@@ -600,14 +609,17 @@ async fn get_program_accounts<'a>(
         loop {
             retries -= 1;
             let _permit = limit.acquire().await;
-            let mut resp = client.post(&app_state.rpc_url).send_json(&req).await?;
-            let body = resp
-                .body()
-                .await
-                .map_err(|_| awc::error::SendRequestError::Timeout); // todo
+            let mut resp = client
+                .post(&app_state.rpc_url)
+                .timeout(std::time::Duration::from_secs(30))
+                .send_json(&req)
+                .await?;
+            let body = resp.body().limit(1024 * 1024 * 100).await;
             match body {
-                Ok(body) => break Ok(body),
-                Err(_) => {
+                Ok(body) => {
+                    break Ok(body);
+                }
+                Err(_err) => {
                     tokio::time::delay_for(std::time::Duration::from_millis(100)).await;
                     if retries == 0 {
                         break Err(awc::error::SendRequestError::Timeout);
@@ -617,7 +629,39 @@ async fn get_program_accounts<'a>(
         }
     };
 
-    let resp = wait_for_response.await.unwrap(); // TODO
+    tokio::pin!(wait_for_response);
+
+    let resp = loop {
+        let notified = app_state.map_updated.notified();
+        tokio::select! {
+            body = &mut wait_for_response => {
+                if let Ok(body) = body {
+                    break body;
+                } else {
+                    warn!("gateway timeout");
+                    return Ok(HttpResponse::GatewayTimeout().finish());
+                }
+            }
+            _ = notified => {
+                if let Some(program_pubkey) = cacheable_for_key {
+                    match app_state.program_accounts.get(&program_pubkey) {
+                        Some(data) => {
+                            let data = data.value();
+                            info!("got hit in map while waiting!");
+                            return program_accounts_response(
+                                req.id,
+                                &data,
+                                &config,
+                                &app_state,
+                            );
+                        },
+                        None => {},
+                    }
+                }
+                continue;
+            }
+        }
+    };
 
     if let Some(program_pubkey) = cacheable_for_key {
         #[derive(Deserialize)]
@@ -634,10 +678,10 @@ async fn get_program_accounts<'a>(
         for acc in resp.result {
             let AccountAndPubkey { account, pubkey } = acc;
             app_state.accounts.insert(pubkey, Some(account));
-            app_state.map_updated.notify();
             keys.insert(pubkey);
         }
         app_state.program_accounts.insert(program_pubkey, keys);
+        app_state.map_updated.notify();
     }
 
     Ok(HttpResponse::Ok()
