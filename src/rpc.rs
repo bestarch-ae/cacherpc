@@ -236,7 +236,7 @@ pub(crate) struct State {
 }
 
 impl State {
-    fn get(&self, key: &Pubkey) -> Option<Ref<'_, Pubkey, Option<AccountInfo>>> {
+    fn get_account(&self, key: &Pubkey) -> Option<Ref<'_, Pubkey, Option<AccountInfo>>> {
         let tx = &self.tx;
         self.accounts.get(key).map(|v| {
             tx.do_send(AccountCommand::Reset(*key));
@@ -383,7 +383,7 @@ async fn get_account_info<'a>(
 
     let mut cacheable_for_key = Some(pubkey);
 
-    match app_state.get(&pubkey) {
+    match app_state.get_account(&pubkey) {
         Some(data) => {
             let data = data.value();
             metrics().account_cache_hits.inc();
@@ -449,7 +449,7 @@ async fn get_account_info<'a>(
             }
             _ = notified => {
                 if let Some(pubkey) = cacheable_for_key {
-                    match app_state.get(&pubkey) {
+                    match app_state.get_account(&pubkey) {
                         Some(data) => {
                             let data = data.value();
                             metrics().account_cache_hits.inc();
@@ -537,9 +537,10 @@ async fn get_program_accounts<'a>(
     struct Config<'a> {
         #[serde(default = "Encoding::default")]
         encoding: Encoding,
-        commitment: Option<&'a str>,
+        commitment: Option<Commitment>,
         #[serde(rename = "dataSlice")]
         data_slice: Option<Slice>,
+        #[serde(borrow)]
         filters: Option<&'a RawValue>,
     }
 
@@ -598,7 +599,7 @@ async fn get_program_accounts<'a>(
         let mut encoded_accounts = Vec::with_capacity(accounts.len());
 
         for key in accounts {
-            if let Some(data) = app_state.get(&key) {
+            if let Some(data) = app_state.get_account(&key) {
                 if data.value().is_none() {
                     continue;
                 }
