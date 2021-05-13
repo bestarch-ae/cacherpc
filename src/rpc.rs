@@ -34,6 +34,7 @@ struct RpcMetrics {
     program_accounts_cache_filled: IntCounter,
     response_uncacheable: IntCounter,
     backend_response_time: HistogramVec,
+    response_size_bytes: HistogramVec,
 }
 
 fn metrics() -> &'static RpcMetrics {
@@ -70,6 +71,16 @@ fn metrics() -> &'static RpcMetrics {
             "backend_response_time",
             "Response time by type",
             &["type"]
+        )
+        .unwrap(),
+        response_size_bytes: register_histogram_vec!(
+            "response_size_bytes",
+            "Response size by type",
+            &["type"],
+            vec![
+                0.0, 1024.0, 4096.0, 16384.0, 65536.0, 524288.0, 1048576.0, 4194304.0, 10485760.0,
+                20971520.0
+            ]
         )
         .unwrap(),
     });
@@ -342,10 +353,15 @@ async fn get_account_info<'a>(
                 .unwrap_or(EncodedAccountContext::empty(&ctx)),
             id: req_id,
         };
+        let body = serde_json::to_vec(&resp).unwrap(); // TODO
+        metrics()
+            .response_size_bytes
+            .with_label_values(&["getAccountInfo"])
+            .observe(body.len() as f64);
 
         HttpResponse::Ok()
             .content_type("application/json")
-            .json(&resp)
+            .body(body)
     }
 
     #[derive(Deserialize, Debug)]
@@ -636,10 +652,14 @@ async fn get_program_accounts<'a>(
             id: req_id,
         };
 
-        //info!("program accounts cache hit for {}", pubkey);
+        let body = serde_json::to_vec(&resp)?;
+        metrics()
+            .response_size_bytes
+            .with_label_values(&["getProgramAccounts"])
+            .observe(body.len() as f64);
         Ok(HttpResponse::Ok()
             .content_type("application/json")
-            .json(&resp))
+            .body(body))
     }
 
     let params: SmallVec<[&RawValue; 2]> = serde_json::from_str(req.params.get())?;
