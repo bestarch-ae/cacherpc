@@ -1,7 +1,56 @@
-use bytes::Bytes;
-use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+use bytes::Bytes;
+use dashmap::{mapref::one::Ref, DashMap};
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone)]
+pub(crate) struct AccountsDb(Arc<Inner>);
+
+struct Inner {
+    finalized: DashMap<Pubkey, Option<AccountInfo>>,
+    confirmed: DashMap<Pubkey, Option<AccountInfo>>,
+    processed: DashMap<Pubkey, Option<AccountInfo>>,
+}
+
+impl AccountsDb {
+    pub fn new() -> Self {
+        AccountsDb(Arc::new(Inner {
+            finalized: DashMap::new(),
+            confirmed: DashMap::new(),
+            processed: DashMap::new(),
+        }))
+    }
+
+    pub fn get(
+        &self,
+        key: &Pubkey,
+        commitment: Commitment,
+    ) -> Option<Ref<'_, Pubkey, Option<AccountInfo>>> {
+        match commitment {
+            Commitment::Confirmed => self.0.confirmed.get(key),
+            Commitment::Finalized => self.0.finalized.get(key),
+            Commitment::Processed => self.0.processed.get(key),
+        }
+    }
+
+    pub fn insert(&self, key: Pubkey, data: Option<AccountInfo>, commitment: Commitment) {
+        match commitment {
+            Commitment::Confirmed => self.0.confirmed.insert(key, data),
+            Commitment::Finalized => self.0.finalized.insert(key, data),
+            Commitment::Processed => self.0.processed.insert(key, data),
+        };
+    }
+
+    pub fn remove(&self, key: &Pubkey, commitment: Commitment) {
+        match commitment {
+            Commitment::Confirmed => self.0.confirmed.remove(key),
+            Commitment::Finalized => self.0.finalized.remove(key),
+            Commitment::Processed => self.0.processed.remove(key),
+        };
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct AtomicSlot(Arc<AtomicU64>);
@@ -19,6 +68,20 @@ impl AtomicSlot {
 
     pub fn update(&self, value: u64) {
         self.0.fetch_max(value, Ordering::AcqRel);
+    }
+}
+
+#[derive(Serialize, Debug, Deserialize, Copy, Clone)]
+#[serde(rename_all = "lowercase")]
+pub enum Commitment {
+    Finalized,
+    Confirmed,
+    Processed,
+}
+
+impl Default for Commitment {
+    fn default() -> Self {
+        Commitment::Finalized
     }
 }
 

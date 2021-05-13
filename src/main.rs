@@ -14,7 +14,7 @@ mod rpc;
 mod types;
 
 use accounts::AccountUpdateManager;
-use types::AtomicSlot;
+use types::{AccountsDb, AtomicSlot};
 
 #[derive(Debug, structopt::StructOpt)]
 struct Options {
@@ -51,7 +51,7 @@ async fn main() {
 }
 
 async fn run(options: Options) {
-    let accounts = Arc::new(DashMap::new());
+    let accounts = AccountsDb::new();
     let program_accounts = Arc::new(DashMap::new());
     let current_slot = AtomicSlot::default();
 

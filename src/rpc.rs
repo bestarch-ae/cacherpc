@@ -21,7 +21,10 @@ use tokio::sync::{Notify, Semaphore};
 use tracing::{info, warn};
 
 use crate::accounts::{AccountCommand, AccountUpdateManager, Subscription};
-use crate::types::{AccountContext, AccountData, AccountInfo, AtomicSlot, Pubkey, SolanaContext};
+use crate::types::{
+    AccountContext, AccountData, AccountInfo, AccountsDb, AtomicSlot, Commitment, Pubkey,
+    SolanaContext,
+};
 
 struct RpcMetrics {
     request_types: IntCounterVec,
@@ -81,20 +84,6 @@ impl AccountInfo {
             slice,
             encoding,
         }
-    }
-}
-
-#[derive(Serialize, Debug, Deserialize, Copy, Clone)]
-#[serde(rename_all = "lowercase")]
-enum Commitment {
-    Finalized,
-    Confirmed,
-    Processed,
-}
-
-impl Commitment {
-    fn default() -> Self {
-        Commitment::Finalized
     }
 }
 
@@ -224,7 +213,7 @@ impl<'a> Serialize for EncodedAccountData<'a> {
 
 #[derive(Clone)]
 pub(crate) struct State {
-    pub accounts: Arc<DashMap<Pubkey, Option<AccountInfo>>>,
+    pub accounts: AccountsDb,
     pub program_accounts: Arc<DashMap<Pubkey, HashSet<Pubkey>>>,
     pub client: Client,
     pub tx: Addr<AccountUpdateManager>,
@@ -236,12 +225,20 @@ pub(crate) struct State {
 }
 
 impl State {
-    fn get_account(&self, key: &Pubkey) -> Option<Ref<'_, Pubkey, Option<AccountInfo>>> {
+    fn get_account(
+        &self,
+        key: &Pubkey,
+        commitment: Commitment,
+    ) -> Option<Ref<'_, Pubkey, Option<AccountInfo>>> {
         let tx = &self.tx;
-        self.accounts.get(key).map(|v| {
+        self.accounts.get(key, commitment).map(|v| {
             tx.do_send(AccountCommand::Reset(*key));
             v
         })
+    }
+
+    fn insert(&self, key: Pubkey, data: Option<AccountInfo>, commitment: Commitment) {
+        self.accounts.insert(key, data, commitment)
     }
 }
 
@@ -383,7 +380,7 @@ async fn get_account_info<'a>(
 
     let mut cacheable_for_key = Some(pubkey);
 
-    match app_state.get_account(&pubkey) {
+    match app_state.get_account(&pubkey, config.commitment.unwrap_or_default()) {
         Some(data) => {
             let data = data.value();
             metrics().account_cache_hits.inc();
@@ -449,7 +446,7 @@ async fn get_account_info<'a>(
             }
             _ = notified => {
                 if let Some(pubkey) = cacheable_for_key {
-                    match app_state.get_account(&pubkey) {
+                    match app_state.get_account(&pubkey, config.commitment.unwrap_or_default()) {
                         Some(data) => {
                             let data = data.value();
                             metrics().account_cache_hits.inc();
@@ -481,7 +478,7 @@ async fn get_account_info<'a>(
         let resp: Resp = serde_json::from_slice(&resp)?;
         if let Some(info) = resp.result {
             info!("cached for key {}", pubkey);
-            app_state.accounts.insert(pubkey, info.value);
+            app_state.insert(pubkey, info.value, config.commitment.unwrap_or_default());
             app_state.map_updated.notify();
             app_state.current_slot.update(info.context.slot);
         } else {
@@ -599,7 +596,7 @@ async fn get_program_accounts<'a>(
         let mut encoded_accounts = Vec::with_capacity(accounts.len());
 
         for key in accounts {
-            if let Some(data) = app_state.get_account(&key) {
+            if let Some(data) = app_state.get_account(&key, config.commitment.unwrap_or_default()) {
                 if data.value().is_none() {
                     continue;
                 }
@@ -758,7 +755,7 @@ async fn get_program_accounts<'a>(
         let mut keys = HashSet::with_capacity(resp.result.len());
         for acc in resp.result {
             let AccountAndPubkey { account, pubkey } = acc;
-            app_state.accounts.insert(pubkey, Some(account));
+            app_state.insert(pubkey, Some(account), config.commitment.unwrap_or_default());
             keys.insert(pubkey);
         }
         app_state.program_accounts.insert(program_pubkey, keys);

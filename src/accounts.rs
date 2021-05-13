@@ -12,7 +12,9 @@ use tokio::sync::mpsc;
 use tokio::time::{DelayQueue, Instant};
 use tracing::{error, info};
 
-use crate::types::{AccountContext, AccountInfo, AtomicSlot, Pubkey, SolanaContext};
+use crate::types::{
+    AccountContext, AccountInfo, AccountsDb, AtomicSlot, Commitment, Pubkey, SolanaContext,
+};
 
 const PURGE_TIMEOUT: Duration = Duration::from_secs(600);
 
@@ -35,7 +37,7 @@ pub(crate) struct AccountUpdateManager {
             awc::ws::Message,
         >,
     >,
-    accounts: Arc<DashMap<Pubkey, Option<AccountInfo>>>,
+    accounts: AccountsDb,
     program_accounts: Arc<DashMap<Pubkey, HashSet<Pubkey>>>,
     purge_queue: DelayQueueHandle<Pubkey>,
     slot: AtomicSlot,
@@ -50,7 +52,7 @@ impl std::fmt::Debug for AccountUpdateManager {
 impl AccountUpdateManager {
     pub fn init(
         current_slot: AtomicSlot,
-        accounts: Arc<DashMap<Pubkey, Option<AccountInfo>>>,
+        accounts: AccountsDb,
         program_accounts: Arc<DashMap<Pubkey, HashSet<Pubkey>>>,
         conn: actix_codec::Framed<awc::BoxedSocket, awc::ws::Codec>,
     ) -> Addr<Self> {
@@ -154,7 +156,7 @@ impl Handler<AccountCommand> for AccountUpdateManager {
                         self.sink
                             .write(awc::ws::Message::Text(serde_json::to_string(&request)?));
                     }
-                    self.accounts.remove(&key);
+                    self.accounts.remove(&key, Commitment::Finalized);
                 }
                 AccountCommand::Reset(key) => {
                     self.purge_queue.reset(key, PURGE_TIMEOUT);
@@ -228,7 +230,7 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
                                 let params: Params = serde_json::from_str(params.get())?;
                                 self.slot.update(params.result.context.slot);
                                 if let Some(key) = self.sub_to_key.get(&params.subscription) {
-                                    self.accounts.insert(*key, params.result.value);
+                                    self.accounts.insert(*key, params.result.value, Commitment::Finalized);
                                 }
                             }
                             "programNotification" => {
@@ -251,7 +253,7 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
                                 self.slot.update(params.result.context.slot);
                                 if let Some(program_key) = self.sub_to_key.get(&params.subscription) {
                                     let key = params.result.value.pubkey;
-                                    self.accounts.insert(key, Some(params.result.value.account));
+                                    self.accounts.insert(key, Some(params.result.value.account), Commitment::Finalized);
                                     if let Some(mut keys) = self.program_accounts.get_mut(program_key) {
                                         keys.insert(params.result.value.pubkey);
                                     }
