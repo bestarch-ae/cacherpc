@@ -32,8 +32,10 @@ struct Options {
     rpc_url: String,
     #[structopt(short = "l", long = "listen", default_value = "127.0.0.1:8080")]
     addr: String,
-    #[structopt(short = "n", long = "request-limit", default_value = "10")]
-    request_limit: usize,
+    #[structopt(short = "p", long = "program-request-limit", default_value = "5")]
+    program_accounts_request_limit: usize,
+    #[structopt(short = "a", long = "account-request-limit", default_value = "100")]
+    account_info_request_limit: usize,
 }
 
 #[actix_web::main]
@@ -72,15 +74,19 @@ async fn run(options: Options) {
 
     let rpc_url = options.rpc_url;
     let notify = Arc::new(Notify::new());
-    let limit = options.request_limit;
-    let semaphore = Arc::new(Semaphore::new(options.request_limit));
+    let connection_limit =
+        options.account_info_request_limit + options.program_accounts_request_limit;
+    let account_info_request_limit = Arc::new(Semaphore::new(options.account_info_request_limit));
+    let program_accounts_request_limit =
+        Arc::new(Semaphore::new(options.program_accounts_request_limit));
+
     HttpServer::new(move || {
         let client = Client::builder()
             .timeout(Duration::from_secs(60))
             .connector(
                 awc::Connector::new()
                     .max_http_version(awc::http::Version::HTTP_11)
-                    .limit(limit)
+                    .limit(connection_limit)
                     //.conn_keep_alive(Duration::from_secs(0))
                     //.conn_lifetime(Duration::from_secs(0))
                     .finish(),
@@ -94,7 +100,8 @@ async fn run(options: Options) {
             rpc_url: rpc_url.clone(),
             current_slot: current_slot.clone(),
             map_updated: notify.clone(),
-            request_limit: semaphore.clone(),
+            account_info_request_limit: account_info_request_limit.clone(),
+            program_accounts_request_limit: program_accounts_request_limit.clone(),
         };
         App::new()
             .data(state)

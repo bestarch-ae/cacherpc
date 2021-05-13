@@ -41,24 +41,21 @@ fn metrics() -> &'static RpcMetrics {
             &["type"]
         )
         .unwrap(),
-        account_cache_hits: register_int_counter!(
-            "program_accounts_cache_hits",
-            "Accounts cache hit"
-        )
-        .unwrap(),
+        account_cache_hits: register_int_counter!("account_cache_hits", "Accounts cache hit")
+            .unwrap(),
         account_cache_filled: register_int_counter!(
-            "accounts_cache_filled",
+            "account_cache_filled",
             "Accounts cache filled while waiting for response"
         )
         .unwrap(),
         program_accounts_cache_hits: register_int_counter!(
             "program_accounts_cache_hits",
-            "Accounts cache hit"
+            "Program accounts cache hit"
         )
         .unwrap(),
         program_accounts_cache_filled: register_int_counter!(
-            "accounts_cache_filled",
-            "Accounts cache filled while waiting for response"
+            "program_accounts_cache_filled",
+            "Program accounts cache filled while waiting for response"
         )
         .unwrap(),
         response_uncacheable: register_int_counter!(
@@ -88,6 +85,20 @@ impl AccountInfo {
 }
 
 #[derive(Serialize, Debug, Deserialize, Copy, Clone)]
+#[serde(rename_all = "lowercase")]
+enum Commitment {
+    Finalized,
+    Confirmed,
+    Processed,
+}
+
+impl Commitment {
+    fn default() -> Self {
+        Commitment::Finalized
+    }
+}
+
+#[derive(Serialize, Debug, Deserialize, Copy, Clone)]
 enum Encoding {
     #[serde(skip)]
     Default,
@@ -97,6 +108,7 @@ enum Encoding {
     Base64,
     #[serde(rename = "base64+zstd")]
     Base64Zstd,
+    // TODO: json parsed
 }
 
 impl Encoding {
@@ -203,7 +215,7 @@ impl<'a> Serialize for EncodedAccountData<'a> {
                         .map_err(|_| Error::custom("can't compress"))?,
                 ))?;
             }
-            _ => panic!("must not happen, handled above"),
+            _ => panic!("must not happen, handled above"), // TODO: jsonparsed
         }
         seq.serialize_element(&self.encoding)?;
         seq.end()
@@ -219,7 +231,8 @@ pub(crate) struct State {
     pub rpc_url: String,
     pub current_slot: AtomicSlot,
     pub map_updated: Arc<Notify>,
-    pub request_limit: Arc<Semaphore>,
+    pub account_info_request_limit: Arc<Semaphore>,
+    pub program_accounts_request_limit: Arc<Semaphore>,
 }
 
 impl State {
@@ -320,7 +333,7 @@ async fn get_account_info<'a>(
         #[derive(Serialize)]
         struct Resp<'a> {
             jsonrpc: &'a str,
-            result: EncodedAccountContext<'a>, //AccountContext,
+            result: EncodedAccountContext<'a>,
             id: u64,
         }
         let ctx = SolanaContext { slot };
@@ -339,13 +352,13 @@ async fn get_account_info<'a>(
     }
 
     #[derive(Deserialize, Debug)]
-    struct Config<'a> {
+    struct Config {
         encoding: Encoding,
-        commitment: Option<&'a str>,
+        commitment: Option<Commitment>,
         #[serde(rename = "dataSlice")]
         data_slice: Option<Slice>,
     }
-    impl Default for Config<'static> {
+    impl Default for Config {
         fn default() -> Self {
             Config {
                 encoding: Encoding::Base58,
@@ -396,7 +409,7 @@ async fn get_account_info<'a>(
     }
 
     let client = &app_state.client;
-    let limit = &app_state.request_limit;
+    let limit = &app_state.account_info_request_limit;
     let wait_for_response = async {
         let mut retries = 10; // todo: proper backoff
         loop {
@@ -665,7 +678,7 @@ async fn get_program_accounts<'a>(
     }
 
     let client = &app_state.client;
-    let limit = &app_state.request_limit;
+    let limit = &app_state.program_accounts_request_limit;
     let wait_for_response = async {
         let mut retries = 10; // todo: proper backoff
         loop {
