@@ -259,7 +259,7 @@ struct Request<'a> {
     id: u64,
     method: &'a str,
     #[serde(borrow)]
-    params: &'a RawValue,
+    params: Option<&'a RawValue>,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -381,7 +381,10 @@ async fn get_account_info<'a>(
         }
     }
 
-    let params: SmallVec<[&RawValue; 2]> = serde_json::from_str(req.params.get())?;
+    let params: SmallVec<[&RawValue; 2]> = match req.params {
+        Some(params) => serde_json::from_str(params.get())?,
+        None => SmallVec::new(),
+    };
     if params.is_empty() {
         return Err(Error::NotEnoughArguments(req.id));
     }
@@ -662,7 +665,10 @@ async fn get_program_accounts<'a>(
             .body(body))
     }
 
-    let params: SmallVec<[&RawValue; 2]> = serde_json::from_str(req.params.get())?;
+    let params: SmallVec<[&RawValue; 2]> = match req.params {
+        Some(params) => serde_json::from_str(params.get())?,
+        None => SmallVec::new(),
+    };
     if params.is_empty() {
         return Err(Error::NotEnoughArguments(req.id));
     }
