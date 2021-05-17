@@ -230,7 +230,7 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
                                 let params: Params = serde_json::from_str(params.get())?;
                                 self.slot.update(params.result.context.slot);
                                 if let Some(key) = self.sub_to_key.get(&params.subscription) {
-                                    self.accounts.insert(*key, params.result.value, Commitment::Finalized);
+                                    self.accounts.insert(*key, params.result, Commitment::Finalized);
                                 }
                             }
                             "programNotification" => {
@@ -253,7 +253,8 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
                                 self.slot.update(params.result.context.slot);
                                 if let Some(program_key) = self.sub_to_key.get(&params.subscription) {
                                     let key = params.result.value.pubkey;
-                                    self.accounts.insert(key, Some(params.result.value.account), Commitment::Finalized);
+                                    self.accounts.insert(key, AccountContext {
+                                        value: Some(params.result.value.account), context: params.result.context },  Commitment::Finalized);
                                     if let Some(mut keys) = self.program_accounts.get_mut(program_key) {
                                         keys.insert(params.result.value.pubkey);
                                     }

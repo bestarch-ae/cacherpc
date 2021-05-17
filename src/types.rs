@@ -6,49 +6,70 @@ use dashmap::{mapref::one::Ref, DashMap};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone)]
-pub(crate) struct AccountsDb(Arc<Inner>);
+pub(crate) struct AccountsDb {
+    map: Arc<DashMap<Pubkey, AccountState>>,
+    slot: Arc<[AtomicU64; 3]>,
+}
 
-struct Inner {
-    finalized: DashMap<Pubkey, Option<AccountInfo>>,
-    confirmed: DashMap<Pubkey, Option<AccountInfo>>,
-    processed: DashMap<Pubkey, Option<AccountInfo>>,
+type Slot = u64;
+
+struct Account {
+    data: Option<AccountInfo>,
+    #[allow(dead_code)] // TODO
+    slot: Slot,
+}
+
+pub(crate) struct AccountState([Option<Account>; 3]);
+
+impl Default for AccountState {
+    fn default() -> AccountState {
+        AccountState([None, None, None])
+    }
+}
+
+impl AccountState {
+    pub fn get(&self, commitment: Commitment) -> Option<Option<&AccountInfo>> {
+        let mut result = None;
+        for acc in self.0.iter().take(commitment.as_idx() + 1) {
+            if acc.is_some() {
+                result = acc.as_ref().map(|state| state.data.as_ref());
+            }
+        }
+        result
+    }
+
+    fn insert(&mut self, commitment: Commitment, data: AccountContext) {
+        (self.0)[commitment.as_idx()] = Some(Account {
+            data: data.value,
+            slot: data.context.slot,
+        })
+    }
 }
 
 impl AccountsDb {
     pub fn new() -> Self {
-        AccountsDb(Arc::new(Inner {
-            finalized: DashMap::new(),
-            confirmed: DashMap::new(),
-            processed: DashMap::new(),
-        }))
-    }
-
-    pub fn get(
-        &self,
-        key: &Pubkey,
-        commitment: Commitment,
-    ) -> Option<Ref<'_, Pubkey, Option<AccountInfo>>> {
-        match commitment {
-            Commitment::Confirmed => self.0.confirmed.get(key),
-            Commitment::Finalized => self.0.finalized.get(key),
-            Commitment::Processed => self.0.processed.get(key),
+        AccountsDb {
+            map: Arc::new(DashMap::new()),
+            slot: Arc::new([AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)]),
         }
     }
 
-    pub fn insert(&self, key: Pubkey, data: Option<AccountInfo>, commitment: Commitment) {
-        match commitment {
-            Commitment::Confirmed => self.0.confirmed.insert(key, data),
-            Commitment::Finalized => self.0.finalized.insert(key, data),
-            Commitment::Processed => self.0.processed.insert(key, data),
-        };
+    pub fn get(&self, key: &Pubkey) -> Option<Ref<'_, Pubkey, AccountState>> {
+        self.map.get(key)
     }
 
-    pub fn remove(&self, key: &Pubkey, commitment: Commitment) {
-        match commitment {
-            Commitment::Confirmed => self.0.confirmed.remove(key),
-            Commitment::Finalized => self.0.finalized.remove(key),
-            Commitment::Processed => self.0.processed.remove(key),
-        };
+    pub fn insert(&self, key: Pubkey, data: AccountContext, commitment: Commitment) {
+        let mut entry = self.map.entry(key).or_default();
+        self.update_slot(commitment, data.context.slot);
+        entry.insert(commitment, data);
+    }
+
+    pub fn remove(&self, key: &Pubkey, _commitment: Commitment) {
+        self.map.remove(key);
+    }
+
+    fn update_slot(&self, commitment: Commitment, val: u64) {
+        self.slot[commitment.as_idx()].fetch_max(val, Ordering::AcqRel);
     }
 }
 
@@ -71,12 +92,22 @@ impl AtomicSlot {
     }
 }
 
-#[derive(Serialize, Debug, Deserialize, Copy, Clone)]
+#[derive(Serialize, Debug, Deserialize, Copy, Clone, Eq, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum Commitment {
     Finalized,
     Confirmed,
     Processed,
+}
+
+impl Commitment {
+    fn as_idx(self) -> usize {
+        match self {
+            Commitment::Finalized => 0,
+            Commitment::Confirmed => 1,
+            Commitment::Processed => 2,
+        }
+    }
 }
 
 impl Default for Commitment {

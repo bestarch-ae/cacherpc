@@ -22,8 +22,8 @@ use tracing::{info, warn};
 
 use crate::accounts::{AccountCommand, AccountUpdateManager, Subscription};
 use crate::types::{
-    AccountContext, AccountData, AccountInfo, AccountsDb, AtomicSlot, Commitment, Pubkey,
-    SolanaContext,
+    AccountContext, AccountData, AccountInfo, AccountState, AccountsDb, AtomicSlot, Commitment,
+    Pubkey, SolanaContext,
 };
 
 struct RpcMetrics {
@@ -236,19 +236,15 @@ pub(crate) struct State {
 }
 
 impl State {
-    fn get_account(
-        &self,
-        key: &Pubkey,
-        commitment: Commitment,
-    ) -> Option<Ref<'_, Pubkey, Option<AccountInfo>>> {
+    fn get_account(&self, key: &Pubkey) -> Option<Ref<'_, Pubkey, AccountState>> {
         let tx = &self.tx;
-        self.accounts.get(key, commitment).map(|v| {
+        self.accounts.get(key).map(|v| {
             tx.do_send(AccountCommand::Reset(*key));
             v
         })
     }
 
-    fn insert(&self, key: Pubkey, data: Option<AccountInfo>, commitment: Commitment) {
+    fn insert(&self, key: Pubkey, data: AccountContext, commitment: Commitment) {
         self.accounts.insert(key, data, commitment)
     }
 }
@@ -333,7 +329,7 @@ async fn get_account_info<'a>(
     #[inline]
     fn account_response(
         req_id: u64,
-        acc: &Option<AccountInfo>,
+        acc: Option<&AccountInfo>,
         slot: u64,
         encoding: Encoding,
         slice: Option<Slice>,
@@ -399,17 +395,23 @@ async fn get_account_info<'a>(
 
     let mut cacheable_for_key = Some(pubkey);
 
-    match app_state.get_account(&pubkey, config.commitment.unwrap_or_default()) {
+    match app_state.get_account(&pubkey) {
         Some(data) => {
             let data = data.value();
-            metrics().account_cache_hits.inc();
-            return Ok(account_response(
-                req.id,
-                &data,
-                app_state.current_slot.get(),
-                config.encoding,
-                config.data_slice,
-            ));
+            let account = data.get(config.commitment.unwrap_or_default());
+            match account {
+                Some(account) => {
+                    metrics().account_cache_hits.inc();
+                    return Ok(account_response(
+                        req.id,
+                        account,
+                        app_state.current_slot.get(),
+                        config.encoding,
+                        config.data_slice,
+                    ));
+                }
+                None => {}
+            }
         }
         None => {
             if config.data_slice.is_some() {
@@ -465,18 +467,23 @@ async fn get_account_info<'a>(
             }
             _ = notified => {
                 if let Some(pubkey) = cacheable_for_key {
-                    match app_state.get_account(&pubkey, config.commitment.unwrap_or_default()) {
+                    match app_state.get_account(&pubkey) {
                         Some(data) => {
                             let data = data.value();
-                            metrics().account_cache_hits.inc();
-                            metrics().account_cache_filled.inc();
-                            return Ok(account_response(
-                                req.id,
-                                &data,
-                                app_state.current_slot.get(),
-                                config.encoding,
-                                config.data_slice,
-                            ));
+                            match data.get(config.commitment.unwrap_or_default()) {
+                                None => {},
+                                Some(account) => {
+                                    metrics().account_cache_hits.inc();
+                                    metrics().account_cache_filled.inc();
+                                    return Ok(account_response(
+                                            req.id,
+                                            account,
+                                            app_state.current_slot.get(),
+                                            config.encoding,
+                                            config.data_slice,
+                                    ));
+                                }
+                            }
                         },
                         None => {},
                     }
@@ -497,9 +504,10 @@ async fn get_account_info<'a>(
         let resp: Resp = serde_json::from_slice(&resp)?;
         if let Some(info) = resp.result {
             info!("cached for key {}", pubkey);
-            app_state.insert(pubkey, info.value, config.commitment.unwrap_or_default());
+            let slot = info.context.slot;
+            app_state.insert(pubkey, info, config.commitment.unwrap_or_default());
             app_state.map_updated.notify();
-            app_state.current_slot.update(info.context.slot);
+            app_state.current_slot.update(slot);
         } else {
             info!("cant cache for key {} because {:?}", pubkey, resp._error);
         }
@@ -576,11 +584,13 @@ async fn get_program_accounts<'a>(
         accounts: &HashSet<Pubkey>,
         config: &'a Config,
         app_state: &web::Data<State>,
+        commitment: Commitment,
     ) -> Result<HttpResponse, Error> {
         struct Encode<'a, K> {
-            inner: Ref<'a, K, Option<AccountInfo>>,
+            inner: Ref<'a, K, AccountState>,
             encoding: Encoding,
             slice: Option<Slice>,
+            commitment: Commitment,
         }
 
         impl<'a, K> Serialize for Encode<'a, K>
@@ -591,7 +601,7 @@ async fn get_program_accounts<'a>(
             where
                 S: serde::Serializer,
             {
-                if let Some(value) = self.inner.value() {
+                if let Some(Some(value)) = self.inner.value().get(self.commitment) {
                     let encoded = value.encode(self.encoding, self.slice);
                     encoded.serialize(serializer)
                 } else {
@@ -615,14 +625,15 @@ async fn get_program_accounts<'a>(
         let mut encoded_accounts = Vec::with_capacity(accounts.len());
 
         for key in accounts {
-            if let Some(data) = app_state.get_account(&key, config.commitment.unwrap_or_default()) {
-                if data.value().is_none() {
+            if let Some(data) = app_state.get_account(&key) {
+                if data.value().get(commitment).is_none() {
                     continue;
                 }
 
                 if let Some(filters) = &filters {
                     let matches = filters.iter().all(|f| {
-                        data.value()
+                        let value = data.value().get(commitment).unwrap(); // checked above
+                        value
                             .as_ref()
                             .map(|val| f.matches(&val.data))
                             .unwrap_or(false)
@@ -638,6 +649,7 @@ async fn get_program_accounts<'a>(
                         inner: data,
                         encoding: config.encoding,
                         slice: config.data_slice,
+                        commitment,
                     },
                     pubkey: *key,
                 })
@@ -686,7 +698,13 @@ async fn get_program_accounts<'a>(
         Some(data) => {
             let accounts = data.value();
             metrics().program_accounts_cache_hits.inc();
-            return program_accounts_response(req.id, &accounts, &config, &app_state);
+            return program_accounts_response(
+                req.id,
+                &accounts,
+                &config,
+                &app_state,
+                config.commitment.unwrap_or_default(),
+            );
         }
         None => {
             if config.data_slice.is_some() || config.filters.is_some() {
@@ -757,6 +775,7 @@ async fn get_program_accounts<'a>(
                                 &data,
                                 &config,
                                 &app_state,
+                                config.commitment.unwrap_or_default(),
                             );
                         },
                         None => {},
@@ -781,7 +800,14 @@ async fn get_program_accounts<'a>(
         let mut keys = HashSet::with_capacity(resp.result.len());
         for acc in resp.result {
             let AccountAndPubkey { account, pubkey } = acc;
-            app_state.insert(pubkey, Some(account), config.commitment.unwrap_or_default());
+            app_state.insert(
+                pubkey,
+                AccountContext {
+                    value: Some(account),
+                    context: SolanaContext { slot: 0 },
+                },
+                config.commitment.unwrap_or_default(),
+            );
             keys.insert(pubkey);
         }
         app_state.program_accounts.insert(program_pubkey, keys);
