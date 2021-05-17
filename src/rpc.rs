@@ -155,7 +155,7 @@ impl<'a> Serialize for EncodedAccountInfo<'a> {
         account_info.serialize_field("lamports", &self.account_info.lamports)?;
         account_info.serialize_field("owner", &self.account_info.owner)?;
         account_info.serialize_field("executable", &self.account_info.executable)?;
-        account_info.serialize_field("rent_epoch", &self.account_info.rent_epoch)?;
+        account_info.serialize_field("rentEpoch", &self.account_info.rent_epoch)?;
         account_info.end()
     }
 }
