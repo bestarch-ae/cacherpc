@@ -20,7 +20,7 @@ use crate::types::{
 const PURGE_TIMEOUT: Duration = Duration::from_secs(600);
 
 enum InflightRequest {
-    Sub(Pubkey),
+    Sub(Pubkey, Commitment),
     Unsub(Pubkey),
     SlotSub(u64),
 }
@@ -28,8 +28,8 @@ enum InflightRequest {
 pub(crate) struct AccountUpdateManager {
     request_id: u64,
     inflight: HashMap<u64, InflightRequest>,
-    subs: HashSet<Pubkey>,
-    sub_to_key: HashMap<u64, Pubkey>,
+    subs: HashSet<(Pubkey, Commitment)>,
+    sub_to_key: HashMap<u64, (Pubkey, Commitment)>,
     key_to_sub: HashMap<Pubkey, u64>,
     sink: SinkWrite<
         awc::ws::Message,
@@ -138,12 +138,12 @@ impl Handler<AccountCommand> for AccountUpdateManager {
                         Subscription::Account(key) => (key, "accountSubscribe"),
                         Subscription::Program(key) => (key, "programSubscribe"),
                     };
-                    if self.subs.contains(&key) {
+                    if self.subs.contains(&(key, commitment)) {
                         info!("already trying to subscribe to {}", key);
                         return Ok(());
                     }
 
-                    info!("subscribe to {} ({})", key, method);
+                    info!("subscribe to {} ({}/{:?})", key, method, commitment);
 
                     let request = Request {
                         jsonrpc: "2.0",
@@ -158,8 +158,9 @@ impl Handler<AccountCommand> for AccountUpdateManager {
                         },
                     };
 
-                    self.inflight.insert(request_id, InflightRequest::Sub(key));
-                    self.subs.insert(key);
+                    self.inflight
+                        .insert(request_id, InflightRequest::Sub(key, commitment));
+                    self.subs.insert((key, commitment));
                     self.sink
                         .write(awc::ws::Message::Text(serde_json::to_string(&request)?));
                     self.purge_queue.insert(key, PURGE_TIMEOUT);
@@ -222,17 +223,18 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
                     if let (Some(result), Some(id)) = (value.result, value.id) {
                         if let Some(req) = self.inflight.remove(&id) {
                             match req {
-                                InflightRequest::Sub(key) => {
+                                InflightRequest::Sub(key, commitment) => {
                                     let sub_id: u64 = serde_json::from_str(result.get())?;
-                                    self.sub_to_key.insert(sub_id, key);
+                                    self.sub_to_key.insert(sub_id, (key, commitment));
                                     self.key_to_sub.insert(key, sub_id);
                                     info!(message = "subscribed to stream", sub = sub_id, key = %key);
                                 }
                                 InflightRequest::Unsub(key) => {
                                     //let _is_ok: bool = serde_json::from_str(result.get()).unwrap();
                                     if let Some(sub) = self.key_to_sub.remove(&key) {
-                                        self.subs.remove(&key);
-                                        self.sub_to_key.remove(&sub);
+                                        if let Some(val) = self.sub_to_key.remove(&sub) {
+                                            self.subs.remove(&val);
+                                        }
                                         info!(
                                             message = "unsubscribed from stream",
                                             sub = sub,
@@ -253,15 +255,15 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
                     if let (Some(method), Some(params)) = (value.method, value.params) {
                         match method {
                             "accountNotification" => {
-                                #[derive(Deserialize)]
+                                #[derive(Deserialize, Debug)]
                                 struct Params {
                                     result: AccountContext,
                                     subscription: u64,
                                 }
                                 let params: Params = serde_json::from_str(params.get())?;
                                 self.slot.update(params.result.context.slot);
-                                if let Some(key) = self.sub_to_key.get(&params.subscription) {
-                                    self.accounts.insert(*key, params.result, Commitment::Finalized);
+                                if let Some((key, commitment)) = self.sub_to_key.get(&params.subscription) {
+                                    self.accounts.insert(*key, params.result, *commitment);
                                 }
                             }
                             "programNotification" => {
@@ -282,7 +284,7 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
                                 }
                                 let params: Params = serde_json::from_str(params.get())?;
                                 self.slot.update(params.result.context.slot);
-                                if let Some(program_key) = self.sub_to_key.get(&params.subscription) {
+                                if let Some((program_key, _)) = self.sub_to_key.get(&params.subscription) {
                                     let key = params.result.value.pubkey;
                                     self.accounts.insert(key, AccountContext {
                                         value: Some(params.result.value.account), context: params.result.context },  Commitment::Finalized);

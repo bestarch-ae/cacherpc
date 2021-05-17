@@ -13,6 +13,7 @@ pub(crate) struct AccountsDb {
 
 type Slot = u64;
 
+#[derive(Debug)]
 struct Account {
     data: Option<AccountInfo>,
     #[allow(dead_code)] // TODO
@@ -30,9 +31,13 @@ impl Default for AccountState {
 impl AccountState {
     pub fn get(&self, commitment: Commitment) -> Option<Option<&AccountInfo>> {
         let mut result = None;
+        let mut slot = 0;
         for acc in self.0.iter().take(commitment.as_idx() + 1) {
-            if acc.is_some() {
-                result = acc.as_ref().map(|state| state.data.as_ref());
+            if let Some(ref acc) = acc {
+                if acc.slot > slot {
+                    result = Some(acc.data.as_ref());
+                    slot = acc.slot;
+                }
             }
         }
         result
@@ -92,7 +97,7 @@ impl AtomicSlot {
     }
 }
 
-#[derive(Serialize, Debug, Deserialize, Copy, Clone, Eq, PartialEq)]
+#[derive(Serialize, Debug, Deserialize, Copy, Clone, Eq, PartialEq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum Commitment {
     Finalized,
