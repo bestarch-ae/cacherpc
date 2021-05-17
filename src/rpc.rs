@@ -281,6 +281,8 @@ pub(crate) enum Error {
     InvalidRequest(Option<u64>),
     #[error("not enough arguments")]
     NotEnoughArguments(u64),
+    #[error("client error")]
+    ClientError(#[from] awc::error::SendRequestError),
 }
 
 impl From<serde_json::Error> for Error {
@@ -291,13 +293,14 @@ impl From<serde_json::Error> for Error {
 
 impl actix_web::error::ResponseError for Error {
     fn error_response(&self) -> HttpResponse {
-        match *self {
+        match self {
             Error::InvalidRequest(req_id) => HttpResponse::Ok()
                 .content_type("application/json")
-                .json(&ErrorResponse::invalid_request(req_id)),
+                .json(&ErrorResponse::invalid_request(*req_id)),
             Error::NotEnoughArguments(req_id) => HttpResponse::Ok()
                 .content_type("application/json")
-                .json(&ErrorResponse::not_enough_arguments(req_id)),
+                .json(&ErrorResponse::not_enough_arguments(*req_id)),
+            Error::ClientError(_error) => HttpResponse::GatewayTimeout().finish(), // TODO
         }
     }
 }
@@ -819,11 +822,7 @@ pub(crate) async fn rpc_handler(
     }
 
     let client = &app_state.client;
-    let resp = client
-        .post(&app_state.rpc_url)
-        .send_json(&req)
-        .await
-        .unwrap(); // TODO
+    let resp = client.post(&app_state.rpc_url).send_json(&req).await?;
 
     Ok(HttpResponse::Ok()
         .content_type("application/json")
