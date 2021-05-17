@@ -89,7 +89,7 @@ fn metrics() -> &'static RpcMetrics {
 }
 
 impl AccountInfo {
-    fn encode(&self, encoding: Encoding, slice: Option<Slice>) -> EncodedAccountInfo {
+    fn encode(&self, encoding: Encoding, slice: Option<Slice>) -> EncodedAccountInfo<'_> {
         EncodedAccountInfo {
             account_info: &self,
             slice,
@@ -148,7 +148,7 @@ struct EncodedAccountContext<'a> {
 }
 
 impl<'a> EncodedAccountContext<'a> {
-    fn empty(ctx: &'a SolanaContext) -> EncodedAccountContext {
+    fn empty(ctx: &'a SolanaContext) -> EncodedAccountContext<'_> {
         EncodedAccountContext {
             context: ctx,
             value: None,
@@ -173,7 +173,7 @@ impl<'a> Serialize for EncodedAccountData<'a> {
             self.data
                 .data
                 .get(slice.offset..slice.offset + slice.length)
-                .ok_or(Error::custom("bad slice"))?
+                .ok_or_else(|| Error::custom("bad slice"))?
         } else {
             &self.data.data[..]
         };
@@ -303,8 +303,8 @@ impl actix_web::error::ResponseError for Error {
     }
 }
 
-async fn get_account_info<'a>(
-    req: Request<'a>,
+async fn get_account_info(
+    req: Request<'_>,
     app_state: web::Data<State>,
 ) -> Result<HttpResponse, Error> {
     #[inline]
@@ -327,7 +327,7 @@ async fn get_account_info<'a>(
             result: acc
                 .as_ref()
                 .map(|acc| acc.encode(encoding, slice).with_context(&ctx))
-                .unwrap_or(EncodedAccountContext::empty(&ctx)),
+                .unwrap_or_else(|| EncodedAccountContext::empty(&ctx)),
             id: req_id,
         };
         let body = serde_json::to_vec(&resp).unwrap(); // TODO
@@ -380,18 +380,15 @@ async fn get_account_info<'a>(
         Some(data) => {
             let data = data.value();
             let account = data.get(config.commitment.unwrap_or_default());
-            match account {
-                Some(account) => {
-                    metrics().account_cache_hits.inc();
-                    return Ok(account_response(
-                        req.id,
-                        account,
-                        app_state.current_slot.get(),
-                        config.encoding,
-                        config.data_slice,
-                    ));
-                }
-                None => {}
+            if let Some(account) = account {
+                metrics().account_cache_hits.inc();
+                return Ok(account_response(
+                    req.id,
+                    account,
+                    app_state.current_slot.get(),
+                    config.encoding,
+                    config.data_slice,
+                ));
             }
         }
         None => {
@@ -451,25 +448,19 @@ async fn get_account_info<'a>(
             }
             _ = notified => {
                 if let Some(pubkey) = cacheable_for_key {
-                    match app_state.get_account(&pubkey) {
-                        Some(data) => {
-                            let data = data.value();
-                            match data.get(config.commitment.unwrap_or_default()) {
-                                None => {},
-                                Some(account) => {
-                                    metrics().account_cache_hits.inc();
-                                    metrics().account_cache_filled.inc();
-                                    return Ok(account_response(
-                                            req.id,
-                                            account,
-                                            app_state.current_slot.get(),
-                                            config.encoding,
-                                            config.data_slice,
-                                    ));
-                                }
-                            }
-                        },
-                        None => {},
+                    if let Some(data) = app_state.get_account(&pubkey) {
+                        let data = data.value();
+                        if let Some(account) = data.get(config.commitment.unwrap_or_default()) {
+                            metrics().account_cache_hits.inc();
+                            metrics().account_cache_filled.inc();
+                            return Ok(account_response(
+                                    req.id,
+                                    account,
+                                    app_state.current_slot.get(),
+                                    config.encoding,
+                                    config.data_slice,
+                            ));
+                        }
                     }
                 }
                 continue;
@@ -482,10 +473,9 @@ async fn get_account_info<'a>(
         struct Resp<'a> {
             result: Option<AccountContext>,
             #[serde(borrow)]
-            #[serde(rename = "error")] // TODO: handle
-            _error: Option<RpcError<'a>>,
+            error: Option<RpcError<'a>>,
         }
-        let resp: Resp = serde_json::from_slice(&resp)?;
+        let resp: Resp<'_> = serde_json::from_slice(&resp)?;
         if let Some(info) = resp.result {
             info!("cached for key {}", pubkey);
             let slot = info.context.slot;
@@ -493,7 +483,7 @@ async fn get_account_info<'a>(
             app_state.map_updated.notify();
             app_state.current_slot.update(slot);
         } else {
-            info!("cant cache for key {} because {:?}", pubkey, resp._error);
+            info!("cant cache for key {} because {:?}", pubkey, resp.error);
         }
     }
 
@@ -502,8 +492,8 @@ async fn get_account_info<'a>(
         .body(resp))
 }
 
-async fn get_program_accounts<'a>(
-    req: Request<'a>,
+async fn get_program_accounts(
+    req: Request<'_>,
     app_state: web::Data<State>,
 ) -> Result<HttpResponse, Error> {
     #[derive(Deserialize, Debug)]
@@ -566,7 +556,7 @@ async fn get_program_accounts<'a>(
     fn program_accounts_response<'a>(
         req_id: u64,
         accounts: &HashSet<Pubkey>,
-        config: &'a Config,
+        config: &'a Config<'_>,
         app_state: &web::Data<State>,
         commitment: Commitment,
     ) -> Result<HttpResponse, Error> {
@@ -669,7 +659,7 @@ async fn get_program_accounts<'a>(
         return Err(Error::NotEnoughArguments(req.id));
     }
     let pubkey: Pubkey = serde_json::from_str(params[0].get())?;
-    let config: Config = {
+    let config: Config<'_> = {
         if let Some(val) = params.get(1) {
             serde_json::from_str(val.get())?
         } else {
@@ -753,19 +743,16 @@ async fn get_program_accounts<'a>(
             }
             _ = notified => {
                 if let Some(program_pubkey) = cacheable_for_key {
-                    match app_state.program_accounts.get(&program_pubkey) {
-                        Some(data) => {
-                            let data = data.value();
-                            metrics().program_accounts_cache_filled.inc();
-                            return program_accounts_response(
-                                req.id,
-                                &data,
-                                &config,
-                                &app_state,
-                                config.commitment.unwrap_or_default(),
-                            );
-                        },
-                        None => {},
+                    if let Some(data) = app_state.program_accounts.get(&program_pubkey) {
+                        let data = data.value();
+                        metrics().program_accounts_cache_filled.inc();
+                        return program_accounts_response(
+                            req.id,
+                            &data,
+                            &config,
+                            &app_state,
+                            config.commitment.unwrap_or_default(),
+                        );
                     }
                 }
                 continue;
@@ -810,9 +797,9 @@ pub(crate) async fn rpc_handler(
     body: Bytes,
     app_state: web::Data<State>,
 ) -> Result<HttpResponse, Error> {
-    let req: Request = serde_json::from_slice(&body)?;
+    let req: Request<'_> = serde_json::from_slice(&body)?;
 
-    match req.method.as_ref() {
+    match req.method {
         "getAccountInfo" => {
             metrics()
                 .request_types

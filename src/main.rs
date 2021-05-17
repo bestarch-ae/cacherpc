@@ -7,7 +7,6 @@ use dashmap::DashMap;
 use structopt::StructOpt;
 use tokio::sync::{Notify, Semaphore};
 use tracing::info;
-use tracing_subscriber;
 
 mod accounts;
 mod rpc;

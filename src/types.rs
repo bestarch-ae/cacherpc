@@ -32,12 +32,10 @@ impl AccountState {
     pub fn get(&self, commitment: Commitment) -> Option<Option<&AccountInfo>> {
         let mut result = None;
         let mut slot = 0;
-        for acc in self.0.iter().take(commitment.as_idx() + 1) {
-            if let Some(ref acc) = acc {
-                if acc.slot > slot {
-                    result = Some(acc.data.as_ref());
-                    slot = acc.slot;
-                }
+        for acc in self.0.iter().take(commitment.as_idx() + 1).flatten() {
+            if acc.slot > slot {
+                result = Some(acc.data.as_ref());
+                slot = acc.slot;
             }
         }
         result
@@ -182,7 +180,7 @@ impl<'de> Deserialize<'de> for Pubkey {
         impl<'de> serde::de::Visitor<'de> for PubkeyVisitor {
             type Value = Pubkey;
 
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 formatter.write_str("string")
             }
 
@@ -218,7 +216,7 @@ impl<'de> Deserialize<'de> for AccountData {
         impl<'de> serde::de::Visitor<'de> for AccountDataVisitor {
             type Value = AccountData;
 
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 formatter.write_str("[]")
             }
 

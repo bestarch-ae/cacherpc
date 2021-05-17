@@ -59,7 +59,7 @@ impl AccountUpdateManager {
     ) -> Addr<Self> {
         AccountUpdateManager::create(|ctx| {
             let (handle, stream) = delay_queue();
-            let purge_stream = stream.map(|item| AccountCommand::Purge(item));
+            let purge_stream = stream.map(AccountCommand::Purge);
 
             let (sink, stream) = futures_util::stream::StreamExt::split(conn);
             let (sink, stream) = (sink, stream.filter_map(Result::ok));
@@ -218,7 +218,7 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
                         #[serde(borrow)]
                         params: Option<&'a RawValue>,
                     }
-                    let value: AnyMessage = serde_json::from_slice(&text)?;
+                    let value: AnyMessage<'_> = serde_json::from_slice(&text)?;
                     // subscription response
                     if let (Some(result), Some(id)) = (value.result, value.id) {
                         if let Some(req) = self.inflight.remove(&id) {
