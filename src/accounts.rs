@@ -13,7 +13,8 @@ use tokio::time::{DelayQueue, Instant};
 use tracing::{error, info};
 
 use crate::types::{
-    AccountContext, AccountInfo, AccountsDb, AtomicSlot, Commitment, Pubkey, SolanaContext,
+    AccountContext, AccountInfo, AccountsDb, AtomicSlot, Commitment, Encoding, Pubkey,
+    SolanaContext,
 };
 
 const PURGE_TIMEOUT: Duration = Duration::from_secs(600);
@@ -100,13 +101,37 @@ impl Handler<AccountCommand> for AccountUpdateManager {
         let _ = (|| -> Result<(), serde_json::Error> {
             let request_id = self.next_request_id();
             match item {
-                AccountCommand::Subscribe(sub) => {
+                AccountCommand::Subscribe(sub, commitment) => {
                     #[derive(Serialize)]
                     struct Request<'a> {
                         jsonrpc: &'a str,
                         id: u64,
                         method: &'a str,
-                        params: [Pubkey; 1], // TODO: commitment and other params
+                        params: SubscribeParams, // TODO: commitment and other params
+                    }
+
+                    #[derive(Serialize)]
+                    struct Config {
+                        commitment: Commitment,
+                        encoding: Encoding,
+                    }
+
+                    struct SubscribeParams {
+                        key: Pubkey,
+                        config: Config,
+                    }
+
+                    impl Serialize for SubscribeParams {
+                        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+                        where
+                            S: serde::Serializer,
+                        {
+                            use serde::ser::SerializeSeq;
+                            let mut seq = serializer.serialize_seq(Some(2))?;
+                            seq.serialize_element(&self.key)?;
+                            seq.serialize_element(&self.config)?;
+                            seq.end()
+                        }
                     }
 
                     let (key, method) = match sub {
@@ -124,7 +149,13 @@ impl Handler<AccountCommand> for AccountUpdateManager {
                         jsonrpc: "2.0",
                         id: request_id,
                         method,
-                        params: [key],
+                        params: SubscribeParams {
+                            key,
+                            config: Config {
+                                commitment,
+                                encoding: Encoding::Base64,
+                            },
+                        },
                     };
 
                     self.inflight.insert(request_id, InflightRequest::Sub(key));
@@ -313,7 +344,7 @@ pub(crate) enum Subscription {
 #[derive(Message, Debug)]
 #[rtype(result = "()")]
 pub(crate) enum AccountCommand {
-    Subscribe(Subscription),
+    Subscribe(Subscription, Commitment),
     Reset(Pubkey),
     Purge(Pubkey),
 }

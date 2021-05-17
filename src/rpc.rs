@@ -23,7 +23,7 @@ use tracing::{info, warn};
 use crate::accounts::{AccountCommand, AccountUpdateManager, Subscription};
 use crate::types::{
     AccountContext, AccountData, AccountInfo, AccountState, AccountsDb, AtomicSlot, Commitment,
-    Pubkey, SolanaContext,
+    Encoding, Pubkey, SolanaContext,
 };
 
 struct RpcMetrics {
@@ -95,25 +95,6 @@ impl AccountInfo {
             slice,
             encoding,
         }
-    }
-}
-
-#[derive(Serialize, Debug, Deserialize, Copy, Clone)]
-enum Encoding {
-    #[serde(skip)]
-    Default,
-    #[serde(rename = "base58")]
-    Base58,
-    #[serde(rename = "base64")]
-    Base64,
-    #[serde(rename = "base64+zstd")]
-    Base64Zstd,
-    // TODO: json parsed
-}
-
-impl Encoding {
-    fn default() -> Self {
-        Encoding::Default
     }
 }
 
@@ -420,7 +401,10 @@ async fn get_account_info<'a>(
             }
             app_state
                 .tx
-                .send(AccountCommand::Subscribe(Subscription::Account(pubkey)))
+                .send(AccountCommand::Subscribe(
+                    Subscription::Account(pubkey),
+                    config.commitment.unwrap_or_default(),
+                ))
                 .await
                 .unwrap();
         }
@@ -713,7 +697,10 @@ async fn get_program_accounts<'a>(
             }
             app_state
                 .tx
-                .send(AccountCommand::Subscribe(Subscription::Program(pubkey)))
+                .send(AccountCommand::Subscribe(
+                    Subscription::Program(pubkey),
+                    config.commitment.unwrap_or_default(),
+                ))
                 .await
                 .unwrap();
         }

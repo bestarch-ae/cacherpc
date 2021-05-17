@@ -116,6 +116,25 @@ impl Default for Commitment {
     }
 }
 
+#[derive(Serialize, Debug, Deserialize, Copy, Clone)]
+pub(crate) enum Encoding {
+    #[serde(skip)]
+    Default,
+    #[serde(rename = "base58")]
+    Base58,
+    #[serde(rename = "base64")]
+    Base64,
+    #[serde(rename = "base64+zstd")]
+    Base64Zstd,
+    // TODO: json parsed
+}
+
+impl Default for Encoding {
+    fn default() -> Self {
+        Encoding::Default
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AccountInfo {
