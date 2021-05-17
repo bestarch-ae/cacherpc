@@ -74,24 +74,9 @@ impl AccountsDb {
     fn update_slot(&self, commitment: Commitment, val: u64) {
         self.slot[commitment.as_idx()].fetch_max(val, Ordering::AcqRel);
     }
-}
 
-#[derive(Clone)]
-pub(crate) struct AtomicSlot(Arc<AtomicU64>);
-
-impl Default for AtomicSlot {
-    fn default() -> Self {
-        AtomicSlot(Arc::new(AtomicU64::new(1)))
-    }
-}
-
-impl AtomicSlot {
-    pub fn get(&self) -> u64 {
-        self.0.load(Ordering::Acquire)
-    }
-
-    pub fn update(&self, value: u64) {
-        self.0.fetch_max(value, Ordering::AcqRel);
+    pub fn get_slot(&self, commitment: Commitment) -> u64 {
+        self.slot[commitment.as_idx()].load(Ordering::Acquire)
     }
 }
 

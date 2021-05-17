@@ -13,8 +13,7 @@ use tokio::time::{DelayQueue, Instant};
 use tracing::{error, info};
 
 use crate::types::{
-    AccountContext, AccountInfo, AccountsDb, AtomicSlot, Commitment, Encoding, Pubkey,
-    SolanaContext,
+    AccountContext, AccountInfo, AccountsDb, Commitment, Encoding, Pubkey, SolanaContext,
 };
 
 const PURGE_TIMEOUT: Duration = Duration::from_secs(600);
@@ -41,7 +40,6 @@ pub(crate) struct AccountUpdateManager {
     accounts: AccountsDb,
     program_accounts: Arc<DashMap<Pubkey, HashSet<Pubkey>>>,
     purge_queue: DelayQueueHandle<Pubkey>,
-    slot: AtomicSlot,
 }
 
 impl std::fmt::Debug for AccountUpdateManager {
@@ -52,7 +50,6 @@ impl std::fmt::Debug for AccountUpdateManager {
 
 impl AccountUpdateManager {
     pub fn init(
-        current_slot: AtomicSlot,
         accounts: AccountsDb,
         program_accounts: Arc<DashMap<Pubkey, HashSet<Pubkey>>>,
         conn: actix_codec::Framed<awc::BoxedSocket, awc::ws::Codec>,
@@ -76,7 +73,6 @@ impl AccountUpdateManager {
                 accounts: accounts.clone(),
                 program_accounts: program_accounts.clone(),
                 purge_queue: handle,
-                slot: current_slot.clone(),
             }
         })
     }
@@ -261,7 +257,6 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
                                     subscription: u64,
                                 }
                                 let params: Params = serde_json::from_str(params.get())?;
-                                self.slot.update(params.result.context.slot);
                                 if let Some((key, commitment)) = self.sub_to_key.get(&params.subscription) {
                                     self.accounts.insert(*key, params.result, *commitment);
                                 }
@@ -283,7 +278,6 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
                                     subscription: u64,
                                 }
                                 let params: Params = serde_json::from_str(params.get())?;
-                                self.slot.update(params.result.context.slot);
                                 if let Some((program_key, _)) = self.sub_to_key.get(&params.subscription) {
                                     let key = params.result.value.pubkey;
                                     self.accounts.insert(key, AccountContext {
@@ -300,8 +294,7 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
                                 }
                                 let params: Params = serde_json::from_str(params.get())?;
                                 //info!("slot {} root {} parent {}", params.result.slot, params.result.root, params.result.parent);
-                                let slot = params.result; // TODO: figure out which slot validator *actually* reports
-                                self.slot.update(slot);
+                                let _slot = params.result; // TODO: figure out which slot validator *actually* reports
                             }
                             _ => {}
                         }

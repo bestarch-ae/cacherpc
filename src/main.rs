@@ -13,7 +13,7 @@ mod rpc;
 mod types;
 
 use accounts::AccountUpdateManager;
-use types::{AccountsDb, AtomicSlot};
+use types::AccountsDb;
 
 #[derive(Debug, structopt::StructOpt)]
 struct Options {
@@ -52,7 +52,6 @@ async fn main() {
 async fn run(options: Options) {
     let accounts = AccountsDb::new();
     let program_accounts = Arc::new(DashMap::new());
-    let current_slot = AtomicSlot::default();
 
     let (_, conn) = Client::builder()
         .max_http_version(awc::http::Version::HTTP_11)
@@ -64,12 +63,7 @@ async fn run(options: Options) {
 
     info!("connected to websocket rpc @ {}", options.ws_url);
 
-    let addr = AccountUpdateManager::init(
-        current_slot.clone(),
-        accounts.clone(),
-        program_accounts.clone(),
-        conn,
-    );
+    let addr = AccountUpdateManager::init(accounts.clone(), program_accounts.clone(), conn);
 
     let rpc_url = options.rpc_url;
     let notify = Arc::new(Notify::new());
@@ -97,7 +91,6 @@ async fn run(options: Options) {
             client,
             tx: addr.clone(),
             rpc_url: rpc_url.clone(),
-            current_slot: current_slot.clone(),
             map_updated: notify.clone(),
             account_info_request_limit: account_info_request_limit.clone(),
             program_accounts_request_limit: program_accounts_request_limit.clone(),

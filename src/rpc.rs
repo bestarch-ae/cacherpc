@@ -22,8 +22,8 @@ use tracing::{info, warn};
 
 use crate::accounts::{AccountCommand, AccountUpdateManager, Subscription};
 use crate::types::{
-    AccountContext, AccountData, AccountInfo, AccountState, AccountsDb, AtomicSlot, Commitment,
-    Encoding, Pubkey, SolanaContext,
+    AccountContext, AccountData, AccountInfo, AccountState, AccountsDb, Commitment, Encoding,
+    Pubkey, SolanaContext,
 };
 
 struct RpcMetrics {
@@ -210,7 +210,6 @@ pub(crate) struct State {
     pub client: Client,
     pub tx: Addr<AccountUpdateManager>,
     pub rpc_url: String,
-    pub current_slot: AtomicSlot,
     pub map_updated: Arc<Notify>,
     pub account_info_request_limit: Arc<Semaphore>,
     pub program_accounts_request_limit: Arc<Semaphore>,
@@ -379,13 +378,14 @@ async fn get_account_info(
     match app_state.get_account(&pubkey) {
         Some(data) => {
             let data = data.value();
-            let account = data.get(config.commitment.unwrap_or_default());
+            let commitment = config.commitment.unwrap_or_default();
+            let account = data.get(commitment);
             if let Some(account) = account {
                 metrics().account_cache_hits.inc();
                 return Ok(account_response(
                     req.id,
                     account,
-                    app_state.current_slot.get(),
+                    app_state.accounts.get_slot(commitment),
                     config.encoding,
                     config.data_slice,
                 ));
@@ -450,13 +450,14 @@ async fn get_account_info(
                 if let Some(pubkey) = cacheable_for_key {
                     if let Some(data) = app_state.get_account(&pubkey) {
                         let data = data.value();
-                        if let Some(account) = data.get(config.commitment.unwrap_or_default()) {
+                        let commitment = config.commitment.unwrap_or_default();
+                        if let Some(account) = data.get(commitment) {
                             metrics().account_cache_hits.inc();
                             metrics().account_cache_filled.inc();
                             return Ok(account_response(
                                     req.id,
                                     account,
-                                    app_state.current_slot.get(),
+                                    app_state.accounts.get_slot(commitment),
                                     config.encoding,
                                     config.data_slice,
                             ));
@@ -478,10 +479,8 @@ async fn get_account_info(
         let resp: Resp<'_> = serde_json::from_slice(&resp)?;
         if let Some(info) = resp.result {
             info!("cached for key {}", pubkey);
-            let slot = info.context.slot;
             app_state.insert(pubkey, info, config.commitment.unwrap_or_default());
             app_state.map_updated.notify();
-            app_state.current_slot.update(slot);
         } else {
             info!("cant cache for key {} because {:?}", pubkey, resp.error);
         }
