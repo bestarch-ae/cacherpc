@@ -1,9 +1,11 @@
+use std::cell::RefCell;
 use std::sync::Arc;
 use std::time::Duration;
 
 use actix_web::{web, App, HttpServer};
 use awc::Client;
 use dashmap::DashMap;
+use lru::LruCache;
 use structopt::StructOpt;
 use tokio::sync::{Notify, Semaphore};
 use tracing::info;
@@ -35,6 +37,8 @@ struct Options {
     program_accounts_request_limit: usize,
     #[structopt(short = "a", long = "account-request-limit", default_value = "100")]
     account_info_request_limit: usize,
+    #[structopt(short = "b", long = "body-cache-size", default_value = "100")]
+    body_cache_size: usize,
 }
 
 #[actix_web::main]
@@ -72,6 +76,7 @@ async fn run(options: Options) {
     let account_info_request_limit = Arc::new(Semaphore::new(options.account_info_request_limit));
     let program_accounts_request_limit =
         Arc::new(Semaphore::new(options.program_accounts_request_limit));
+    let body_cache_size = options.body_cache_size;
 
     HttpServer::new(move || {
         let client = Client::builder()
@@ -94,6 +99,7 @@ async fn run(options: Options) {
             map_updated: notify.clone(),
             account_info_request_limit: account_info_request_limit.clone(),
             program_accounts_request_limit: program_accounts_request_limit.clone(),
+            lru: RefCell::new(LruCache::new(body_cache_size)),
         };
         App::new()
             .data(state)

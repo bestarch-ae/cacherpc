@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -8,6 +9,7 @@ use awc::Client;
 use bytes::Bytes;
 use dashmap::mapref::one::Ref;
 use dashmap::DashMap;
+use lru::LruCache;
 use once_cell::sync::Lazy;
 use prometheus::{
     register_histogram_vec, register_int_counter, register_int_counter_vec, HistogramVec,
@@ -35,6 +37,7 @@ struct RpcMetrics {
     response_uncacheable: IntCounter,
     backend_response_time: HistogramVec,
     response_size_bytes: HistogramVec,
+    lru_cache_hits: IntCounter,
 }
 
 fn metrics() -> &'static RpcMetrics {
@@ -47,6 +50,7 @@ fn metrics() -> &'static RpcMetrics {
         .unwrap(),
         account_cache_hits: register_int_counter!("account_cache_hits", "Accounts cache hit")
             .unwrap(),
+        lru_cache_hits: register_int_counter!("lru_cache_hits", "LRU cache hit").unwrap(),
         account_cache_filled: register_int_counter!(
             "account_cache_filled",
             "Accounts cache filled while waiting for response"
@@ -203,7 +207,6 @@ impl<'a> Serialize for EncodedAccountData<'a> {
     }
 }
 
-#[derive(Clone)]
 pub(crate) struct State {
     pub accounts: AccountsDb,
     pub program_accounts: Arc<DashMap<Pubkey, HashSet<Pubkey>>>,
@@ -213,6 +216,7 @@ pub(crate) struct State {
     pub map_updated: Arc<Notify>,
     pub account_info_request_limit: Arc<Semaphore>,
     pub program_accounts_request_limit: Arc<Semaphore>,
+    pub lru: RefCell<LruCache<u64, Bytes>>,
 }
 
 impl State {
@@ -305,6 +309,15 @@ impl actix_web::error::ResponseError for Error {
     }
 }
 
+fn hash<T: std::hash::Hash>(params: T) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::Hasher;
+
+    let mut hasher = DefaultHasher::new();
+    params.hash(&mut hasher);
+    hasher.finish()
+}
+
 async fn get_account_info(
     req: Request<'_>,
     app_state: web::Data<State>,
@@ -312,35 +325,55 @@ async fn get_account_info(
     #[inline]
     fn account_response(
         req_id: u64,
-        acc: Option<&AccountInfo>,
-        slot: u64,
-        encoding: Encoding,
-        slice: Option<Slice>,
-    ) -> HttpResponse {
+        request_hash: u64,
+        acc: (Option<&AccountInfo>, u64),
+        app_state: &web::Data<State>,
+        config: Config,
+    ) -> Result<HttpResponse, Error> {
         #[derive(Serialize)]
         struct Resp<'a> {
             jsonrpc: &'a str,
             result: EncodedAccountContext<'a>,
             id: u64,
         }
+        let request_and_slot_hash = hash((request_hash, acc.1));
+        if let Some(body) = app_state.lru.borrow_mut().get(&request_and_slot_hash) {
+            metrics().lru_cache_hits.inc();
+            return Ok(HttpResponse::Ok()
+                .content_type("application/json")
+                .body(body.clone()));
+        }
+
+        let slot = app_state
+            .accounts
+            .get_slot(config.commitment.unwrap_or_default());
         let ctx = SolanaContext { slot };
         let resp = Resp {
             jsonrpc: "2.0",
             result: acc
+                .0
                 .as_ref()
-                .map(|acc| acc.encode(encoding, slice).with_context(&ctx))
+                .map(|acc| {
+                    acc.encode(config.encoding, config.data_slice)
+                        .with_context(&ctx)
+                })
                 .unwrap_or_else(|| EncodedAccountContext::empty(&ctx)),
             id: req_id,
         };
-        let body = serde_json::to_vec(&resp).unwrap(); // TODO
+        let body = Bytes::from(serde_json::to_vec(&resp)?);
+        app_state
+            .lru
+            .borrow_mut()
+            .put(request_and_slot_hash, body.clone());
+
         metrics()
             .response_size_bytes
             .with_label_values(&["getAccountInfo"])
             .observe(body.len() as f64);
 
-        HttpResponse::Ok()
+        Ok(HttpResponse::Ok()
             .content_type("application/json")
-            .body(body)
+            .body(body))
     }
 
     #[derive(Deserialize, Debug)]
@@ -350,6 +383,7 @@ async fn get_account_info(
         #[serde(rename = "dataSlice")]
         data_slice: Option<Slice>,
     }
+
     impl Default for Config {
         fn default() -> Self {
             Config {
@@ -360,13 +394,11 @@ async fn get_account_info(
         }
     }
 
-    let params: SmallVec<[&RawValue; 2]> = match req.params {
-        Some(params) => serde_json::from_str(params.get())?,
-        None => SmallVec::new(),
+    let (params, request_hash): (SmallVec<[&RawValue; 2]>, _) = match req.params {
+        Some(params) => (serde_json::from_str(params.get())?, hash(params.get())),
+        None => return Err(Error::NotEnoughArguments(req.id)),
     };
-    if params.is_empty() {
-        return Err(Error::NotEnoughArguments(req.id));
-    }
+
     let pubkey: Pubkey = serde_json::from_str(params[0].get())?;
     let config: Config = {
         if let Some(param) = params.get(1) {
@@ -385,13 +417,7 @@ async fn get_account_info(
             let account = data.get(commitment);
             if let Some(account) = account {
                 metrics().account_cache_hits.inc();
-                return Ok(account_response(
-                    req.id,
-                    account,
-                    app_state.accounts.get_slot(commitment),
-                    config.encoding,
-                    config.data_slice,
-                ));
+                return account_response(req.id, request_hash, account, &app_state, config);
             }
         }
         None => {
@@ -457,13 +483,13 @@ async fn get_account_info(
                         if let Some(account) = data.get(commitment) {
                             metrics().account_cache_hits.inc();
                             metrics().account_cache_filled.inc();
-                            return Ok(account_response(
+                            return account_response(
                                     req.id,
+                                    request_hash,
                                     account,
-                                    app_state.accounts.get_slot(commitment),
-                                    config.encoding,
-                                    config.data_slice,
-                            ));
+                                    &app_state,
+                                    config,
+                            );
                         }
                     }
                 }
@@ -577,7 +603,7 @@ async fn get_program_accounts(
             where
                 S: serde::Serializer,
             {
-                if let Some(Some(value)) = self.inner.value().get(self.commitment) {
+                if let Some((Some(value), _)) = self.inner.value().get(self.commitment) {
                     let encoded = value.encode(self.encoding, self.slice);
                     encoded.serialize(serializer)
                 } else {
@@ -610,6 +636,7 @@ async fn get_program_accounts(
                     let matches = filters.iter().all(|f| {
                         let value = data.value().get(commitment).unwrap(); // checked above
                         value
+                            .0
                             .as_ref()
                             .map(|val| f.matches(&val.data))
                             .unwrap_or(false)

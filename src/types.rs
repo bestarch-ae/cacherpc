@@ -16,7 +16,6 @@ type Slot = u64;
 #[derive(Debug)]
 struct Account {
     data: Option<AccountInfo>,
-    #[allow(dead_code)] // TODO
     slot: Slot,
 }
 
@@ -29,12 +28,12 @@ impl Default for AccountState {
 }
 
 impl AccountState {
-    pub fn get(&self, commitment: Commitment) -> Option<Option<&AccountInfo>> {
+    pub fn get(&self, commitment: Commitment) -> Option<(Option<&AccountInfo>, Slot)> {
         let mut result = None;
         let mut slot = 0;
         for acc in self.0.iter().take(commitment.as_idx() + 1).flatten() {
             if acc.slot > slot {
-                result = Some(acc.data.as_ref());
+                result = Some((acc.data.as_ref(), acc.slot));
                 slot = acc.slot;
             }
         }
