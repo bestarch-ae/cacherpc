@@ -346,6 +346,12 @@ async fn get_account_info(
         let request_and_slot_hash = hash((request_hash, acc.1));
         if let Some(body) = app_state.lru.borrow_mut().get(&request_and_slot_hash) {
             metrics().lru_cache_hits.inc();
+
+            metrics()
+                .response_size_bytes
+                .with_label_values(&["getAccountInfo"])
+                .observe(body.len() as f64);
+
             return Ok(HttpResponse::Ok()
                 .content_type("application/json")
                 .body(body.clone()));
