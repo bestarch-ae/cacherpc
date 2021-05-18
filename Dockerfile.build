@@ -1,0 +1,9 @@
+FROM ubuntu:20.04
+COPY rust-toolchain /tmp/rust-toolchain
+RUN apt-get update && apt-get install -y curl openssl-devel gcc gcc-c++ pkgconfig git gperftools-devel jq libssl-dev libudev-dev pkg-config zlib1g-dev llvm clang make curl openssh-client
+RUN curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain $(cat /tmp/rust-toolchain)
+ENV PATH="/root/.cargo/bin:${PATH}"
+RUN rustup component add rustfmt
+RUN echo -e \
+    '[registries.zubr]\nindex = "ssh://git@git.zubr.dev/shared/crates/index.git"' \
+    > /root/.cargo/config
