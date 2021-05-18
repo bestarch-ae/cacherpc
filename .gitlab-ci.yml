@@ -4,7 +4,7 @@ variables:
   ARTIFACTS_PATH: dev-cacherpc-artifacts
   RPM_DEB_REPO_PATH: dev-cacherpc-apt
 
-  BIN_NAME: cacherpc
+  BIN_NAME: cache-rpc
   BUILD_IMAGE: $REGISTRY_PROJECT:build-$CI_COMMIT_REF_SLUG
   CARGO_HOME: /cache/cacherpc/.cargo
   CARGO_TARGET_DIR: "/cache/cacherpc/$CI_COMMIT_REF_SLUG/$CI_JOB_NAME"
