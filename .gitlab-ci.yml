@@ -139,11 +139,11 @@ build_docker:
       .
     - docker push $REGISTRY_PROJECT:$PIPLINE_ID_VER
     - docker push $REGISTRY_PROJECT:latest
-#  only:
-#    - tags
-#    - develop
-#    - master
-#    - web
+  only:
+    - tags
+    - develop
+    - master
+    - web
 
 Deploy DEB to Dev:
   stage: deploy_dev
@@ -154,8 +154,8 @@ Deploy DEB to Dev:
     - git clone https://git.zubr.dev/shared/ci-scripts.git
     - chmod 0700 ci-scripts/deploy_deb.sh
     - ci-scripts/deploy_deb.sh DEV
-#  only:
-#    - develop
-#    - master
-#    - tags
-#    - web
+  only:
+    - develop
+    - master
+    - tags
+    - web
