@@ -284,12 +284,25 @@ impl ErrorResponse<'static> {
             },
         }
     }
+
+    fn parse_error(id: Option<u64>) -> ErrorResponse<'static> {
+        ErrorResponse {
+            jsonrpc: "2.0",
+            id,
+            error: RpcError {
+                code: -32700,
+                message: "Parse error",
+            },
+        }
+    }
 }
 
 #[derive(Debug, Error)]
 pub(crate) enum Error {
     #[error("invalid request")]
     InvalidRequest(Option<u64>),
+    #[error("invalid request")]
+    ParseError(Option<u64>),
     #[error("not enough arguments")]
     NotEnoughArguments(u64),
     #[error("client error")]
@@ -297,8 +310,12 @@ pub(crate) enum Error {
 }
 
 impl From<serde_json::Error> for Error {
-    fn from(_err: serde_json::Error) -> Self {
-        Error::InvalidRequest(None)
+    fn from(err: serde_json::Error) -> Self {
+        if err.is_data() {
+            Error::InvalidRequest(None)
+        } else {
+            Error::ParseError(None)
+        }
     }
 }
 
@@ -308,6 +325,9 @@ impl actix_web::error::ResponseError for Error {
             Error::InvalidRequest(req_id) => HttpResponse::Ok()
                 .content_type("application/json")
                 .json(&ErrorResponse::invalid_request(*req_id)),
+            Error::ParseError(req_id) => HttpResponse::Ok()
+                .content_type("application/json")
+                .json(&ErrorResponse::parse_error(*req_id)),
             Error::NotEnoughArguments(req_id) => HttpResponse::Ok()
                 .content_type("application/json")
                 .json(&ErrorResponse::not_enough_arguments(*req_id)),
