@@ -316,6 +316,24 @@ impl actix_web::error::ResponseError for Error {
     }
 }
 
+#[derive(Deserialize, Debug)]
+struct AccountInfoConfig {
+    encoding: Encoding,
+    commitment: Option<Commitment>,
+    #[serde(rename = "dataSlice")]
+    data_slice: Option<Slice>,
+}
+
+impl Default for AccountInfoConfig {
+    fn default() -> Self {
+        AccountInfoConfig {
+            encoding: Encoding::Base58,
+            commitment: None,
+            data_slice: None,
+        }
+    }
+}
+
 fn hash<T: std::hash::Hash>(params: T) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::Hasher;
@@ -325,99 +343,80 @@ fn hash<T: std::hash::Hash>(params: T) -> u64 {
     hasher.finish()
 }
 
-async fn get_account_info(
-    req: Request<'_>,
-    app_state: web::Data<State>,
+fn account_response(
+    req_id: u64,
+    request_hash: u64,
+    acc: (Option<&AccountInfo>, u64),
+    app_state: &web::Data<State>,
+    config: AccountInfoConfig,
 ) -> Result<HttpResponse, Error> {
-    #[inline]
-    fn account_response(
-        req_id: u64,
-        request_hash: u64,
-        acc: (Option<&AccountInfo>, u64),
-        app_state: &web::Data<State>,
-        config: Config,
-    ) -> Result<HttpResponse, Error> {
-        #[derive(Serialize)]
-        struct Resp<'a> {
-            jsonrpc: &'a str,
-            result: EncodedAccountContext<'a>,
-            id: u64,
-        }
-        let request_and_slot_hash = hash((request_hash, acc.1));
-        if let Some(body) = app_state.lru.borrow_mut().get(&request_and_slot_hash) {
-            metrics().lru_cache_hits.inc();
-
-            metrics()
-                .response_size_bytes
-                .with_label_values(&["getAccountInfo"])
-                .observe(body.len() as f64);
-
-            return Ok(HttpResponse::Ok()
-                .content_type("application/json")
-                .body(body.clone()));
-        }
-
-        let slot = app_state
-            .accounts
-            .get_slot(config.commitment.unwrap_or_default());
-        let ctx = SolanaContext { slot };
-        let resp = Resp {
-            jsonrpc: "2.0",
-            result: acc
-                .0
-                .as_ref()
-                .map(|acc| {
-                    acc.encode(config.encoding, config.data_slice)
-                        .with_context(&ctx)
-                })
-                .unwrap_or_else(|| EncodedAccountContext::empty(&ctx)),
-            id: req_id,
-        };
-        let body = Bytes::from(serde_json::to_vec(&resp)?);
-        app_state
-            .lru
-            .borrow_mut()
-            .put(request_and_slot_hash, body.clone());
+    #[derive(Serialize)]
+    struct Resp<'a> {
+        jsonrpc: &'a str,
+        result: EncodedAccountContext<'a>,
+        id: u64,
+    }
+    let request_and_slot_hash = hash((request_hash, acc.1));
+    if let Some(body) = app_state.lru.borrow_mut().get(&request_and_slot_hash) {
+        metrics().lru_cache_hits.inc();
 
         metrics()
             .response_size_bytes
             .with_label_values(&["getAccountInfo"])
             .observe(body.len() as f64);
 
-        Ok(HttpResponse::Ok()
+        return Ok(HttpResponse::Ok()
             .content_type("application/json")
-            .body(body))
+            .body(body.clone()));
     }
 
-    #[derive(Deserialize, Debug)]
-    struct Config {
-        encoding: Encoding,
-        commitment: Option<Commitment>,
-        #[serde(rename = "dataSlice")]
-        data_slice: Option<Slice>,
-    }
+    let slot = app_state
+        .accounts
+        .get_slot(config.commitment.unwrap_or_default());
+    let ctx = SolanaContext { slot };
+    let resp = Resp {
+        jsonrpc: "2.0",
+        result: acc
+            .0
+            .as_ref()
+            .map(|acc| {
+                acc.encode(config.encoding, config.data_slice)
+                    .with_context(&ctx)
+            })
+            .unwrap_or_else(|| EncodedAccountContext::empty(&ctx)),
+        id: req_id,
+    };
+    let body = Bytes::from(serde_json::to_vec(&resp)?);
+    app_state
+        .lru
+        .borrow_mut()
+        .put(request_and_slot_hash, body.clone());
 
-    impl Default for Config {
-        fn default() -> Self {
-            Config {
-                encoding: Encoding::Base58,
-                commitment: None,
-                data_slice: None,
-            }
-        }
-    }
+    metrics()
+        .response_size_bytes
+        .with_label_values(&["getAccountInfo"])
+        .observe(body.len() as f64);
 
+    Ok(HttpResponse::Ok()
+        .content_type("application/json")
+        .body(body))
+}
+
+async fn get_account_info(
+    req: Request<'_>,
+    app_state: web::Data<State>,
+) -> Result<HttpResponse, Error> {
     let (params, request_hash): (SmallVec<[&RawValue; 2]>, _) = match req.params {
         Some(params) => (serde_json::from_str(params.get())?, hash(params.get())),
         None => return Err(Error::NotEnoughArguments(req.id)),
     };
 
     let pubkey: Pubkey = serde_json::from_str(params[0].get())?;
-    let config: Config = {
+    let config: AccountInfoConfig = {
         if let Some(param) = params.get(1) {
             serde_json::from_str(param.get())?
         } else {
-            Config::default()
+            AccountInfoConfig::default()
         }
     };
 
