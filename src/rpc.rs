@@ -36,6 +36,7 @@ struct RpcMetrics {
     program_accounts_cache_filled: IntCounter,
     response_uncacheable: IntCounter,
     backend_response_time: HistogramVec,
+    handler_time: HistogramVec,
     response_size_bytes: HistogramVec,
     lru_cache_hits: IntCounter,
 }
@@ -73,7 +74,13 @@ fn metrics() -> &'static RpcMetrics {
         .unwrap(),
         backend_response_time: register_histogram_vec!(
             "backend_response_time",
-            "Response time by type",
+            "Backend response time by type",
+            &["type"]
+        )
+        .unwrap(),
+        handler_time: register_histogram_vec!(
+            "handler_time",
+            "Handler processing time by type",
             &["type"]
         )
         .unwrap(),
@@ -286,7 +293,7 @@ pub(crate) enum Error {
     #[error("not enough arguments")]
     NotEnoughArguments(u64),
     #[error("client error")]
-    ClientError(#[from] awc::error::SendRequestError),
+    Client(#[from] awc::error::SendRequestError),
 }
 
 impl From<serde_json::Error> for Error {
@@ -304,7 +311,7 @@ impl actix_web::error::ResponseError for Error {
             Error::NotEnoughArguments(req_id) => HttpResponse::Ok()
                 .content_type("application/json")
                 .json(&ErrorResponse::not_enough_arguments(*req_id)),
-            Error::ClientError(_error) => HttpResponse::GatewayTimeout().finish(), // TODO
+            Error::Client(_error) => HttpResponse::GatewayTimeout().finish(), // TODO
         }
     }
 }
@@ -432,7 +439,7 @@ async fn get_account_info(
                     config.commitment.unwrap_or_default(),
                 ))
                 .await
-                .unwrap();
+                .expect("actor is dead");
         }
     }
 
@@ -721,7 +728,7 @@ async fn get_program_accounts(
                     config.commitment.unwrap_or_default(),
                 ))
                 .await
-                .unwrap();
+                .expect("actor is dead");
         }
     }
 
@@ -834,14 +841,26 @@ pub(crate) async fn rpc_handler(
                 .request_types
                 .with_label_values(&["getAccountInfo"])
                 .inc();
-            return get_account_info(req, app_state).await;
+            let timer = metrics()
+                .handler_time
+                .with_label_values(&["getAccountInfo"])
+                .start_timer();
+            let resp = get_account_info(req, app_state).await;
+            timer.observe_duration();
+            return resp;
         }
         "getProgramAccounts" => {
             metrics()
                 .request_types
                 .with_label_values(&["getProgramAccounts"])
                 .inc();
-            return get_program_accounts(req, app_state).await;
+            let timer = metrics()
+                .handler_time
+                .with_label_values(&["getProgramAccounts"])
+                .start_timer();
+            let resp = get_program_accounts(req, app_state).await;
+            timer.observe_duration();
+            return resp;
         }
         _ => {
             metrics().request_types.with_label_values(&["other"]).inc();
