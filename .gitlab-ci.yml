@@ -112,8 +112,7 @@ build_artifact:
     - du /cache
     - ls -la ~/.cargo/
     - ls -la /cache/cacherpc/.cargo/
-#    - cat ~/.cargo/config
-#    - cat /cache/cacherpc/.cargo/config
+    - cat /cache/cacherpc/.cargo/config
     - cargo build --release
     - echo $CARGO_TARGET_DIR
     - mkdir -p artifact/usr/sbin
