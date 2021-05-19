@@ -66,7 +66,7 @@ impl AccountsDb {
         entry.insert(commitment, data);
     }
 
-    pub fn remove(&self, key: &Pubkey, _commitment: Commitment) {
+    pub fn remove(&self, key: &Pubkey) {
         self.map.remove(key);
     }
 

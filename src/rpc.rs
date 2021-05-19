@@ -230,7 +230,7 @@ impl State {
     fn get_account(&self, key: &Pubkey) -> Option<Ref<'_, Pubkey, AccountState>> {
         let tx = &self.tx;
         self.accounts.get(key).map(|v| {
-            tx.do_send(AccountCommand::Reset(*key));
+            tx.do_send(AccountCommand::Reset(Subscription::Account(*key)));
             v
         })
     }
