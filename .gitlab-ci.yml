@@ -67,7 +67,7 @@ lint:
   image: $BUILD_IMAGE
   tags: [docker_19_cache]
   before_script:
-    - cat /cache/cacherpc/.cargo/config
+    - cat /root/.cargo/config
     - "[ ! -d $CARGO_TARGET_DIR ] && if [ -d $CARGO_TARGET_DIR_MASTER ]; then mkdir -p $CARGO_TARGET_DIR && cp -rp $CARGO_TARGET_DIR_MASTER $CARGO_TARGET_DIR; else mkdir -p $CARGO_TARGET_DIR; fi"
     - mkdir -p $CARGO_HOME
     - eval $(ssh-agent -s)
