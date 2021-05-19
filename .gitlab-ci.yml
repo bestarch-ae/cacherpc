@@ -6,14 +6,14 @@ variables:
 
   BIN_NAME: cache-rpc
   BUILD_IMAGE: $REGISTRY_PROJECT:build-$CI_COMMIT_REF_SLUG
-  CARGO_HOME: /cache/cacherpc/.cargo
+#  CARGO_HOME: /cache/cacherpc/.cargo
   CARGO_TARGET_DIR: "/cache/cacherpc/$CI_COMMIT_REF_SLUG/$CI_JOB_NAME"
   CARGO_TARGET_DIR_MASTER: "/cache/cacherpc/master/$CI_JOB_NAME"
 
 stages:
   - pre_build
-#  - lint
-#  - rustfmt
+  - lint
+  - rustfmt
   - build_version
   - build_artifact
   - build
@@ -60,7 +60,7 @@ clear_cache:
   when: manual
   tags: [docker_19_cache]
   script:
-    - rm -rf /cache/broker/$CI_COMMIT_REF_SLUG
+    - rm -rf /cache/cacherpc/$CI_COMMIT_REF_SLUG
 
 #lint:
 #  stage: lint
@@ -68,8 +68,7 @@ clear_cache:
 #  tags: [docker_19_cache]
 #  before_script:
 #    - "[ ! -d $CARGO_TARGET_DIR ] && if [ -d $CARGO_TARGET_DIR_MASTER ]; then mkdir -p $CARGO_TARGET_DIR && cp -rp $CARGO_TARGET_DIR_MASTER $CARGO_TARGET_DIR; else mkdir -p $CARGO_TARGET_DIR; fi"
-#    - mkdir -p $CARGO_HOME
-#    - cp ~/.cargo/config "$CARGO_HOME/config"
+##    - mkdir -p $CARGO_HOME
 #    - eval $(ssh-agent -s)
 #    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add - > /dev/null
 #    - mkdir -p ~/.ssh
@@ -84,14 +83,14 @@ clear_cache:
 #  stage: rustfmt
 #  image: $BUILD_IMAGE
 #  tags: [docker_19_cache]
-#  before_script:
-#    - "[ ! -d $CARGO_TARGET_DIR ] && if [ -d $CARGO_TARGET_DIR_MASTER ]; then mkdir -p $CARGO_TARGET_DIR && cp -rp $CARGO_TARGET_DIR_MASTER $CARGO_TARGET_DIR; else mkdir -p $CARGO_TARGET_DIR; fi"
-#    - mkdir -p $CARGO_HOME
-#    - cp ~/.cargo/config "$CARGO_HOME/config"
-#    - eval $(ssh-agent -s)
-#    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add - > /dev/null
-#    - mkdir -p ~/.ssh
-#    - chmod 700 ~/.ssh
+##  before_script:
+##    - "[ ! -d $CARGO_TARGET_DIR ] && if [ -d $CARGO_TARGET_DIR_MASTER ]; then mkdir -p $CARGO_TARGET_DIR && cp -rp $CARGO_TARGET_DIR_MASTER $CARGO_TARGET_DIR; else mkdir -p $CARGO_TARGET_DIR; fi"
+##    - mkdir -p $CARGO_HOME
+##    - cp ~/.cargo/config "$CARGO_HOME/config"
+##    - eval $(ssh-agent -s)
+##    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add - > /dev/null
+##    - mkdir -p ~/.ssh
+##    - chmod 700 ~/.ssh
 #  script:
 #    - cargo fmt -- --check
 
@@ -108,6 +107,8 @@ build_artifact:
     - mkdir -p ~/.ssh
     - chmod 700 ~/.ssh
   script:
+    - ls -la /cache/
+    - du /cache
     - cargo build --release
     - echo $CARGO_TARGET_DIR
     - mkdir -p artifact/usr/sbin
@@ -139,11 +140,11 @@ build_docker:
       .
     - docker push $REGISTRY_PROJECT:$PIPLINE_ID_VER
     - docker push $REGISTRY_PROJECT:latest
-  only:
-    - tags
-    - develop
-    - master
-    - web
+#  only:
+#    - tags
+#    - develop
+#    - master
+#    - web
 
 Deploy DEB to Dev:
   stage: deploy_dev
@@ -154,8 +155,8 @@ Deploy DEB to Dev:
     - git clone https://git.zubr.dev/shared/ci-scripts.git
     - chmod 0700 ci-scripts/deploy_deb.sh
     - ci-scripts/deploy_deb.sh DEV
-  only:
-    - develop
-    - master
-    - tags
-    - web
+#  only:
+#    - develop
+#    - master
+#    - tags
+#    - web
