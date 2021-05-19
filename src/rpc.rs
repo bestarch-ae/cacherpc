@@ -750,7 +750,8 @@ async fn get_program_accounts(
     if params.is_empty() {
         return Err(Error::NotEnoughArguments(req.id));
     }
-    let pubkey: Pubkey = serde_json::from_str(params[0].get())?;
+    let pubkey: Pubkey = serde_json::from_str(params[0].get())
+        .map_err(|_err| Error::InvalidParam(req.id, "Invalid param: WrongSize"))?;
     let config: ProgramAccountsConfig<'_> = {
         if let Some(val) = params.get(1) {
             serde_json::from_str(val.get())?

@@ -241,9 +241,12 @@ impl<'de> Deserialize<'de> for Pubkey {
             {
                 use serde::de::Error;
                 let mut buf = [0; 32];
-                bs58::decode(v)
+                let len = bs58::decode(v)
                     .into(&mut buf)
                     .map_err(|_| Error::custom("can't b58decode"))?;
+                if len != buf.len() {
+                    return Err(Error::custom("bad size"));
+                }
                 Ok(Pubkey(buf))
             }
         }
