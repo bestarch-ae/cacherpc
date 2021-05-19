@@ -86,7 +86,7 @@ rustfmt:
   before_script:
     - "[ ! -d $CARGO_TARGET_DIR ] && if [ -d $CARGO_TARGET_DIR_MASTER ]; then mkdir -p $CARGO_TARGET_DIR && cp -rp $CARGO_TARGET_DIR_MASTER $CARGO_TARGET_DIR; else mkdir -p $CARGO_TARGET_DIR; fi"
     - mkdir -p $CARGO_HOME
-    - cp ~/.cargo/config "$CARGO_HOME/config"
+#    - cp ~/.cargo/config "$CARGO_HOME/config"
     - eval $(ssh-agent -s)
     - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add - > /dev/null
     - mkdir -p ~/.ssh
