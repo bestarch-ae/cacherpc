@@ -280,6 +280,17 @@ impl ErrorResponse<'static> {
         }
     }
 
+    fn invalid_param(id: u64, msg: &'static str) -> ErrorResponse<'static> {
+        ErrorResponse {
+            jsonrpc: "2.0",
+            id: Some(id),
+            error: RpcError {
+                code: -32602,
+                message: msg,
+            },
+        }
+    }
+
     fn invalid_request(id: Option<u64>) -> ErrorResponse<'static> {
         ErrorResponse {
             jsonrpc: "2.0",
@@ -307,6 +318,8 @@ impl ErrorResponse<'static> {
 pub(crate) enum Error {
     #[error("invalid request")]
     InvalidRequest(Option<u64>),
+    #[error("invalid param")]
+    InvalidParam(u64, &'static str),
     #[error("parsing request")]
     Parsing(Option<u64>),
     #[error("not enough arguments")]
@@ -331,6 +344,9 @@ impl actix_web::error::ResponseError for Error {
             Error::InvalidRequest(req_id) => HttpResponse::Ok()
                 .content_type("application/json")
                 .json(&ErrorResponse::invalid_request(*req_id)),
+            Error::InvalidParam(req_id, msg) => HttpResponse::Ok()
+                .content_type("application/json")
+                .json(&ErrorResponse::invalid_param(*req_id, msg)),
             Error::Parsing(req_id) => HttpResponse::Ok()
                 .content_type("application/json")
                 .json(&ErrorResponse::parse_error(*req_id)),
@@ -437,7 +453,8 @@ async fn get_account_info(
         None => return Err(Error::NotEnoughArguments(req.id)),
     };
 
-    let pubkey: Pubkey = serde_json::from_str(params[0].get())?;
+    let pubkey: Pubkey = serde_json::from_str(params[0].get())
+        .map_err(|_err| Error::InvalidParam(req.id, "Invalid param: WrongSize"))?;
     let config: AccountInfoConfig = {
         if let Some(param) = params.get(1) {
             serde_json::from_str(param.get())?
