@@ -1,9 +1,70 @@
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
 use dashmap::{mapref::one::Ref, DashMap};
 use serde::{Deserialize, Serialize};
+
+pub(crate) struct ProgramState([Option<HashSet<Pubkey>>; 3]);
+
+impl ProgramState {
+    pub fn get(&self, commitment: Commitment) -> Option<&HashSet<Pubkey>> {
+        (self.0)[commitment.as_idx()].as_ref()
+    }
+
+    fn insert(&mut self, commitment: Commitment, data: HashSet<Pubkey>) {
+        (self.0)[commitment.as_idx()] = Some(data);
+    }
+
+    fn add(&mut self, commitment: Commitment, data: Pubkey) {
+        if let Some(ref mut keys) = (self.0)[commitment.as_idx()] {
+            keys.insert(data);
+        } else {
+            let mut set = HashSet::new();
+            set.insert(data);
+            self.insert(commitment, set);
+        }
+    }
+}
+
+impl Default for ProgramState {
+    fn default() -> Self {
+        ProgramState([None, None, None])
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ProgramAccountsDb {
+    map: Arc<DashMap<Pubkey, ProgramState>>,
+}
+
+impl ProgramAccountsDb {
+    pub fn new() -> Self {
+        ProgramAccountsDb {
+            map: Arc::new(DashMap::new()),
+        }
+    }
+
+    pub fn get(&self, key: &Pubkey) -> Option<Ref<'_, Pubkey, ProgramState>> {
+        self.map.get(key)
+    }
+
+    pub fn insert(&self, key: Pubkey, data: HashSet<Pubkey>, commitment: Commitment) {
+        let mut entry = self.map.entry(key).or_default();
+        entry.insert(commitment, data);
+    }
+
+    pub fn add(&self, key: &Pubkey, data: Pubkey, commitment: Commitment) {
+        if let Some(mut state) = self.map.get_mut(&key) {
+            state.add(commitment, data);
+        }
+    }
+
+    pub fn remove(&self, key: &Pubkey) {
+        self.map.remove(key);
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct AccountsDb {

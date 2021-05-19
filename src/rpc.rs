@@ -8,7 +8,6 @@ use actix_web::{web, HttpResponse};
 use awc::Client;
 use bytes::Bytes;
 use dashmap::mapref::one::Ref;
-use dashmap::DashMap;
 use lru::LruCache;
 use once_cell::sync::Lazy;
 use prometheus::{
@@ -25,7 +24,7 @@ use tracing::{info, warn};
 use crate::accounts::{AccountCommand, AccountUpdateManager, Subscription};
 use crate::types::{
     AccountContext, AccountData, AccountInfo, AccountState, AccountsDb, Commitment, Encoding,
-    Pubkey, SolanaContext,
+    ProgramAccountsDb, Pubkey, SolanaContext,
 };
 
 struct RpcMetrics {
@@ -216,7 +215,7 @@ impl<'a> Serialize for EncodedAccountData<'a> {
 
 pub(crate) struct State {
     pub accounts: AccountsDb,
-    pub program_accounts: Arc<DashMap<Pubkey, HashSet<Pubkey>>>,
+    pub program_accounts: ProgramAccountsDb,
     pub client: Client,
     pub tx: Addr<AccountUpdateManager>,
     pub rpc_url: String,
@@ -623,7 +622,6 @@ async fn get_program_accounts(
         accounts: &HashSet<Pubkey>,
         config: &'a Config<'_>,
         app_state: &web::Data<State>,
-        commitment: Commitment,
     ) -> Result<HttpResponse, Error> {
         struct Encode<'a, K> {
             inner: Ref<'a, K, AccountState>,
@@ -655,6 +653,8 @@ async fn get_program_accounts(
             account: Encode<'a, Pubkey>,
             pubkey: Pubkey,
         }
+
+        let commitment = config.commitment.unwrap_or_default();
 
         let filters: Option<SmallVec<[Filter<'a>; 2]>> = config
             .filters
@@ -738,13 +738,9 @@ async fn get_program_accounts(
         Some(data) => {
             let accounts = data.value();
             metrics().program_accounts_cache_hits.inc();
-            return program_accounts_response(
-                req.id,
-                &accounts,
-                &config,
-                &app_state,
-                config.commitment.unwrap_or_default(),
-            );
+            if let Some(accounts) = accounts.get(config.commitment.unwrap_or_default()) {
+                return program_accounts_response(req.id, accounts, &config, &app_state);
+            }
         }
         None => {
             if config.data_slice.is_some() || config.filters.is_some() {
@@ -810,13 +806,14 @@ async fn get_program_accounts(
                     if let Some(data) = app_state.program_accounts.get(&program_pubkey) {
                         let data = data.value();
                         metrics().program_accounts_cache_filled.inc();
-                        return program_accounts_response(
-                            req.id,
-                            &data,
-                            &config,
-                            &app_state,
-                            config.commitment.unwrap_or_default(),
-                        );
+                        if let Some(accounts) = data.get(config.commitment.unwrap_or_default()) {
+                            return program_accounts_response(
+                                req.id,
+                                accounts,
+                                &config,
+                                &app_state,
+                            );
+                        }
                     }
                 }
                 continue;
@@ -848,7 +845,11 @@ async fn get_program_accounts(
             );
             keys.insert(pubkey);
         }
-        app_state.program_accounts.insert(program_pubkey, keys);
+        app_state.program_accounts.insert(
+            program_pubkey,
+            keys,
+            config.commitment.unwrap_or_default(),
+        );
         app_state.map_updated.notify();
     }
 

@@ -4,7 +4,6 @@ use std::time::Duration;
 
 use actix_web::{web, App, HttpServer};
 use awc::Client;
-use dashmap::DashMap;
 use lru::LruCache;
 use structopt::StructOpt;
 use tokio::sync::{Notify, Semaphore};
@@ -15,7 +14,7 @@ mod rpc;
 mod types;
 
 use accounts::AccountUpdateManager;
-use types::AccountsDb;
+use types::{AccountsDb, ProgramAccountsDb};
 
 #[derive(Debug, structopt::StructOpt)]
 struct Options {
@@ -55,7 +54,7 @@ async fn main() {
 
 async fn run(options: Options) {
     let accounts = AccountsDb::new();
-    let program_accounts = Arc::new(DashMap::new());
+    let program_accounts = ProgramAccountsDb::new();
 
     let (_, conn) = Client::builder()
         .max_http_version(awc::http::Version::HTTP_11)

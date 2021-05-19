@@ -1,10 +1,8 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::time::Duration;
 
 use actix::io::SinkWrite;
 use actix::prelude::{Actor, Addr, Context, Handler, Message, StreamHandler};
-use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use tokio::stream::{Stream, StreamExt};
@@ -13,7 +11,8 @@ use tokio::time::{DelayQueue, Instant};
 use tracing::{error, info};
 
 use crate::types::{
-    AccountContext, AccountInfo, AccountsDb, Commitment, Encoding, Pubkey, SolanaContext,
+    AccountContext, AccountInfo, AccountsDb, Commitment, Encoding, ProgramAccountsDb, Pubkey,
+    SolanaContext,
 };
 
 const PURGE_TIMEOUT: Duration = Duration::from_secs(600);
@@ -38,7 +37,7 @@ pub(crate) struct AccountUpdateManager {
         >,
     >,
     accounts: AccountsDb,
-    program_accounts: Arc<DashMap<Pubkey, HashSet<Pubkey>>>,
+    program_accounts: ProgramAccountsDb,
     purge_queue: DelayQueueHandle<Subscription>,
 }
 
@@ -51,7 +50,7 @@ impl std::fmt::Debug for AccountUpdateManager {
 impl AccountUpdateManager {
     pub fn init(
         accounts: AccountsDb,
-        program_accounts: Arc<DashMap<Pubkey, HashSet<Pubkey>>>,
+        program_accounts: ProgramAccountsDb,
         conn: actix_codec::Framed<awc::BoxedSocket, awc::ws::Codec>,
     ) -> Addr<Self> {
         AccountUpdateManager::create(|ctx| {
@@ -293,9 +292,7 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
                                     let key = params.result.value.pubkey;
                                     self.accounts.insert(key, AccountContext {
                                         value: Some(params.result.value.account), context: params.result.context }, *commitment);
-                                    if let Some(mut keys) = self.program_accounts.get_mut(&program_sub.key()) {
-                                        keys.insert(params.result.value.pubkey);
-                                    }
+                                    self.program_accounts.add(&program_sub.key(), params.result.value.pubkey, *commitment);
                                 }
                             }
                             "rootNotification" => {
