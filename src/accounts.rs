@@ -162,7 +162,7 @@ impl Handler<AccountCommand> for AccountUpdateManager {
                     self.purge_queue.insert(sub, PURGE_TIMEOUT);
                 }
                 AccountCommand::Purge(sub) => {
-                    info!("purging {:?}", sub);
+                    info!("purging {}", sub);
 
                     #[derive(Serialize)]
                     struct Request<'a> {
@@ -230,22 +230,22 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
                     if let (Some(result), Some(id)) = (value.result, value.id) {
                         if let Some(req) = self.inflight.remove(&id) {
                             match req {
-                                InflightRequest::Sub(key, commitment) => {
+                                InflightRequest::Sub(sub, commitment) => {
                                     let sub_id: u64 = serde_json::from_str(result.get())?;
-                                    self.id_to_sub.insert(sub_id, (key, commitment));
-                                    self.sub_to_id.insert(key, sub_id);
-                                    info!(message = "subscribed to stream", sub = sub_id, key = %key);
+                                    self.id_to_sub.insert(sub_id, (sub, commitment));
+                                    self.sub_to_id.insert(sub, sub_id);
+                                    info!(message = "subscribed to stream", sub_id = sub_id, sub = %sub);
                                 }
-                                InflightRequest::Unsub(key) => {
+                                InflightRequest::Unsub(sub) => {
                                     //let _is_ok: bool = serde_json::from_str(result.get()).unwrap();
-                                    if let Some(sub) = self.sub_to_id.remove(&key) {
-                                        if let Some(val) = self.id_to_sub.remove(&sub) {
+                                    if let Some(sub_id) = self.sub_to_id.remove(&sub) {
+                                        if let Some(val) = self.id_to_sub.remove(&sub_id) {
                                             self.subs.remove(&val);
                                         }
                                         info!(
                                             message = "unsubscribed from stream",
-                                            sub = sub,
-                                            key = %key,
+                                            sub_id = sub_id,
+                                            sub= %sub,
                                         );
                                     }
                                 }
@@ -359,10 +359,10 @@ impl Subscription {
 impl std::fmt::Display for Subscription {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let (prefix, key) = match self {
-            Subscription::Account(key) => ("account", key),
-            Subscription::Program(key) => ("program", key),
+            Subscription::Account(key) => ("Account", key),
+            Subscription::Program(key) => ("Program", key),
         };
-        write!(f, "{}: {}", prefix, key)
+        write!(f, "{}({})", prefix, key)
     }
 }
 

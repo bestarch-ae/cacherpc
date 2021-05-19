@@ -238,6 +238,13 @@ impl State {
     fn insert(&self, key: Pubkey, data: AccountContext, commitment: Commitment) {
         self.accounts.insert(key, data, commitment)
     }
+
+    async fn subscribe(&self, subscription: Subscription, commitment: Commitment) {
+        self.tx
+            .send(AccountCommand::Subscribe(subscription, commitment))
+            .await
+            .expect("actor is dead");
+    }
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -458,13 +465,11 @@ async fn get_account_info(
                 metrics().response_uncacheable.inc();
             }
             app_state
-                .tx
-                .send(AccountCommand::Subscribe(
+                .subscribe(
                     Subscription::Account(pubkey),
                     config.commitment.unwrap_or_default(),
-                ))
-                .await
-                .expect("actor is dead");
+                )
+                .await;
         }
     }
 
@@ -747,13 +752,11 @@ async fn get_program_accounts(
                 cacheable_for_key = None;
             }
             app_state
-                .tx
-                .send(AccountCommand::Subscribe(
+                .subscribe(
                     Subscription::Program(pubkey),
                     config.commitment.unwrap_or_default(),
-                ))
-                .await
-                .expect("actor is dead");
+                )
+                .await;
         }
     }
 
@@ -843,6 +846,12 @@ async fn get_program_accounts(
                 },
                 config.commitment.unwrap_or_default(),
             );
+            app_state
+                .subscribe(
+                    Subscription::Account(pubkey),
+                    config.commitment.unwrap_or_default(),
+                )
+                .await;
             keys.insert(pubkey);
         }
         app_state.program_accounts.insert(program_pubkey, keys);
