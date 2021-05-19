@@ -56,17 +56,8 @@ async fn run(options: Options) {
     let accounts = AccountsDb::new();
     let program_accounts = ProgramAccountsDb::new();
 
-    let (_, conn) = Client::builder()
-        .max_http_version(awc::http::Version::HTTP_11)
-        .finish()
-        .ws(&options.ws_url)
-        .connect()
-        .await
-        .unwrap();
-
-    info!("connected to websocket rpc @ {}", options.ws_url);
-
-    let addr = AccountUpdateManager::init(accounts.clone(), program_accounts.clone(), conn);
+    let addr =
+        AccountUpdateManager::init(accounts.clone(), program_accounts.clone(), &options.ws_url);
 
     let rpc_url = options.rpc_url;
     let notify = Arc::new(Notify::new());

@@ -2,13 +2,13 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use actix::io::SinkWrite;
-use actix::prelude::{Actor, Addr, Context, Handler, Message, StreamHandler};
+use actix::prelude::{Actor, Addr, Context, Handler, Message, Running, StreamHandler};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use tokio::stream::{Stream, StreamExt};
 use tokio::sync::mpsc;
 use tokio::time::{DelayQueue, Instant};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::types::{
     AccountContext, AccountInfo, AccountsDb, Commitment, Encoding, ProgramAccountsDb, Pubkey,
@@ -23,19 +23,22 @@ enum InflightRequest {
     SlotSub(u64),
 }
 
+type WsSink = SinkWrite<
+    awc::ws::Message,
+    futures_util::stream::SplitSink<
+        actix_codec::Framed<awc::BoxedSocket, awc::ws::Codec>,
+        awc::ws::Message,
+    >,
+>;
+
 pub(crate) struct AccountUpdateManager {
+    websocket_url: String,
     request_id: u64,
     inflight: HashMap<u64, InflightRequest>,
     subs: HashSet<(Subscription, Commitment)>,
     id_to_sub: HashMap<u64, (Subscription, Commitment)>,
     sub_to_id: HashMap<Subscription, u64>,
-    sink: SinkWrite<
-        awc::ws::Message,
-        futures_util::stream::SplitSink<
-            actix_codec::Framed<awc::BoxedSocket, awc::ws::Codec>,
-            awc::ws::Message,
-        >,
-    >,
+    sink: Option<WsSink>,
     accounts: AccountsDb,
     program_accounts: ProgramAccountsDb,
     purge_queue: DelayQueueHandle<Subscription>,
@@ -51,19 +54,43 @@ impl AccountUpdateManager {
     pub fn init(
         accounts: AccountsDb,
         program_accounts: ProgramAccountsDb,
-        conn: actix_codec::Framed<awc::BoxedSocket, awc::ws::Codec>,
+        websocket_url: &str,
     ) -> Addr<Self> {
         AccountUpdateManager::create(|ctx| {
             let (handle, stream) = delay_queue();
             let purge_stream = stream.map(AccountCommand::Purge);
 
+            /*
+            let fut = async move {
+                let conn = loop {
+                    let res = awc::Client::builder()
+                        .max_http_version(awc::http::Version::HTTP_11)
+                        .finish()
+                        .ws(websocket_url)
+                        .connect()
+                        .await;
+                    match res {
+                        Ok((_, conn)) => break conn,
+                        Err(err) => error!("failed to connect: {:?}", err),
+                    }
+                };
+                conn
+            };
+            use actix::fut::ActorFuture;
+            use actix::prelude::AsyncContext;
+
+            let fut = actix::fut::wrap_future::<_, Self>(fut).map(|res, actor, _ctx| {});
+            let conn = ctx.wait(fut);
+
             let (sink, stream) = futures_util::stream::StreamExt::split(conn);
             let (sink, stream) = (sink, stream.filter_map(Result::ok));
             let sink = SinkWrite::new(sink, ctx);
             AccountUpdateManager::add_stream(stream, ctx);
+            */
             AccountUpdateManager::add_stream(purge_stream, ctx);
             AccountUpdateManager {
-                sink,
+                websocket_url: websocket_url.to_owned(),
+                sink: None,
                 id_to_sub: HashMap::default(),
                 sub_to_id: HashMap::default(),
                 inflight: HashMap::default(),
@@ -80,6 +107,48 @@ impl AccountUpdateManager {
         let request_id = self.request_id;
         self.request_id += 1;
         request_id
+    }
+
+    fn send<T: Serialize>(&mut self, request: &T) -> Result<(), serde_json::Error> {
+        if let Some(sink) = &mut self.sink {
+            sink.write(awc::ws::Message::Text(serde_json::to_string(request)?));
+        } else {
+            warn!("no sink");
+        }
+        Ok(())
+    }
+
+    fn connect(&self, ctx: &mut Context<Self>) {
+        use actix::fut::{ActorFuture, WrapFuture};
+        use actix::prelude::AsyncContext;
+
+        let websocket_url = self.websocket_url.clone();
+        let fut = async move {
+            loop {
+                info!("connecting to websocket {}", websocket_url);
+                let res = awc::Client::builder()
+                    .max_http_version(awc::http::Version::HTTP_11)
+                    .finish()
+                    .ws(&websocket_url)
+                    .connect()
+                    .await;
+                match res {
+                    Ok((_, conn)) => break conn,
+                    Err(err) => {
+                        error!("failed to connect to {} {:?}", websocket_url, err);
+                        tokio::time::delay_for(Duration::from_secs(1)).await;
+                    }
+                }
+            }
+        };
+        let fut = fut.into_actor(self).map(|conn, actor, ctx| {
+            let (sink, stream) = futures_util::stream::StreamExt::split(conn);
+            let (sink, stream) = (sink, stream.filter_map(Result::ok));
+            let sink = SinkWrite::new(sink, ctx);
+            AccountUpdateManager::add_stream(stream, ctx);
+            actor.sink = Some(sink);
+        });
+        ctx.wait(fut);
     }
 }
 
@@ -156,8 +225,7 @@ impl Handler<AccountCommand> for AccountUpdateManager {
                     self.inflight
                         .insert(request_id, InflightRequest::Sub(sub, commitment));
                     self.subs.insert((sub, commitment));
-                    self.sink
-                        .write(awc::ws::Message::Text(serde_json::to_string(&request)?));
+                    self.send(&request)?;
                     self.purge_queue.insert(sub, PURGE_TIMEOUT);
                 }
                 AccountCommand::Purge(sub) => {
@@ -184,8 +252,7 @@ impl Handler<AccountCommand> for AccountUpdateManager {
                         };
                         self.inflight
                             .insert(request_id, InflightRequest::Unsub(sub));
-                        self.sink
-                            .write(awc::ws::Message::Text(serde_json::to_string(&request)?));
+                        self.send(&request)?;
                     }
                     match sub {
                         Subscription::Program(key) => {
@@ -319,12 +386,9 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
             error!("error handling Frame: {}", err);
         });
     }
-}
 
-impl Actor for AccountUpdateManager {
-    type Context = Context<Self>;
-
-    fn started(&mut self, _ctx: &mut Context<Self>) {
+    fn started(&mut self, _: &mut Context<Self>) {
+        info!("websocket connected");
         // subscribe to slots
         let request_id = self.next_request_id();
         let request = serde_json::json!({
@@ -334,13 +398,30 @@ impl Actor for AccountUpdateManager {
         });
         self.inflight
             .insert(request_id, InflightRequest::SlotSub(request_id));
-        self.sink.write(awc::ws::Message::Text(
-            serde_json::to_string(&request).unwrap(),
-        ));
+        let _ = self.send(&request);
+    }
+
+    fn finished(&mut self, ctx: &mut Context<Self>) {
+        info!("websocket disconnected");
+        self.connect(ctx);
     }
 }
 
-impl actix::io::WriteHandler<awc::error::WsProtocolError> for AccountUpdateManager {}
+impl Actor for AccountUpdateManager {
+    type Context = Context<Self>;
+
+    fn started(&mut self, ctx: &mut Context<Self>) {
+        self.connect(ctx);
+    }
+}
+
+impl actix::io::WriteHandler<awc::error::WsProtocolError> for AccountUpdateManager {
+    fn error(&mut self, err: awc::error::WsProtocolError, ctx: &mut Self::Context) -> Running {
+        error!("websocket error {:?}", err);
+        self.connect(ctx);
+        Running::Continue
+    }
+}
 
 #[derive(Debug, Eq, PartialEq, Clone, Hash, Copy)]
 pub(crate) enum Subscription {
