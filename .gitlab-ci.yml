@@ -6,7 +6,7 @@ variables:
 
   BIN_NAME: cache-rpc
   BUILD_IMAGE: $REGISTRY_PROJECT:build-$CI_COMMIT_REF_SLUG
-#  CARGO_HOME: /cache/cacherpc/.cargo
+  CARGO_HOME: /cache/cacherpc/.cargo
   CARGO_TARGET_DIR: "/cache/cacherpc/$CI_COMMIT_REF_SLUG/$CI_JOB_NAME"
   CARGO_TARGET_DIR_MASTER: "/cache/cacherpc/master/$CI_JOB_NAME"
 
@@ -62,23 +62,23 @@ clear_cache:
   script:
     - rm -rf /cache/cacherpc/$CI_COMMIT_REF_SLUG
 
-#lint:
-#  stage: lint
-#  image: $BUILD_IMAGE
-#  tags: [docker_19_cache]
-#  before_script:
-#    - "[ ! -d $CARGO_TARGET_DIR ] && if [ -d $CARGO_TARGET_DIR_MASTER ]; then mkdir -p $CARGO_TARGET_DIR && cp -rp $CARGO_TARGET_DIR_MASTER $CARGO_TARGET_DIR; else mkdir -p $CARGO_TARGET_DIR; fi"
-##    - mkdir -p $CARGO_HOME
-#    - eval $(ssh-agent -s)
-#    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add - > /dev/null
-#    - mkdir -p ~/.ssh
-#    - chmod 700 ~/.ssh
-#  script:
-#    - cargo clippy --version
+lint:
+  stage: lint
+  image: $BUILD_IMAGE
+  tags: [docker_19_cache]
+  before_script:
+    - "[ ! -d $CARGO_TARGET_DIR ] && if [ -d $CARGO_TARGET_DIR_MASTER ]; then mkdir -p $CARGO_TARGET_DIR && cp -rp $CARGO_TARGET_DIR_MASTER $CARGO_TARGET_DIR; else mkdir -p $CARGO_TARGET_DIR; fi"
+    - mkdir -p $CARGO_HOME
+    - eval $(ssh-agent -s)
+    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add - > /dev/null
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+  script:
+    - cargo clippy --version
 #    - cargo clippy --all-targets --all-features -- -D warnings -D rust_2018_idioms
 #    - "cargo metadata --format-version 1 | jq '.packages | map(.dependencies) | flatten | map(select(.source != null)) | map(select(.source | test(\"zubr.dev\"))) | unique_by(.source) | group_by(.name) | map(select(length > 1)) | .[] | {(.[0].name): [.[] | .source]}' | tee /tmp/1"
 #    - if [ -s /tmp/1 ]; then echo Version mismatch; exit 2; fi
-#
+
 #rustfmt:
 #  stage: rustfmt
 #  image: $BUILD_IMAGE
