@@ -556,167 +556,176 @@ async fn get_account_info(
         .body(resp))
 }
 
+#[derive(Error, Debug)]
+enum ProgramAccountsResponseError {
+    #[error("serialization failed")]
+    Serialize(#[from] serde_json::Error),
+    #[error("data inconsistency")]
+    Inconsistency,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+enum Filter<'a> {
+    Memcmp {
+        offset: usize,
+        #[serde(borrow)]
+        bytes: &'a str,
+    },
+    DataSize(usize),
+}
+
+impl<'a> Filter<'a> {
+    fn matches(&self, data: &AccountData) -> bool {
+        match *self {
+            Filter::DataSize(len) => data.data.len() == len,
+            Filter::Memcmp { offset, bytes } => {
+                // data to match, as base-58 encoded string and limited to less than 129 bytes
+                let mut buf = [0u8; 128];
+
+                // see rpc_filter.rs, same behaviour
+                let len = match bs58::decode(bytes).into(&mut buf) {
+                    Ok(len) => len,
+                    Err(_) => {
+                        return false;
+                    }
+                };
+                match data.data.get(offset..offset + len) {
+                    Some(slice) => slice == &buf[..len],
+                    None => false,
+                }
+            }
+        }
+    }
+}
+
+#[derive(Deserialize, Debug)]
+struct ProgramAccountsConfig<'a> {
+    #[serde(default = "Encoding::default")]
+    encoding: Encoding,
+    commitment: Option<Commitment>,
+    #[serde(rename = "dataSlice")]
+    data_slice: Option<Slice>,
+    #[serde(borrow)]
+    filters: Option<&'a RawValue>,
+}
+
+impl Default for ProgramAccountsConfig<'static> {
+    fn default() -> Self {
+        ProgramAccountsConfig {
+            encoding: Encoding::Default,
+            commitment: None,
+            data_slice: None,
+            filters: None,
+        }
+    }
+}
+
+fn program_accounts_response<'a>(
+    req_id: u64,
+    accounts: &HashSet<Pubkey>,
+    config: &'a ProgramAccountsConfig<'_>,
+    app_state: &web::Data<State>,
+) -> Result<HttpResponse, ProgramAccountsResponseError> {
+    struct Encode<'a, K> {
+        inner: Ref<'a, K, AccountState>,
+        encoding: Encoding,
+        slice: Option<Slice>,
+        commitment: Commitment,
+    }
+
+    impl<'a, K> Serialize for Encode<'a, K>
+    where
+        K: Eq + std::hash::Hash,
+    {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            if let Some((Some(value), _)) = self.inner.value().get(self.commitment) {
+                let encoded = value.encode(self.encoding, self.slice);
+                encoded.serialize(serializer)
+            } else {
+                // shouldn't happen
+                serializer.serialize_none()
+            }
+        }
+    }
+
+    #[derive(Serialize)]
+    struct AccountAndPubkey<'a> {
+        account: Encode<'a, Pubkey>,
+        pubkey: Pubkey,
+    }
+
+    let commitment = config.commitment.unwrap_or_default();
+
+    let filters: Option<SmallVec<[Filter<'a>; 2]>> = config
+        .filters
+        .map(|s| serde_json::from_str(s.get()))
+        .transpose()?;
+
+    let mut encoded_accounts = Vec::with_capacity(accounts.len());
+
+    for key in accounts {
+        if let Some(data) = app_state.get_account(&key) {
+            if data.value().get(commitment).is_none() {
+                warn!("data for key {}/{:?} not found", key, commitment);
+                return Err(ProgramAccountsResponseError::Inconsistency);
+            }
+
+            if let Some(filters) = &filters {
+                let matches = filters.iter().all(|f| {
+                    let value = data.value().get(commitment).unwrap(); // checked above
+                    value
+                        .0
+                        .as_ref()
+                        .map(|val| f.matches(&val.data))
+                        .unwrap_or(false)
+                });
+                if !matches {
+                    info!("skipped {} because of filter", data.key());
+                    continue;
+                }
+            }
+
+            encoded_accounts.push(AccountAndPubkey {
+                account: Encode {
+                    inner: data,
+                    encoding: config.encoding,
+                    slice: config.data_slice,
+                    commitment,
+                },
+                pubkey: *key,
+            })
+        }
+    }
+    #[derive(Serialize)]
+    struct Resp<'a> {
+        jsonrpc: &'a str,
+        result: Vec<AccountAndPubkey<'a>>,
+        id: u64,
+    }
+    let resp = Resp {
+        jsonrpc: "2.0",
+        result: encoded_accounts,
+        id: req_id,
+    };
+
+    let body = serde_json::to_vec(&resp)?;
+    metrics()
+        .response_size_bytes
+        .with_label_values(&["getProgramAccounts"])
+        .observe(body.len() as f64);
+    Ok(HttpResponse::Ok()
+        .content_type("application/json")
+        .body(body))
+}
+
 async fn get_program_accounts(
     req: Request<'_>,
     app_state: web::Data<State>,
 ) -> Result<HttpResponse, Error> {
-    #[derive(Deserialize, Debug)]
-    #[serde(rename_all = "camelCase")]
-    enum Filter<'a> {
-        Memcmp {
-            offset: usize,
-            #[serde(borrow)]
-            bytes: &'a str,
-        },
-        DataSize(usize),
-    }
-
-    impl<'a> Filter<'a> {
-        fn matches(&self, data: &AccountData) -> bool {
-            match *self {
-                Filter::DataSize(len) => data.data.len() == len,
-                Filter::Memcmp { offset, bytes } => {
-                    // data to match, as base-58 encoded string and limited to less than 129 bytes
-                    let mut buf = [0u8; 128];
-
-                    // see rpc_filter.rs, same behaviour
-                    let len = match bs58::decode(bytes).into(&mut buf) {
-                        Ok(len) => len,
-                        Err(_) => {
-                            return false;
-                        }
-                    };
-                    match data.data.get(offset..offset + len) {
-                        Some(slice) => slice == &buf[..len],
-                        None => false,
-                    }
-                }
-            }
-        }
-    }
-
-    #[derive(Deserialize, Debug)]
-    struct Config<'a> {
-        #[serde(default = "Encoding::default")]
-        encoding: Encoding,
-        commitment: Option<Commitment>,
-        #[serde(rename = "dataSlice")]
-        data_slice: Option<Slice>,
-        #[serde(borrow)]
-        filters: Option<&'a RawValue>,
-    }
-
-    impl Default for Config<'static> {
-        fn default() -> Self {
-            Config {
-                encoding: Encoding::Default,
-                commitment: None,
-                data_slice: None,
-                filters: None,
-            }
-        }
-    }
-
-    fn program_accounts_response<'a>(
-        req_id: u64,
-        accounts: &HashSet<Pubkey>,
-        config: &'a Config<'_>,
-        app_state: &web::Data<State>,
-    ) -> Result<HttpResponse, Error> {
-        struct Encode<'a, K> {
-            inner: Ref<'a, K, AccountState>,
-            encoding: Encoding,
-            slice: Option<Slice>,
-            commitment: Commitment,
-        }
-
-        impl<'a, K> Serialize for Encode<'a, K>
-        where
-            K: Eq + std::hash::Hash,
-        {
-            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-            where
-                S: serde::Serializer,
-            {
-                if let Some((Some(value), _)) = self.inner.value().get(self.commitment) {
-                    let encoded = value.encode(self.encoding, self.slice);
-                    encoded.serialize(serializer)
-                } else {
-                    // shouldn't happen
-                    serializer.serialize_none()
-                }
-            }
-        }
-
-        #[derive(Serialize)]
-        struct AccountAndPubkey<'a> {
-            account: Encode<'a, Pubkey>,
-            pubkey: Pubkey,
-        }
-
-        let commitment = config.commitment.unwrap_or_default();
-
-        let filters: Option<SmallVec<[Filter<'a>; 2]>> = config
-            .filters
-            .map(|s| serde_json::from_str(s.get()))
-            .transpose()?;
-
-        let mut encoded_accounts = Vec::with_capacity(accounts.len());
-
-        for key in accounts {
-            if let Some(data) = app_state.get_account(&key) {
-                if data.value().get(commitment).is_none() {
-                    continue;
-                }
-
-                if let Some(filters) = &filters {
-                    let matches = filters.iter().all(|f| {
-                        let value = data.value().get(commitment).unwrap(); // checked above
-                        value
-                            .0
-                            .as_ref()
-                            .map(|val| f.matches(&val.data))
-                            .unwrap_or(false)
-                    });
-                    if !matches {
-                        info!("skipped {} because of filter", data.key());
-                        continue;
-                    }
-                }
-
-                encoded_accounts.push(AccountAndPubkey {
-                    account: Encode {
-                        inner: data,
-                        encoding: config.encoding,
-                        slice: config.data_slice,
-                        commitment,
-                    },
-                    pubkey: *key,
-                })
-            }
-        }
-        #[derive(Serialize)]
-        struct Resp<'a> {
-            jsonrpc: &'a str,
-            result: Vec<AccountAndPubkey<'a>>,
-            id: u64,
-        }
-        let resp = Resp {
-            jsonrpc: "2.0",
-            result: encoded_accounts,
-            id: req_id,
-        };
-
-        let body = serde_json::to_vec(&resp)?;
-        metrics()
-            .response_size_bytes
-            .with_label_values(&["getProgramAccounts"])
-            .observe(body.len() as f64);
-        Ok(HttpResponse::Ok()
-            .content_type("application/json")
-            .body(body))
-    }
-
     let params: SmallVec<[&RawValue; 2]> = match req.params {
         Some(params) => serde_json::from_str(params.get())?,
         None => SmallVec::new(),
@@ -725,11 +734,11 @@ async fn get_program_accounts(
         return Err(Error::NotEnoughArguments(req.id));
     }
     let pubkey: Pubkey = serde_json::from_str(params[0].get())?;
-    let config: Config<'_> = {
+    let config: ProgramAccountsConfig<'_> = {
         if let Some(val) = params.get(1) {
             serde_json::from_str(val.get())?
         } else {
-            Config::default()
+            ProgramAccountsConfig::default()
         }
     };
 
@@ -737,9 +746,11 @@ async fn get_program_accounts(
     match app_state.program_accounts.get(&pubkey) {
         Some(data) => {
             let accounts = data.value();
-            metrics().program_accounts_cache_hits.inc();
             if let Some(accounts) = accounts.get(config.commitment.unwrap_or_default()) {
-                return program_accounts_response(req.id, accounts, &config, &app_state);
+                metrics().program_accounts_cache_hits.inc();
+                if let Ok(resp) = program_accounts_response(req.id, accounts, &config, &app_state) {
+                    return Ok(resp);
+                }
             }
         }
         None => {
@@ -807,12 +818,14 @@ async fn get_program_accounts(
                         let data = data.value();
                         metrics().program_accounts_cache_filled.inc();
                         if let Some(accounts) = data.get(config.commitment.unwrap_or_default()) {
-                            return program_accounts_response(
+                            if let Ok(resp) = program_accounts_response(
                                 req.id,
                                 accounts,
                                 &config,
                                 &app_state,
-                            );
+                            ) {
+                                return Ok(resp);
+                            }
                         }
                     }
                 }
