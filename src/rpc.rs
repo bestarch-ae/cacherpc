@@ -846,12 +846,6 @@ async fn get_program_accounts(
                 },
                 config.commitment.unwrap_or_default(),
             );
-            app_state
-                .subscribe(
-                    Subscription::Account(pubkey),
-                    config.commitment.unwrap_or_default(),
-                )
-                .await;
             keys.insert(pubkey);
         }
         app_state.program_accounts.insert(program_pubkey, keys);
