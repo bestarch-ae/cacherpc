@@ -47,6 +47,8 @@ create_build_image:
   image: docker
   tags: [docker_19_nocache]
   before_script:
+    - cat /cache/cacherpc/.cargo/config
+    - rm -rf /cache/cacherpc/.cargo/config
     - docker login -u $REGISTRY_LOGIN -p $REGISTRY_PASS
   script:
     - docker pull $REGISTRY_PROJECT:build-master || true
