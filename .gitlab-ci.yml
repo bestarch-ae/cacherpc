@@ -79,19 +79,20 @@ lint:
 #    - "cargo metadata --format-version 1 | jq '.packages | map(.dependencies) | flatten | map(select(.source != null)) | map(select(.source | test(\"zubr.dev\"))) | unique_by(.source) | group_by(.name) | map(select(length > 1)) | .[] | {(.[0].name): [.[] | .source]}' | tee /tmp/1"
 #    - if [ -s /tmp/1 ]; then echo Version mismatch; exit 2; fi
 
-#rustfmt:
-#  stage: rustfmt
-#  image: $BUILD_IMAGE
-#  tags: [docker_19_cache]
-##  before_script:
-##    - "[ ! -d $CARGO_TARGET_DIR ] && if [ -d $CARGO_TARGET_DIR_MASTER ]; then mkdir -p $CARGO_TARGET_DIR && cp -rp $CARGO_TARGET_DIR_MASTER $CARGO_TARGET_DIR; else mkdir -p $CARGO_TARGET_DIR; fi"
-##    - mkdir -p $CARGO_HOME
-##    - cp ~/.cargo/config "$CARGO_HOME/config"
-##    - eval $(ssh-agent -s)
-##    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add - > /dev/null
-##    - mkdir -p ~/.ssh
-##    - chmod 700 ~/.ssh
-#  script:
+rustfmt:
+  stage: rustfmt
+  image: $BUILD_IMAGE
+  tags: [docker_19_cache]
+  before_script:
+    - "[ ! -d $CARGO_TARGET_DIR ] && if [ -d $CARGO_TARGET_DIR_MASTER ]; then mkdir -p $CARGO_TARGET_DIR && cp -rp $CARGO_TARGET_DIR_MASTER $CARGO_TARGET_DIR; else mkdir -p $CARGO_TARGET_DIR; fi"
+    - mkdir -p $CARGO_HOME
+    - cp ~/.cargo/config "$CARGO_HOME/config"
+    - eval $(ssh-agent -s)
+    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add - > /dev/null
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+  script:
+    - echo "fmt"
 #    - cargo fmt -- --check
 
 build_artifact:
@@ -109,6 +110,10 @@ build_artifact:
   script:
     - ls -la /cache/
     - du /cache
+    - ls -la ~/.cargo/
+    - ls -la /cache/cacherpc/.cargo/
+    - cat ~/.cargo/config
+    - cat /cache/cacherpc/.cargo/config
     - cargo build --release
     - echo $CARGO_TARGET_DIR
     - mkdir -p artifact/usr/sbin
