@@ -99,7 +99,7 @@ impl AccountState {
         let mut result = None;
         let mut slot = 0;
         for acc in self.0.iter().take(commitment.as_idx() + 1).flatten() {
-            if acc.slot > slot {
+            if acc.slot >= slot {
                 result = Some((acc.data.as_ref(), acc.slot));
                 slot = acc.slot;
             }
