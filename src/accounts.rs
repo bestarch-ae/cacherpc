@@ -60,33 +60,6 @@ impl AccountUpdateManager {
             let (handle, stream) = delay_queue();
             let purge_stream = stream.map(AccountCommand::Purge);
 
-            /*
-            let fut = async move {
-                let conn = loop {
-                    let res = awc::Client::builder()
-                        .max_http_version(awc::http::Version::HTTP_11)
-                        .finish()
-                        .ws(websocket_url)
-                        .connect()
-                        .await;
-                    match res {
-                        Ok((_, conn)) => break conn,
-                        Err(err) => error!("failed to connect: {:?}", err),
-                    }
-                };
-                conn
-            };
-            use actix::fut::ActorFuture;
-            use actix::prelude::AsyncContext;
-
-            let fut = actix::fut::wrap_future::<_, Self>(fut).map(|res, actor, _ctx| {});
-            let conn = ctx.wait(fut);
-
-            let (sink, stream) = futures_util::stream::StreamExt::split(conn);
-            let (sink, stream) = (sink, stream.filter_map(Result::ok));
-            let sink = SinkWrite::new(sink, ctx);
-            AccountUpdateManager::add_stream(stream, ctx);
-            */
             AccountUpdateManager::add_stream(purge_stream, ctx);
             AccountUpdateManager {
                 websocket_url: websocket_url.to_owned(),
