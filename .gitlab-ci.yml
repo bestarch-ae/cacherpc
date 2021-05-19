@@ -161,3 +161,17 @@ Deploy DEB to Dev:
     - master
     - tags
     - web
+
+Deploy DEB to sbx:
+  stage: deploy_sbx
+  tags:
+    - deploy_rpm_sbx
+  script:
+    - find . -mindepth 1 -maxdepth 1 -exec rm -rf {} \;
+    - git clone https://git.zubr.dev/shared/ci-scripts.git
+    - chmod 0700 ci-scripts/deploy_deb.sh
+    - ci-scripts/deploy_deb.sh SBX
+  when: manual
+  only:
+    - master
+    - tags
