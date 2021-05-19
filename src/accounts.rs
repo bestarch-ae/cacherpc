@@ -189,7 +189,11 @@ impl Handler<AccountCommand> for AccountUpdateManager {
                     }
                     match sub {
                         Subscription::Program(key) => {
-                            self.program_accounts.remove(&key);
+                            if let Some(program_accounts) = self.program_accounts.remove(&key) {
+                                for key in program_accounts.into_accounts() {
+                                    self.accounts.remove(&key)
+                                }
+                            }
                         }
                         Subscription::Account(key) => {
                             self.accounts.remove(&key);

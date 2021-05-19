@@ -13,6 +13,12 @@ impl ProgramState {
         (self.0)[commitment.as_idx()].as_ref()
     }
 
+    pub fn into_accounts(self) -> impl Iterator<Item = Pubkey> {
+        std::array::IntoIter::new(self.0)
+            .flat_map(|set| set.into_iter())
+            .flatten()
+    }
+
     fn insert(&mut self, commitment: Commitment, data: HashSet<Pubkey>) {
         (self.0)[commitment.as_idx()] = Some(data);
     }
@@ -61,8 +67,8 @@ impl ProgramAccountsDb {
         }
     }
 
-    pub fn remove(&self, key: &Pubkey) {
-        self.map.remove(key);
+    pub fn remove(&self, key: &Pubkey) -> Option<ProgramState> {
+        self.map.remove(key).map(|(_, state)| state)
     }
 }
 
