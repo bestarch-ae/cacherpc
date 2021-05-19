@@ -19,7 +19,7 @@ stages:
   - build
   - build_deb
   - deploy_dev
-  - ready_sbx
+  - deploy_sbx
   - notify
 
 
@@ -36,9 +36,6 @@ include:
   - project: 'shared/tasks'
     ref: master
     file: 'notify/send-failed.yml'
-  - project: 'shared/tasks'
-    ref: 'master'
-    file: 'deploy/ready-sbx.yml'                            #ready_sbx
   - project: 'shared/tasks'
     ref: 'master'
     file: 'deb/build_rust_app.yml'                          #build_deb
