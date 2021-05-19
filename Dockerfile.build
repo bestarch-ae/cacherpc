@@ -5,5 +5,3 @@ RUN apt-get update && apt-get install -y build-essential curl pkg-config libssl-
 RUN curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain $(cat /tmp/rust-toolchain)
 ENV PATH="/root/.cargo/bin:${PATH}"
 RUN rustup component add clippy && rustup component add rustfmt
-RUN echo '[registries.zubr]\nindex = "ssh://git@git.zubr.dev/shared/crates/index.git"' \
-    > /root/.cargo/config
