@@ -312,6 +312,17 @@ impl ErrorResponse<'static> {
             },
         }
     }
+
+    fn gateway_timeout(id: Option<u64>) -> ErrorResponse<'static> {
+        ErrorResponse {
+            jsonrpc: "2.0",
+            id,
+            error: RpcError {
+                code: -32000,
+                message: "Gateway timeout",
+            },
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -324,8 +335,8 @@ pub(crate) enum Error {
     Parsing(Option<u64>),
     #[error("not enough arguments")]
     NotEnoughArguments(u64),
-    #[error("client error")]
-    Client(#[from] awc::error::SendRequestError),
+    #[error("backend timeout")]
+    Timeout(u64),
 }
 
 impl From<serde_json::Error> for Error {
@@ -353,7 +364,9 @@ impl actix_web::error::ResponseError for Error {
             Error::NotEnoughArguments(req_id) => HttpResponse::Ok()
                 .content_type("application/json")
                 .json(&ErrorResponse::not_enough_arguments(*req_id)),
-            Error::Client(_error) => HttpResponse::GatewayTimeout().finish(), // TODO
+            Error::Timeout(req_id) => HttpResponse::Ok()
+                .content_type("application/json")
+                .json(&ErrorResponse::gateway_timeout(Some(*req_id))),
         }
     }
 }
@@ -525,7 +538,7 @@ async fn get_account_info(
                     break body;
                 } else {
                     warn!("gateway timeout");
-                    return Ok(HttpResponse::GatewayTimeout().finish());
+                    return Err(Error::Timeout(req.id));
                 }
             }
             _ = notified => {
@@ -827,7 +840,7 @@ async fn get_program_accounts(
                     break body;
                 } else {
                     warn!("gateway timeout");
-                    return Ok(HttpResponse::GatewayTimeout().finish());
+                    return Err(Error::Timeout(req.id));
                 }
             }
             _ = notified => {
@@ -928,7 +941,11 @@ pub(crate) async fn rpc_handler(
     }
 
     let client = &app_state.client;
-    let resp = client.post(&app_state.rpc_url).send_json(&req).await?;
+    let resp = client
+        .post(&app_state.rpc_url)
+        .send_json(&req)
+        .await
+        .map_err(|_| Error::Timeout(req.id))?;
 
     Ok(HttpResponse::Ok()
         .content_type("application/json")
