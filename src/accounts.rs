@@ -385,14 +385,8 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
             .insert(request_id, InflightRequest::SlotSub(request_id));
         let _ = self.send(&request);
 
-        info!("clearing db");
-        self.accounts.clear();
-
         // restore subscriptions
         info!("adding subscriptions");
-        self.inflight.clear();
-        self.id_to_sub.clear();
-        self.sub_to_id.clear();
         let subs_len = self.subs.len();
         let subs = std::mem::replace(&mut self.subs, HashSet::with_capacity(subs_len));
         for (sub, commitment) in subs {
@@ -404,6 +398,13 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
 
     fn finished(&mut self, ctx: &mut Context<Self>) {
         info!("websocket disconnected");
+        self.inflight.clear();
+        self.id_to_sub.clear();
+        self.sub_to_id.clear();
+
+        info!("clearing db");
+        self.accounts.clear();
+
         self.connect(ctx);
     }
 }
