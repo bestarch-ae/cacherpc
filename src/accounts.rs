@@ -123,6 +123,78 @@ impl AccountUpdateManager {
         });
         ctx.wait(fut);
     }
+
+    fn subscribe(
+        &mut self,
+        sub: Subscription,
+        commitment: Commitment,
+    ) -> Result<(), serde_json::Error> {
+        #[derive(Serialize)]
+        struct Request<'a> {
+            jsonrpc: &'a str,
+            id: u64,
+            method: &'a str,
+            params: SubscribeParams, // TODO: commitment and other params
+        }
+
+        #[derive(Serialize)]
+        struct Config {
+            commitment: Commitment,
+            encoding: Encoding,
+        }
+
+        struct SubscribeParams {
+            key: Pubkey,
+            config: Config,
+        }
+
+        impl Serialize for SubscribeParams {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                use serde::ser::SerializeSeq;
+                let mut seq = serializer.serialize_seq(Some(2))?;
+                seq.serialize_element(&self.key)?;
+                seq.serialize_element(&self.config)?;
+                seq.end()
+            }
+        }
+
+        let request_id = self.next_request_id();
+
+        let (key, method) = match sub {
+            Subscription::Account(key) => (key, "accountSubscribe"),
+            Subscription::Program(key) => (key, "programSubscribe"),
+        };
+        if self.subs.contains(&(sub, commitment)) {
+            info!("already trying to subscribe to {}", key);
+            return Ok(());
+        }
+
+        info!("subscribe to {} ({}/{:?})", key, method, commitment);
+
+        let request = Request {
+            jsonrpc: "2.0",
+            id: request_id,
+            method,
+            params: SubscribeParams {
+                key,
+                config: Config {
+                    commitment,
+                    encoding: Encoding::Base64,
+                },
+            },
+        };
+
+        self.inflight
+            .insert(request_id, InflightRequest::Sub(sub, commitment));
+        self.subs.insert((sub, commitment));
+        self.send(&request)?;
+        self.purge_queue.insert(sub, PURGE_TIMEOUT);
+
+        Ok(())
+    }
 }
 
 impl StreamHandler<AccountCommand> for AccountUpdateManager {
@@ -139,67 +211,7 @@ impl Handler<AccountCommand> for AccountUpdateManager {
             let request_id = self.next_request_id();
             match item {
                 AccountCommand::Subscribe(sub, commitment) => {
-                    #[derive(Serialize)]
-                    struct Request<'a> {
-                        jsonrpc: &'a str,
-                        id: u64,
-                        method: &'a str,
-                        params: SubscribeParams, // TODO: commitment and other params
-                    }
-
-                    #[derive(Serialize)]
-                    struct Config {
-                        commitment: Commitment,
-                        encoding: Encoding,
-                    }
-
-                    struct SubscribeParams {
-                        key: Pubkey,
-                        config: Config,
-                    }
-
-                    impl Serialize for SubscribeParams {
-                        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-                        where
-                            S: serde::Serializer,
-                        {
-                            use serde::ser::SerializeSeq;
-                            let mut seq = serializer.serialize_seq(Some(2))?;
-                            seq.serialize_element(&self.key)?;
-                            seq.serialize_element(&self.config)?;
-                            seq.end()
-                        }
-                    }
-
-                    let (key, method) = match sub {
-                        Subscription::Account(key) => (key, "accountSubscribe"),
-                        Subscription::Program(key) => (key, "programSubscribe"),
-                    };
-                    if self.subs.contains(&(sub, commitment)) {
-                        info!("already trying to subscribe to {}", key);
-                        return Ok(());
-                    }
-
-                    info!("subscribe to {} ({}/{:?})", key, method, commitment);
-
-                    let request = Request {
-                        jsonrpc: "2.0",
-                        id: request_id,
-                        method,
-                        params: SubscribeParams {
-                            key,
-                            config: Config {
-                                commitment,
-                                encoding: Encoding::Base64,
-                            },
-                        },
-                    };
-
-                    self.inflight
-                        .insert(request_id, InflightRequest::Sub(sub, commitment));
-                    self.subs.insert((sub, commitment));
-                    self.send(&request)?;
-                    self.purge_queue.insert(sub, PURGE_TIMEOUT);
+                    self.subscribe(sub, commitment)?;
                 }
                 AccountCommand::Purge(sub) => {
                     info!("purging {}", sub);
@@ -372,6 +384,22 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
         self.inflight
             .insert(request_id, InflightRequest::SlotSub(request_id));
         let _ = self.send(&request);
+
+        info!("clearing db");
+        self.accounts.clear();
+
+        // restore subscriptions
+        info!("adding subscriptions");
+        self.inflight.clear();
+        self.id_to_sub.clear();
+        self.sub_to_id.clear();
+        let subs_len = self.subs.len();
+        let subs = std::mem::replace(&mut self.subs, HashSet::with_capacity(subs_len));
+        for (sub, commitment) in subs {
+            self.subscribe(sub, commitment).unwrap()
+            // TODO: it would be nice to retrieve current state for
+            // everything we had before
+        }
     }
 
     fn finished(&mut self, ctx: &mut Context<Self>) {

@@ -123,6 +123,10 @@ impl AccountsDb {
         }
     }
 
+    pub fn clear(&self) {
+        self.map.clear();
+    }
+
     pub fn get(&self, key: &Pubkey) -> Option<Ref<'_, Pubkey, AccountState>> {
         self.map.get(key)
     }
