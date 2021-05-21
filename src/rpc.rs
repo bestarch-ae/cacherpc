@@ -289,7 +289,11 @@ struct Request<'a> {
 #[derive(Deserialize, Serialize, Debug)]
 struct RpcError<'a> {
     code: i64,
+    #[serde(borrow)]
     message: Cow<'a, str>,
+    #[serde(borrow)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<&'a RawValue>,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -307,6 +311,7 @@ impl<'a> ErrorResponse<'a> {
             error: RpcError {
                 code: -32602,
                 message: "`params` should have at least 1 argument(s)".into(),
+                data: None,
             },
         }
     }
@@ -318,6 +323,7 @@ impl<'a> ErrorResponse<'a> {
             error: RpcError {
                 code: -32602,
                 message: msg,
+                data: None,
             },
         }
     }
@@ -329,6 +335,7 @@ impl<'a> ErrorResponse<'a> {
             error: RpcError {
                 code: -32600,
                 message: Cow::from(msg.unwrap_or("Invalid request")),
+                data: None,
             },
         }
     }
@@ -340,6 +347,7 @@ impl<'a> ErrorResponse<'a> {
             error: RpcError {
                 code: -32700,
                 message: "Parse error".into(),
+                data: None,
             },
         }
     }
@@ -351,6 +359,7 @@ impl<'a> ErrorResponse<'a> {
             error: RpcError {
                 code: -32000,
                 message: "Gateway timeout".into(),
+                data: None,
             },
         }
     }
@@ -502,6 +511,13 @@ async fn get_account_info(
         Some(params) => (serde_json::from_str(params.get())?, hash(params.get())),
         None => return Err(Error::NotEnoughArguments(req.id)),
     };
+
+    if params.len() > 2 {
+        return Err(Error::InvalidParam(
+            req.id.clone(),
+            "Expected from 1 to 2 parameters".into(),
+        ));
+    }
 
     let pubkey: Pubkey = match serde_json::from_str(params[0].get()) {
         Err(_) => {
@@ -820,6 +836,12 @@ async fn get_program_accounts(
     };
     if params.is_empty() {
         return Err(Error::NotEnoughArguments(req.id));
+    }
+    if params.len() > 2 {
+        return Err(Error::InvalidParam(
+            req.id.clone(),
+            "Expected from 1 to 2 parameters".into(),
+        ));
     }
     let pubkey: Pubkey = match serde_json::from_str(params[0].get()) {
         Ok(pubkey) => pubkey,
