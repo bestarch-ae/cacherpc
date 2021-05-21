@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -288,7 +289,7 @@ struct Request<'a> {
 #[derive(Deserialize, Serialize, Debug)]
 struct RpcError<'a> {
     code: i64,
-    message: &'a str,
+    message: Cow<'a, str>,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -305,12 +306,12 @@ impl<'a> ErrorResponse<'a> {
             id: Some(id),
             error: RpcError {
                 code: -32602,
-                message: "`params` should have at least 1 argument(s)",
+                message: "`params` should have at least 1 argument(s)".into(),
             },
         }
     }
 
-    fn invalid_param(id: Id<'a>, msg: &'a str) -> ErrorResponse<'a> {
+    fn invalid_param(id: Id<'a>, msg: Cow<'a, str>) -> ErrorResponse<'a> {
         ErrorResponse {
             jsonrpc: "2.0",
             id: Some(id),
@@ -327,7 +328,7 @@ impl<'a> ErrorResponse<'a> {
             id,
             error: RpcError {
                 code: -32600,
-                message: msg.unwrap_or("Invalid request"),
+                message: Cow::from(msg.unwrap_or("Invalid request")),
             },
         }
     }
@@ -338,7 +339,7 @@ impl<'a> ErrorResponse<'a> {
             id,
             error: RpcError {
                 code: -32700,
-                message: "Parse error",
+                message: "Parse error".into(),
             },
         }
     }
@@ -349,7 +350,7 @@ impl<'a> ErrorResponse<'a> {
             id,
             error: RpcError {
                 code: -32000,
-                message: "Gateway timeout",
+                message: "Gateway timeout".into(),
             },
         }
     }
@@ -360,7 +361,7 @@ pub(crate) enum Error<'a> {
     #[error("invalid request")]
     InvalidRequest(Option<Id<'a>>, Option<&'a str>),
     #[error("invalid param")]
-    InvalidParam(Id<'a>, &'static str),
+    InvalidParam(Id<'a>, Cow<'a, str>),
     #[error("parsing request")]
     Parsing(Option<Id<'a>>),
     #[error("not enough arguments")]
@@ -385,7 +386,7 @@ impl ResponseError for Error<'_> {
                 .json(&ErrorResponse::invalid_request(req_id.clone(), *msg)),
             Error::InvalidParam(req_id, msg) => HttpResponse::Ok()
                 .content_type("application/json")
-                .json(&ErrorResponse::invalid_param(req_id.clone(), msg)),
+                .json(&ErrorResponse::invalid_param(req_id.clone(), msg.clone())),
             Error::Parsing(req_id) => HttpResponse::Ok()
                 .content_type("application/json")
                 .json(&ErrorResponse::parse_error(req_id.clone())),
@@ -503,12 +504,19 @@ async fn get_account_info(
     };
 
     let pubkey: Pubkey = match serde_json::from_str(params[0].get()) {
-        Err(_) => return Err(Error::InvalidParam(req.id, "Invalid param: WrongSize")),
+        Err(_) => {
+            return Err(Error::InvalidParam(
+                req.id,
+                "Invalid param: WrongSize".into(),
+            ))
+        }
         Ok(pubkey) => pubkey,
     };
     let config: AccountInfoConfig = {
         if let Some(param) = params.get(1) {
-            serde_json::from_str(param.get())?
+            serde_json::from_str(param.get()).map_err(|err| {
+                Error::InvalidParam(req.id.clone(), format!("Invalid params: {}", err).into())
+            })?
         } else {
             AccountInfoConfig::default()
         }
@@ -815,11 +823,18 @@ async fn get_program_accounts(
     }
     let pubkey: Pubkey = match serde_json::from_str(params[0].get()) {
         Ok(pubkey) => pubkey,
-        Err(_) => return Err(Error::InvalidParam(req.id, "Invalid param: WrongSize")),
+        Err(_) => {
+            return Err(Error::InvalidParam(
+                req.id,
+                "Invalid param: WrongSize".into(),
+            ))
+        }
     };
     let config: ProgramAccountsConfig<'_> = {
         if let Some(val) = params.get(1) {
-            serde_json::from_str(val.get())?
+            serde_json::from_str(val.get()).map_err(|err| {
+                Error::InvalidParam(req.id.clone(), format!("Invalid params: {}", err).into())
+            })?
         } else {
             ProgramAccountsConfig::default()
         }
