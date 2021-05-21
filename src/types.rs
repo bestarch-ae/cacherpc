@@ -175,16 +175,27 @@ impl Default for Commitment {
 }
 
 #[derive(Serialize, Debug, Deserialize, Copy, Clone, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub(crate) enum Encoding {
     #[serde(skip)]
     Default,
-    #[serde(rename = "base58")]
     Base58,
-    #[serde(rename = "base64")]
     Base64,
     #[serde(rename = "base64+zstd")]
     Base64Zstd,
-    // TODO: json parsed
+    JsonParsed,
+}
+
+impl Encoding {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Encoding::Default => "default",
+            Encoding::Base58 => "base58",
+            Encoding::Base64 => "base64",
+            Encoding::Base64Zstd => "base64_zstd",
+            Encoding::JsonParsed => "json_parsed",
+        }
+    }
 }
 
 impl Default for Encoding {

@@ -29,6 +29,7 @@ use crate::types::{
 
 struct RpcMetrics {
     request_types: IntCounterVec,
+    request_encodings: IntCounterVec,
     account_cache_hits: IntCounter,
     account_cache_filled: IntCounter,
     program_accounts_cache_hits: IntCounter,
@@ -46,6 +47,12 @@ fn metrics() -> &'static RpcMetrics {
             "request_types",
             "Request counts by type",
             &["type"]
+        )
+        .unwrap(),
+        request_encodings: register_int_counter_vec!(
+            "request_encodings",
+            "Request encoding counts by type",
+            &["type", "encoding"]
         )
         .unwrap(),
         account_cache_hits: register_int_counter!("account_cache_hits", "Accounts cache hit")
@@ -218,7 +225,10 @@ impl<'a> Serialize for EncodedAccountData<'a> {
                         .map_err(|_| Error::custom("can't compress"))?,
                 ))?;
             }
-            _ => panic!("must not happen, handled above"), // TODO: jsonparsed
+            Encoding::JsonParsed => {
+                return Err(Error::custom("jsonParsed is not supported yet")); // TODO
+            }
+            _ => panic!("must not happen, handled above"),
         }
         seq.serialize_element(&self.encoding)?;
         seq.end()
@@ -504,30 +514,40 @@ async fn get_account_info(
         }
     };
 
+    metrics()
+        .request_encodings
+        .with_label_values(&["getAccountInfo", config.encoding.as_str()])
+        .inc();
+
     let mut cacheable_for_key = Some(pubkey);
 
-    match app_state.get_account(&pubkey) {
-        Some(data) => {
-            let data = data.value();
-            let commitment = config.commitment.unwrap_or_default();
-            let account = data.get(commitment);
-            if let Some(account) = account {
-                metrics().account_cache_hits.inc();
-                return account_response(req.id, request_hash, account, &app_state, config);
+    // pass through for JsonParsed as we don't support it yet
+    if config.encoding != Encoding::JsonParsed {
+        match app_state.get_account(&pubkey) {
+            Some(data) => {
+                let data = data.value();
+                let commitment = config.commitment.unwrap_or_default();
+                let account = data.get(commitment);
+                if let Some(account) = account {
+                    metrics().account_cache_hits.inc();
+                    return account_response(req.id, request_hash, account, &app_state, config);
+                }
+            }
+            None => {
+                if config.data_slice.is_some() {
+                    cacheable_for_key = None;
+                    metrics().response_uncacheable.inc();
+                }
+                app_state
+                    .subscribe(
+                        Subscription::Account(pubkey),
+                        config.commitment.unwrap_or_default(),
+                    )
+                    .await;
             }
         }
-        None => {
-            if config.data_slice.is_some() {
-                cacheable_for_key = None;
-                metrics().response_uncacheable.inc();
-            }
-            app_state
-                .subscribe(
-                    Subscription::Account(pubkey),
-                    config.commitment.unwrap_or_default(),
-                )
-                .await;
-        }
+    } else {
+        cacheable_for_key = None;
     }
 
     let client = &app_state.client;
@@ -805,31 +825,41 @@ async fn get_program_accounts(
         }
     };
 
+    metrics()
+        .request_encodings
+        .with_label_values(&["getProgramAccounts", config.encoding.as_str()])
+        .inc();
+
     let mut cacheable_for_key = Some(pubkey);
-    match app_state.program_accounts.get(&pubkey) {
-        Some(data) => {
-            let accounts = data.value();
-            if let Some(accounts) = accounts.get(config.commitment.unwrap_or_default()) {
-                metrics().program_accounts_cache_hits.inc();
-                if let Ok(resp) =
-                    program_accounts_response(req.id.clone(), accounts, &config, &app_state)
-                {
-                    return Ok(resp);
+
+    if config.encoding != Encoding::JsonParsed {
+        match app_state.program_accounts.get(&pubkey) {
+            Some(data) => {
+                let accounts = data.value();
+                if let Some(accounts) = accounts.get(config.commitment.unwrap_or_default()) {
+                    metrics().program_accounts_cache_hits.inc();
+                    if let Ok(resp) =
+                        program_accounts_response(req.id.clone(), accounts, &config, &app_state)
+                    {
+                        return Ok(resp);
+                    }
                 }
             }
-        }
-        None => {
-            if config.data_slice.is_some() || config.filters.is_some() {
-                metrics().response_uncacheable.inc();
-                cacheable_for_key = None;
+            None => {
+                if config.data_slice.is_some() || config.filters.is_some() {
+                    metrics().response_uncacheable.inc();
+                    cacheable_for_key = None;
+                }
+                app_state
+                    .subscribe(
+                        Subscription::Program(pubkey),
+                        config.commitment.unwrap_or_default(),
+                    )
+                    .await;
             }
-            app_state
-                .subscribe(
-                    Subscription::Program(pubkey),
-                    config.commitment.unwrap_or_default(),
-                )
-                .await;
         }
+    } else {
+        cacheable_for_key = None;
     }
 
     let client = &app_state.client;
