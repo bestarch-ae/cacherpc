@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use actix::prelude::Addr;
-use actix_web::{web, HttpResponse};
+use actix_web::{web, HttpResponse, ResponseError};
 
 use awc::Client;
 use bytes::Bytes;
@@ -246,10 +246,18 @@ impl State {
     }
 }
 
+#[derive(Deserialize, Serialize, Debug, Clone)]
+#[serde(untagged)]
+pub enum Id<'a> {
+    Null,
+    Num(u64),
+    Str(&'a str),
+}
+
 #[derive(Deserialize, Serialize, Debug)]
 struct Request<'a> {
     jsonrpc: &'a str,
-    id: u64,
+    id: Id<'a>,
     method: &'a str,
     #[serde(borrow)]
     params: Option<&'a RawValue>,
@@ -265,11 +273,11 @@ struct RpcError<'a> {
 struct ErrorResponse<'a> {
     jsonrpc: &'a str,
     error: RpcError<'a>,
-    id: Option<u64>,
+    id: Option<Id<'a>>,
 }
 
-impl ErrorResponse<'static> {
-    fn not_enough_arguments(id: u64) -> ErrorResponse<'static> {
+impl<'a> ErrorResponse<'a> {
+    fn not_enough_arguments(id: Id<'a>) -> ErrorResponse<'a> {
         ErrorResponse {
             jsonrpc: "2.0",
             id: Some(id),
@@ -280,7 +288,7 @@ impl ErrorResponse<'static> {
         }
     }
 
-    fn invalid_param(id: u64, msg: &'static str) -> ErrorResponse<'static> {
+    fn invalid_param(id: Id<'a>, msg: &'a str) -> ErrorResponse<'a> {
         ErrorResponse {
             jsonrpc: "2.0",
             id: Some(id),
@@ -291,7 +299,7 @@ impl ErrorResponse<'static> {
         }
     }
 
-    fn invalid_request(id: Option<u64>) -> ErrorResponse<'static> {
+    fn invalid_request(id: Option<Id<'a>>) -> ErrorResponse<'a> {
         ErrorResponse {
             jsonrpc: "2.0",
             id,
@@ -302,7 +310,7 @@ impl ErrorResponse<'static> {
         }
     }
 
-    fn parse_error(id: Option<u64>) -> ErrorResponse<'static> {
+    fn parse_error(id: Option<Id<'a>>) -> ErrorResponse<'a> {
         ErrorResponse {
             jsonrpc: "2.0",
             id,
@@ -313,7 +321,7 @@ impl ErrorResponse<'static> {
         }
     }
 
-    fn gateway_timeout(id: Option<u64>) -> ErrorResponse<'static> {
+    fn gateway_timeout(id: Option<Id<'a>>) -> ErrorResponse<'a> {
         ErrorResponse {
             jsonrpc: "2.0",
             id,
@@ -326,47 +334,48 @@ impl ErrorResponse<'static> {
 }
 
 #[derive(Debug, Error)]
-pub(crate) enum Error {
+pub(crate) enum Error<'a> {
     #[error("invalid request")]
-    InvalidRequest(Option<u64>),
+    InvalidRequest(Option<Id<'a>>),
     #[error("invalid param")]
-    InvalidParam(u64, &'static str),
+    InvalidParam(Id<'a>, &'static str),
     #[error("parsing request")]
-    Parsing(Option<u64>),
+    Parsing(Option<Id<'a>>),
     #[error("not enough arguments")]
-    NotEnoughArguments(u64),
+    NotEnoughArguments(Id<'a>),
     #[error("backend timeout")]
-    Timeout(u64),
+    Timeout(Id<'a>),
+    #[error("forward error")]
+    Forward(#[from] awc::error::SendRequestError),
 }
 
-impl From<serde_json::Error> for Error {
-    fn from(err: serde_json::Error) -> Self {
-        if err.is_data() {
-            Error::InvalidRequest(None)
-        } else {
-            Error::Parsing(None)
-        }
+impl From<serde_json::Error> for Error<'_> {
+    fn from(_err: serde_json::Error) -> Self {
+        Error::Parsing(None)
     }
 }
 
-impl actix_web::error::ResponseError for Error {
+impl ResponseError for Error<'_> {
     fn error_response(&self) -> HttpResponse {
         match self {
             Error::InvalidRequest(req_id) => HttpResponse::Ok()
                 .content_type("application/json")
-                .json(&ErrorResponse::invalid_request(*req_id)),
+                .json(&ErrorResponse::invalid_request(req_id.clone())),
             Error::InvalidParam(req_id, msg) => HttpResponse::Ok()
                 .content_type("application/json")
-                .json(&ErrorResponse::invalid_param(*req_id, msg)),
+                .json(&ErrorResponse::invalid_param(req_id.clone(), msg)),
             Error::Parsing(req_id) => HttpResponse::Ok()
                 .content_type("application/json")
-                .json(&ErrorResponse::parse_error(*req_id)),
+                .json(&ErrorResponse::parse_error(req_id.clone())),
             Error::NotEnoughArguments(req_id) => HttpResponse::Ok()
                 .content_type("application/json")
-                .json(&ErrorResponse::not_enough_arguments(*req_id)),
+                .json(&ErrorResponse::not_enough_arguments(req_id.clone())),
             Error::Timeout(req_id) => HttpResponse::Ok()
                 .content_type("application/json")
-                .json(&ErrorResponse::gateway_timeout(Some(*req_id))),
+                .json(&ErrorResponse::gateway_timeout(Some(req_id.clone()))),
+            Error::Forward(_) => HttpResponse::Ok()
+                .content_type("application/json")
+                .json(&ErrorResponse::gateway_timeout(None)),
         }
     }
 }
@@ -398,18 +407,18 @@ fn hash<T: std::hash::Hash>(params: T) -> u64 {
     hasher.finish()
 }
 
-fn account_response(
-    req_id: u64,
+fn account_response<'a>(
+    req_id: Id<'a>,
     request_hash: u64,
     acc: (Option<&AccountInfo>, u64),
     app_state: &web::Data<State>,
     config: AccountInfoConfig,
-) -> Result<HttpResponse, Error> {
+) -> Result<HttpResponse, Error<'a>> {
     #[derive(Serialize)]
     struct Resp<'a> {
         jsonrpc: &'a str,
         result: EncodedAccountContext<'a>,
-        id: u64,
+        id: Id<'a>,
     }
     let request_and_slot_hash = hash((request_hash, acc.1));
     if let Some(body) = app_state.lru.borrow_mut().get(&request_and_slot_hash) {
@@ -460,14 +469,16 @@ fn account_response(
 async fn get_account_info(
     req: Request<'_>,
     app_state: web::Data<State>,
-) -> Result<HttpResponse, Error> {
+) -> Result<HttpResponse, Error<'_>> {
     let (params, request_hash): (SmallVec<[&RawValue; 2]>, _) = match req.params {
         Some(params) => (serde_json::from_str(params.get())?, hash(params.get())),
         None => return Err(Error::NotEnoughArguments(req.id)),
     };
 
-    let pubkey: Pubkey = serde_json::from_str(params[0].get())
-        .map_err(|_err| Error::InvalidParam(req.id, "Invalid param: WrongSize"))?;
+    let pubkey: Pubkey = match serde_json::from_str(params[0].get()) {
+        Err(_) => return Err(Error::InvalidParam(req.id, "Invalid param: WrongSize")),
+        Ok(pubkey) => pubkey,
+    };
     let config: AccountInfoConfig = {
         if let Some(param) = params.get(1) {
             serde_json::from_str(param.get())?
@@ -538,7 +549,7 @@ async fn get_account_info(
                     break body;
                 } else {
                     warn!("gateway timeout");
-                    return Err(Error::Timeout(req.id));
+                    return Err(Error::Timeout(req.id.clone()));
                 }
             }
             _ = notified => {
@@ -550,7 +561,7 @@ async fn get_account_info(
                             metrics().account_cache_hits.inc();
                             metrics().account_cache_filled.inc();
                             return account_response(
-                                    req.id,
+                                    req.id.clone(),
                                     request_hash,
                                     account,
                                     &app_state,
@@ -652,7 +663,7 @@ impl Default for ProgramAccountsConfig<'static> {
 }
 
 fn program_accounts_response<'a>(
-    req_id: u64,
+    req_id: Id<'a>,
     accounts: &HashSet<Pubkey>,
     config: &'a ProgramAccountsConfig<'_>,
     app_state: &web::Data<State>,
@@ -734,7 +745,7 @@ fn program_accounts_response<'a>(
     struct Resp<'a> {
         jsonrpc: &'a str,
         result: Vec<AccountAndPubkey<'a>>,
-        id: u64,
+        id: Id<'a>,
     }
     let resp = Resp {
         jsonrpc: "2.0",
@@ -755,7 +766,7 @@ fn program_accounts_response<'a>(
 async fn get_program_accounts(
     req: Request<'_>,
     app_state: web::Data<State>,
-) -> Result<HttpResponse, Error> {
+) -> Result<HttpResponse, Error<'_>> {
     let params: SmallVec<[&RawValue; 2]> = match req.params {
         Some(params) => serde_json::from_str(params.get())?,
         None => SmallVec::new(),
@@ -763,8 +774,10 @@ async fn get_program_accounts(
     if params.is_empty() {
         return Err(Error::NotEnoughArguments(req.id));
     }
-    let pubkey: Pubkey = serde_json::from_str(params[0].get())
-        .map_err(|_err| Error::InvalidParam(req.id, "Invalid param: WrongSize"))?;
+    let pubkey: Pubkey = match serde_json::from_str(params[0].get()) {
+        Ok(pubkey) => pubkey,
+        Err(_) => return Err(Error::InvalidParam(req.id, "Invalid param: WrongSize")),
+    };
     let config: ProgramAccountsConfig<'_> = {
         if let Some(val) = params.get(1) {
             serde_json::from_str(val.get())?
@@ -779,7 +792,9 @@ async fn get_program_accounts(
             let accounts = data.value();
             if let Some(accounts) = accounts.get(config.commitment.unwrap_or_default()) {
                 metrics().program_accounts_cache_hits.inc();
-                if let Ok(resp) = program_accounts_response(req.id, accounts, &config, &app_state) {
+                if let Ok(resp) =
+                    program_accounts_response(req.id.clone(), accounts, &config, &app_state)
+                {
                     return Ok(resp);
                 }
             }
@@ -840,7 +855,7 @@ async fn get_program_accounts(
                     break body;
                 } else {
                     warn!("gateway timeout");
-                    return Err(Error::Timeout(req.id));
+                    return Err(Error::Timeout(req.id.clone()));
                 }
             }
             _ = notified => {
@@ -850,7 +865,7 @@ async fn get_program_accounts(
                         metrics().program_accounts_cache_filled.inc();
                         if let Some(accounts) = data.get(config.commitment.unwrap_or_default()) {
                             if let Ok(resp) = program_accounts_response(
-                                req.id,
+                                req.id.clone(),
                                 accounts,
                                 &config,
                                 &app_state,
@@ -905,8 +920,17 @@ async fn get_program_accounts(
 pub(crate) async fn rpc_handler(
     body: Bytes,
     app_state: web::Data<State>,
-) -> Result<HttpResponse, Error> {
-    let req: Request<'_> = serde_json::from_slice(&body)?;
+) -> Result<HttpResponse, Error<'static>> {
+    let req: Request<'_> = match serde_json::from_slice(&body) {
+        Ok(req) => req,
+        Err(err) => {
+            return Ok(Error::from(err).error_response());
+        }
+    };
+
+    if req.jsonrpc != "2.0" {
+        return Ok(Error::InvalidRequest(Some(req.id)).error_response());
+    }
 
     match req.method {
         "getAccountInfo" => {
@@ -920,7 +944,7 @@ pub(crate) async fn rpc_handler(
                 .start_timer();
             let resp = get_account_info(req, app_state).await;
             timer.observe_duration();
-            return resp;
+            return Ok(resp.unwrap_or_else(|err| err.error_response()));
         }
         "getProgramAccounts" => {
             metrics()
@@ -933,7 +957,7 @@ pub(crate) async fn rpc_handler(
                 .start_timer();
             let resp = get_program_accounts(req, app_state).await;
             timer.observe_duration();
-            return resp;
+            return Ok(resp.unwrap_or_else(|err| err.error_response()));
         }
         _ => {
             metrics().request_types.with_label_values(&["other"]).inc();
@@ -941,11 +965,7 @@ pub(crate) async fn rpc_handler(
     }
 
     let client = &app_state.client;
-    let resp = client
-        .post(&app_state.rpc_url)
-        .send_json(&req)
-        .await
-        .map_err(|_| Error::Timeout(req.id))?;
+    let resp = client.post(&app_state.rpc_url).send_json(&req).await?;
 
     Ok(HttpResponse::Ok()
         .content_type("application/json")
@@ -955,7 +975,7 @@ pub(crate) async fn rpc_handler(
 pub(crate) async fn metrics_handler(
     _body: Bytes,
     _app_state: web::Data<State>,
-) -> Result<HttpResponse, Error> {
+) -> Result<HttpResponse, Error<'static>> {
     use prometheus::{Encoder, TextEncoder};
     let encoder = TextEncoder::new();
     let mut buffer = Vec::new();
