@@ -174,7 +174,7 @@ impl Default for Commitment {
     }
 }
 
-#[derive(Serialize, Debug, Deserialize, Copy, Clone)]
+#[derive(Serialize, Debug, Deserialize, Copy, Clone, Eq, PartialEq)]
 pub(crate) enum Encoding {
     #[serde(skip)]
     Default,
@@ -262,6 +262,12 @@ impl<'de> Deserialize<'de> for Pubkey {
 #[derive(Debug)]
 pub(crate) struct AccountData {
     pub data: Bytes,
+}
+
+impl AccountData {
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
 }
 
 impl<'de> Deserialize<'de> for AccountData {

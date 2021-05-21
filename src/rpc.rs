@@ -98,13 +98,25 @@ fn metrics() -> &'static RpcMetrics {
     &METRICS
 }
 
+#[derive(Error, Debug)]
+#[error("can't encode in base58")]
+struct Base58Error;
+
 impl AccountInfo {
-    fn encode(&self, encoding: Encoding, slice: Option<Slice>) -> EncodedAccountInfo<'_> {
-        EncodedAccountInfo {
+    fn encode(
+        &self,
+        encoding: Encoding,
+        slice: Option<Slice>,
+    ) -> Result<EncodedAccountInfo<'_>, Base58Error> {
+        // Encoded binary (base 58) data should be less than 128 bytes
+        if self.data.len() > 128 && encoding == Encoding::Base58 {
+            return Err(Base58Error);
+        }
+        Ok(EncodedAccountInfo {
             account_info: &self,
             slice,
             encoding,
-        }
+        })
     }
 }
 
@@ -299,13 +311,13 @@ impl<'a> ErrorResponse<'a> {
         }
     }
 
-    fn invalid_request(id: Option<Id<'a>>) -> ErrorResponse<'a> {
+    fn invalid_request(id: Option<Id<'a>>, msg: Option<&'a str>) -> ErrorResponse<'a> {
         ErrorResponse {
             jsonrpc: "2.0",
             id,
             error: RpcError {
                 code: -32600,
-                message: "Invalid request",
+                message: msg.unwrap_or("Invalid request"),
             },
         }
     }
@@ -336,7 +348,7 @@ impl<'a> ErrorResponse<'a> {
 #[derive(Debug, Error)]
 pub(crate) enum Error<'a> {
     #[error("invalid request")]
-    InvalidRequest(Option<Id<'a>>),
+    InvalidRequest(Option<Id<'a>>, Option<&'a str>),
     #[error("invalid param")]
     InvalidParam(Id<'a>, &'static str),
     #[error("parsing request")]
@@ -358,9 +370,9 @@ impl From<serde_json::Error> for Error<'_> {
 impl ResponseError for Error<'_> {
     fn error_response(&self) -> HttpResponse {
         match self {
-            Error::InvalidRequest(req_id) => HttpResponse::Ok()
+            Error::InvalidRequest(req_id, msg) => HttpResponse::Ok()
                 .content_type("application/json")
-                .json(&ErrorResponse::invalid_request(req_id.clone())),
+                .json(&ErrorResponse::invalid_request(req_id.clone(), *msg)),
             Error::InvalidParam(req_id, msg) => HttpResponse::Ok()
                 .content_type("application/json")
                 .json(&ErrorResponse::invalid_param(req_id.clone(), msg)),
@@ -407,10 +419,10 @@ fn hash<T: std::hash::Hash>(params: T) -> u64 {
     hasher.finish()
 }
 
-fn account_response<'a>(
+fn account_response<'a, 'b>(
     req_id: Id<'a>,
     request_hash: u64,
-    acc: (Option<&AccountInfo>, u64),
+    acc: (Option<&'b AccountInfo>, u64),
     app_state: &web::Data<State>,
     config: AccountInfoConfig,
 ) -> Result<HttpResponse, Error<'a>> {
@@ -444,9 +456,14 @@ fn account_response<'a>(
             .0
             .as_ref()
             .map(|acc| {
-                acc.encode(config.encoding, config.data_slice)
-                    .with_context(&ctx)
+                Ok::<_, Base58Error>(
+                    acc.encode(config.encoding, config.data_slice)?
+                        .with_context(&ctx),
+                )
             })
+            .transpose()
+            .map_err(|_| Error::InvalidRequest(Some(req_id.clone()),
+                    Some("Encoded binary (base 58) data should be less than 128 bytes, please use Base64 encoding.")))?
             .unwrap_or_else(|| EncodedAccountContext::empty(&ctx)),
         id: req_id,
     };
@@ -684,7 +701,9 @@ fn program_accounts_response<'a>(
             S: serde::Serializer,
         {
             if let Some((Some(value), _)) = self.inner.value().get(self.commitment) {
-                let encoded = value.encode(self.encoding, self.slice);
+                let encoded = value
+                    .encode(self.encoding, self.slice)
+                    .map_err(|_| serde::ser::Error::custom("fuck"))?;
                 encoded.serialize(serializer)
             } else {
                 // shouldn't happen
@@ -929,7 +948,7 @@ pub(crate) async fn rpc_handler(
     };
 
     if req.jsonrpc != "2.0" {
-        return Ok(Error::InvalidRequest(Some(req.id)).error_response());
+        return Ok(Error::InvalidRequest(Some(req.id), None).error_response());
     }
 
     match req.method {
