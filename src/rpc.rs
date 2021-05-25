@@ -16,7 +16,7 @@ use prometheus::{
     IntCounter, IntCounterVec,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::value::RawValue;
+use serde_json::value::{to_raw_value, RawValue};
 use smallvec::SmallVec;
 use thiserror::Error;
 use tokio::sync::{Notify, Semaphore};
@@ -293,14 +293,14 @@ struct RpcError<'a> {
     message: Cow<'a, str>,
     #[serde(borrow)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    data: Option<&'a RawValue>,
+    data: Option<Cow<'a, RawValue>>,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
 struct ErrorResponse<'a> {
+    id: Option<Id<'a>>,
     jsonrpc: &'a str,
     error: RpcError<'a>,
-    id: Option<Id<'a>>,
 }
 
 impl<'a> ErrorResponse<'a> {
@@ -316,14 +316,19 @@ impl<'a> ErrorResponse<'a> {
         }
     }
 
-    fn invalid_param(id: Id<'a>, msg: Cow<'a, str>) -> ErrorResponse<'a> {
+    fn invalid_param(
+        id: Id<'a>,
+        msg: Cow<'a, str>,
+        data: Option<Cow<'a, str>>,
+    ) -> ErrorResponse<'a> {
+        let str = data.and_then(|data| to_raw_value(&data).ok());
         ErrorResponse {
             jsonrpc: "2.0",
             id: Some(id),
             error: RpcError {
                 code: -32602,
                 message: msg,
-                data: None,
+                data: str.map(|str| Cow::Owned(str)),
             },
         }
     }
@@ -370,7 +375,11 @@ pub(crate) enum Error<'a> {
     #[error("invalid request")]
     InvalidRequest(Option<Id<'a>>, Option<&'a str>),
     #[error("invalid param")]
-    InvalidParam(Id<'a>, Cow<'a, str>),
+    InvalidParam {
+        req_id: Id<'a>,
+        message: Cow<'a, str>,
+        data: Option<Cow<'a, str>>,
+    },
     #[error("parsing request")]
     Parsing(Option<Id<'a>>),
     #[error("not enough arguments")]
@@ -393,9 +402,13 @@ impl ResponseError for Error<'_> {
             Error::InvalidRequest(req_id, msg) => HttpResponse::Ok()
                 .content_type("application/json")
                 .json(&ErrorResponse::invalid_request(req_id.clone(), *msg)),
-            Error::InvalidParam(req_id, msg) => HttpResponse::Ok()
-                .content_type("application/json")
-                .json(&ErrorResponse::invalid_param(req_id.clone(), msg.clone())),
+            Error::InvalidParam {
+                req_id,
+                message,
+                data,
+            } => HttpResponse::Ok().content_type("application/json").json(
+                &ErrorResponse::invalid_param(req_id.clone(), message.clone(), data.clone()),
+            ),
             Error::Parsing(req_id) => HttpResponse::Ok()
                 .content_type("application/json")
                 .json(&ErrorResponse::parse_error(req_id.clone())),
@@ -513,25 +526,29 @@ async fn get_account_info(
     };
 
     if params.len() > 2 {
-        return Err(Error::InvalidParam(
-            req.id.clone(),
-            "Expected from 1 to 2 parameters".into(),
-        ));
+        return Err(Error::InvalidParam {
+            req_id: req.id.clone(),
+            message: "Expected from 1 to 2 parameters".into(),
+            data: Some(format!("Got {}", params.len()).into()),
+        });
     }
 
     let pubkey: Pubkey = match serde_json::from_str(params[0].get()) {
         Err(_) => {
-            return Err(Error::InvalidParam(
-                req.id,
-                "Invalid param: WrongSize".into(),
-            ))
+            return Err(Error::InvalidParam {
+                req_id: req.id,
+                message: "Invalid param: WrongSize".into(),
+                data: None,
+            })
         }
         Ok(pubkey) => pubkey,
     };
     let config: AccountInfoConfig = {
         if let Some(param) = params.get(1) {
-            serde_json::from_str(param.get()).map_err(|err| {
-                Error::InvalidParam(req.id.clone(), format!("Invalid params: {}", err).into())
+            serde_json::from_str(param.get()).map_err(|err| Error::InvalidParam {
+                req_id: req.id.clone(),
+                message: format!("Invalid params: {}", err).into(),
+                data: None,
             })?
         } else {
             AccountInfoConfig::default()
@@ -838,24 +855,28 @@ async fn get_program_accounts(
         return Err(Error::NotEnoughArguments(req.id));
     }
     if params.len() > 2 {
-        return Err(Error::InvalidParam(
-            req.id.clone(),
-            "Expected from 1 to 2 parameters".into(),
-        ));
+        return Err(Error::InvalidParam {
+            req_id: req.id.clone(),
+            message: "Expected from 1 to 2 parameters".into(),
+            data: Some(format!("Got {}", params.len()).into()),
+        });
     }
     let pubkey: Pubkey = match serde_json::from_str(params[0].get()) {
         Ok(pubkey) => pubkey,
         Err(_) => {
-            return Err(Error::InvalidParam(
-                req.id,
-                "Invalid param: WrongSize".into(),
-            ))
+            return Err(Error::InvalidParam {
+                req_id: req.id,
+                message: "Invalid param: WrongSize".into(),
+                data: None,
+            })
         }
     };
     let config: ProgramAccountsConfig<'_> = {
-        if let Some(val) = params.get(1) {
-            serde_json::from_str(val.get()).map_err(|err| {
-                Error::InvalidParam(req.id.clone(), format!("Invalid params: {}", err).into())
+        if let Some(param) = params.get(1) {
+            serde_json::from_str(param.get()).map_err(|err| Error::InvalidParam {
+                req_id: req.id.clone(),
+                message: format!("Invalid params: {}", err).into(),
+                data: None,
             })?
         } else {
             ProgramAccountsConfig::default()
