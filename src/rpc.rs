@@ -321,14 +321,16 @@ impl<'a> ErrorResponse<'a> {
         msg: Cow<'a, str>,
         data: Option<Cow<'a, str>>,
     ) -> ErrorResponse<'a> {
-        let str = data.and_then(|data| to_raw_value(&data).ok());
+        let data = data
+            .and_then(|data| to_raw_value(&data).ok())
+            .map(Cow::Owned);
         ErrorResponse {
             jsonrpc: "2.0",
             id: Some(id),
             error: RpcError {
                 code: -32602,
                 message: msg,
-                data: str.map(|str| Cow::Owned(str)),
+                data,
             },
         }
     }
