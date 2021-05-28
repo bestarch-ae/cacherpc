@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::sync::Arc;
 use std::time::Duration;
 
+use actix_cors::Cors;
 use actix_web::{web, App, HttpServer};
 use awc::Client;
 use lru::LruCache;
@@ -91,8 +92,13 @@ async fn run(options: Options) {
             program_accounts_request_limit: program_accounts_request_limit.clone(),
             lru: RefCell::new(LruCache::new(body_cache_size)),
         };
+        let cors = Cors::default()
+            .allow_any_origin()
+            .allowed_methods(vec!["POST"])
+            .allowed_header(actix_web::http::header::CONTENT_TYPE);
         App::new()
             .data(state)
+            .wrap(cors)
             .service(web::resource("/").route(web::post().to(rpc::rpc_handler)))
             .service(web::resource("/metrics").route(web::get().to(rpc::metrics_handler)))
     })

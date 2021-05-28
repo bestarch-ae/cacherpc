@@ -10,6 +10,7 @@ edition = "2018"
 actix-web = "3.3"
 actix = "0.10"
 actix-codec = "0.3"
+actix-cors = "0.5"
 tokio = { version = "0.2", features = ["sync", "time", "macros"] }
 bytes = "0.5"
 serde = "1.0"
