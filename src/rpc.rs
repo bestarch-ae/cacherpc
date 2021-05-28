@@ -28,6 +28,8 @@ use crate::types::{
     ProgramAccountsDb, Pubkey, SolanaContext,
 };
 
+const BODY_LIMIT: usize = 1024 * 1024 * 100;
+
 struct RpcMetrics {
     request_types: IntCounterVec,
     request_encodings: IntCounterVec,
@@ -605,13 +607,14 @@ async fn get_account_info(
                 .backend_response_time
                 .with_label_values(&["getAccountInfo"])
                 .start_timer();
-            let body = resp.body().await;
+            let body = resp.body().limit(BODY_LIMIT).await;
             timer.observe_duration();
             match body {
                 Ok(body) => break Ok(body),
-                Err(_) => {
+                Err(err) => {
                     tokio::time::delay_for(std::time::Duration::from_millis(100)).await;
                     if retries == 0 {
+                        warn!("request: {:?} error: {:?}", req, err);
                         break Err(awc::error::SendRequestError::Timeout);
                     }
                 }
@@ -628,7 +631,7 @@ async fn get_account_info(
                 if let Ok(body) = body {
                     break body;
                 } else {
-                    warn!("gateway timeout");
+                    info!("reporting gateway timeout"); // TODO: return proper error
                     return Err(Error::Timeout(req.id.clone()));
                 }
             }
@@ -938,15 +941,16 @@ async fn get_program_accounts(
                 .timeout(std::time::Duration::from_secs(30))
                 .send_json(&req)
                 .await?;
-            let body = resp.body().limit(1024 * 1024 * 100).await;
+            let body = resp.body().limit(BODY_LIMIT).await;
             timer.observe_duration();
             match body {
                 Ok(body) => {
                     break Ok(body);
                 }
-                Err(_err) => {
+                Err(err) => {
                     tokio::time::delay_for(std::time::Duration::from_millis(100)).await;
                     if retries == 0 {
+                        warn!("request: {:?} error: {:?}", req, err);
                         break Err(awc::error::SendRequestError::Timeout);
                     }
                 }
@@ -963,7 +967,7 @@ async fn get_program_accounts(
                 if let Ok(body) = body {
                     break body;
                 } else {
-                    warn!("gateway timeout");
+                    info!("reporting gateway timeout"); // TODO: return proper error
                     return Err(Error::Timeout(req.id.clone()));
                 }
             }
