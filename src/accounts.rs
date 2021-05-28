@@ -279,6 +279,11 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
         let _ = (|| -> Result<(), serde_json::Error> {
             use awc::ws::Frame;
             match item {
+                Frame::Ping(data) => {
+                    if let Some(sink) = &mut self.sink {
+                        sink.write(awc::ws::Message::Pong(data));
+                    }
+                }
                 Frame::Text(text) => {
                     #[derive(Deserialize)]
                     struct AnyMessage<'a> {
