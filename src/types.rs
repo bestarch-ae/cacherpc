@@ -150,7 +150,7 @@ impl AccountsDb {
     }
 }
 
-#[derive(Serialize, Debug, Deserialize, Copy, Clone, Eq, PartialEq, Hash)]
+#[derive(Serialize, Debug, Copy, Clone, Eq, PartialEq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum Commitment {
     Finalized,
@@ -165,6 +165,37 @@ impl Commitment {
             Commitment::Confirmed => 1,
             Commitment::Processed => 2,
         }
+    }
+}
+
+impl<'de> Deserialize<'de> for Commitment {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = Commitment;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("string")
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                use serde::de::Error;
+                match v {
+                    "finalized" | "max" => Ok(Commitment::Finalized),
+                    "singleGossip" | "confirmed" => Ok(Commitment::Confirmed),
+                    "recent" | "processed" => Ok(Commitment::Processed),
+                    _ => Err(Error::custom("unsupported commitment")),
+                }
+            }
+        }
+
+        deserializer.deserialize_str(Visitor)
     }
 }
 
