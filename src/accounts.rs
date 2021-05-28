@@ -116,7 +116,17 @@ impl AccountUpdateManager {
         };
         let fut = fut.into_actor(self).map(|conn, actor, ctx| {
             let (sink, stream) = futures_util::stream::StreamExt::split(conn);
-            let (sink, stream) = (sink, stream.filter_map(Result::ok));
+            let (sink, stream) = (
+                sink,
+                stream
+                    .take_while(|item| {
+                        if let Err(err) = &item {
+                            warn!("websocket error {:?}", err);
+                        }
+                        item.is_ok()
+                    })
+                    .filter_map(Result::ok),
+            );
             let sink = SinkWrite::new(sink, ctx);
             AccountUpdateManager::add_stream(stream, ctx);
             actor.sink = Some(sink);
@@ -289,7 +299,7 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
                                     let sub_id: u64 = serde_json::from_str(result.get())?;
                                     self.id_to_sub.insert(sub_id, (sub, commitment));
                                     self.sub_to_id.insert(sub, sub_id);
-                                    info!(message = "subscribed to stream", sub_id = sub_id, sub = %sub);
+                                    info!(message = "subscribed to stream", sub_id = sub_id, sub = %sub, commitment = ?commitment);
                                 }
                                 InflightRequest::Unsub(sub) => {
                                     //let _is_ok: bool = serde_json::from_str(result.get()).unwrap();
@@ -325,6 +335,8 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
                                 let params: Params = serde_json::from_str(params.get())?;
                                 if let Some((sub, commitment)) = self.id_to_sub.get(&params.subscription) {
                                     self.accounts.insert(sub.key(), params.result, *commitment);
+                                } else {
+                                    warn!("unknown subscription {}", params.subscription);
                                 }
                             }
                             "programNotification" => {
@@ -360,7 +372,9 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
                                 //info!("slot {} root {} parent {}", params.result.slot, params.result.root, params.result.parent);
                                 let _slot = params.result; // TODO: figure out which slot validator *actually* reports
                             }
-                            _ => {}
+                            _ => {
+                                warn!(message = "unknown notification", method = method);
+                            }
                         }
                     }
                 }
