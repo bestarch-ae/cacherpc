@@ -17,26 +17,49 @@ use accounts::AccountUpdateManager;
 use types::{AccountsDb, ProgramAccountsDb};
 
 #[derive(Debug, structopt::StructOpt)]
+#[structopt(about = "Solana RPC cache server")]
 struct Options {
     #[structopt(
         short = "w",
         long = "websocket-url",
-        default_value = "wss://solana-api.projectserum.com"
+        default_value = "wss://solana-api.projectserum.com",
+        help = "validator or cluster PubSub endpoint"
     )]
     ws_url: String,
     #[structopt(
         short = "r",
         long = "rpc-api-url",
-        default_value = "https://solana-api.projectserum.com"
+        default_value = "https://solana-api.projectserum.com",
+        help = "validator or cluster JSON-RPC endpoint"
     )]
     rpc_url: String,
-    #[structopt(short = "l", long = "listen", default_value = "127.0.0.1:8080")]
+    #[structopt(
+        short = "l",
+        long = "listen",
+        default_value = "127.0.0.1:8080",
+        help = "cache server bind address"
+    )]
     addr: String,
-    #[structopt(short = "p", long = "program-request-limit", default_value = "5")]
+    #[structopt(
+        short = "p",
+        long = "program-request-limit",
+        default_value = "5",
+        help = "maximum number of concurrent getProgramAccounts cache-to-validator requests"
+    )]
     program_accounts_request_limit: usize,
-    #[structopt(short = "a", long = "account-request-limit", default_value = "100")]
+    #[structopt(
+        short = "a",
+        long = "account-request-limit",
+        default_value = "100",
+        help = "maximum number of concurrent getAccountInfo cache-to-validator requests"
+    )]
     account_info_request_limit: usize,
-    #[structopt(short = "b", long = "body-cache-size", default_value = "100")]
+    #[structopt(
+        short = "b",
+        long = "body-cache-size",
+        default_value = "100",
+        help = "maximum amount of entries in the response cache"
+    )]
     body_cache_size: usize,
 }
 
