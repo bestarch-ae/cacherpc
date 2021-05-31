@@ -44,6 +44,7 @@ pub struct RpcMetrics {
     pub program_accounts_cache_filled: IntCounter,
     pub response_uncacheable: IntCounter,
     pub backend_response_time: HistogramVec,
+    pub backend_errors: IntCounterVec,
     pub handler_time: HistogramVec,
     pub response_size_bytes: HistogramVec,
     pub lru_cache_hits: IntCounter,
@@ -89,6 +90,12 @@ pub fn rpc_metrics() -> &'static RpcMetrics {
         backend_response_time: register_histogram_vec!(
             "backend_response_time",
             "Backend response time by type",
+            &["type"]
+        )
+        .unwrap(),
+        backend_errors: register_int_counter_vec!(
+            "backend_errors",
+            "Error responses by request type",
             &["type"]
         )
         .unwrap(),

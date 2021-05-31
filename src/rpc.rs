@@ -577,6 +577,7 @@ async fn get_account_info(
     };
 
     if let Some(pubkey) = cacheable_for_key {
+        // TODO: handle error case
         #[derive(Deserialize)]
         struct Resp<'a> {
             result: Option<AccountContext>,
@@ -589,6 +590,10 @@ async fn get_account_info(
             app_state.insert(pubkey, info, config.commitment.unwrap_or_default());
             app_state.map_updated.notify();
         } else {
+            metrics()
+                .backend_errors
+                .with_label_values(&["getAccountInfo"])
+                .inc();
             info!("can't cache for key {} because {:?}", pubkey, resp.error);
             // check cache one more time, maybe another thread was more lucky
             if let Some(data) = app_state.get_account(&pubkey) {
