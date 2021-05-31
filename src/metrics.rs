@@ -8,6 +8,7 @@ pub struct PubSubMetrics {
     pub subscriptions_active: IntGauge,
     pub websocket_connected: IntGauge,
     pub notifications_received: IntCounterVec,
+    pub commands: IntCounterVec,
 }
 
 pub fn pubsub_metrics() -> &'static PubSubMetrics {
@@ -23,11 +24,13 @@ pub fn pubsub_metrics() -> &'static PubSubMetrics {
         )
         .unwrap(),
         notifications_received: register_int_counter_vec!(
-            "account_notifications_received",
-            "number of accountNotifications received",
+            "notifications_received",
+            "number of notifications received",
             &["type"]
         )
         .unwrap(),
+        commands: register_int_counter_vec!("commands", "number of commands received", &["type"])
+            .unwrap(),
     });
     &METRICS
 }

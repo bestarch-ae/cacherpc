@@ -223,9 +223,11 @@ impl Handler<AccountCommand> for AccountUpdateManager {
             let request_id = self.next_request_id();
             match item {
                 AccountCommand::Subscribe(sub, commitment) => {
+                    metrics().commands.with_label_values(&["subscribe"]).inc();
                     self.subscribe(sub, commitment)?;
                 }
                 AccountCommand::Purge(sub) => {
+                    metrics().commands.with_label_values(&["purge"]).inc();
                     info!("purging {}", sub);
 
                     #[derive(Serialize)]
@@ -265,6 +267,7 @@ impl Handler<AccountCommand> for AccountUpdateManager {
                     }
                 }
                 AccountCommand::Reset(key) => {
+                    metrics().commands.with_label_values(&["reset"]).inc();
                     self.purge_queue.reset(key, PURGE_TIMEOUT);
                 }
             }
