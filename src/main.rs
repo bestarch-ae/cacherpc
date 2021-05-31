@@ -11,6 +11,7 @@ use tokio::sync::{Notify, Semaphore};
 use tracing::info;
 
 mod accounts;
+mod metrics;
 mod rpc;
 mod types;
 
