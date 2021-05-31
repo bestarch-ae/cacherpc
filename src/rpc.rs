@@ -589,7 +589,23 @@ async fn get_account_info(
             app_state.insert(pubkey, info, config.commitment.unwrap_or_default());
             app_state.map_updated.notify();
         } else {
-            info!("cant cache for key {} because {:?}", pubkey, resp.error);
+            info!("can't cache for key {} because {:?}", pubkey, resp.error);
+            // check cache one more time, maybe another thread was more lucky
+            if let Some(data) = app_state.get_account(&pubkey) {
+                let data = data.value();
+                let commitment = config.commitment.unwrap_or_default();
+                if let Some(account) = data.get(commitment) {
+                    metrics().account_cache_hits.inc();
+                    metrics().account_cache_filled.inc();
+                    return account_response(
+                        req.id.clone(),
+                        request_hash,
+                        account,
+                        &app_state,
+                        config,
+                    );
+                }
+            }
         }
     }
 
