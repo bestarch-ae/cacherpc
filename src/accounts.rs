@@ -10,6 +10,7 @@ use tokio::sync::mpsc;
 use tokio::time::{DelayQueue, Instant};
 use tracing::{error, info, warn};
 
+use crate::metrics::pubsub_metrics as metrics;
 use crate::types::{
     AccountContext, AccountInfo, AccountsDb, Commitment, Encoding, ProgramAccountsDb, Pubkey,
     SolanaContext,
@@ -130,6 +131,7 @@ impl AccountUpdateManager {
             let sink = SinkWrite::new(sink, ctx);
             AccountUpdateManager::add_stream(stream, ctx);
             actor.sink = Some(sink);
+            metrics().websocket_connected.set(1);
         });
         ctx.wait(fut);
     }
@@ -305,6 +307,7 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
                                     self.id_to_sub.insert(sub_id, (sub, commitment));
                                     self.sub_to_id.insert(sub, sub_id);
                                     info!(message = "subscribed to stream", sub_id = sub_id, sub = %sub, commitment = ?commitment);
+                                    metrics().subscriptions_active.inc();
                                 }
                                 InflightRequest::Unsub(sub) => {
                                     //let _is_ok: bool = serde_json::from_str(result.get()).unwrap();
@@ -318,6 +321,7 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
                                             sub= %sub,
                                         );
                                     }
+                                    metrics().subscriptions_active.dec();
                                 }
                                 InflightRequest::SlotSub(_) => {
                                     info!(message = "subscribed to root");
@@ -343,6 +347,7 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
                                 } else {
                                     warn!("unknown subscription {}", params.subscription);
                                 }
+                                metrics().notifications_received.with_label_values(&["accountNotification"]).inc();
                             }
                             "programNotification" => {
                                 #[derive(Deserialize, Debug)]
@@ -366,7 +371,10 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
                                     self.accounts.insert(key, AccountContext {
                                         value: Some(params.result.value.account), context: params.result.context }, *commitment);
                                     self.program_accounts.add(&program_sub.key(), params.result.value.pubkey, *commitment);
+                                } else {
+                                    warn!("unknown subscription {}", params.subscription);
                                 }
+                                metrics().notifications_received.with_label_values(&["programNotification"]).inc();
                             }
                             "rootNotification" => {
                                 #[derive(Deserialize)]
@@ -417,6 +425,7 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
 
     fn finished(&mut self, ctx: &mut Context<Self>) {
         info!("websocket disconnected");
+        metrics().websocket_connected.set(0);
         self.inflight.clear();
         self.id_to_sub.clear();
         self.sub_to_id.clear();

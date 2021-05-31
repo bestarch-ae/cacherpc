@@ -10,11 +10,6 @@ use awc::Client;
 use bytes::Bytes;
 use dashmap::mapref::one::Ref;
 use lru::LruCache;
-use once_cell::sync::Lazy;
-use prometheus::{
-    register_histogram_vec, register_int_counter, register_int_counter_vec, HistogramVec,
-    IntCounter, IntCounterVec,
-};
 use serde::{Deserialize, Serialize};
 use serde_json::value::{to_raw_value, RawValue};
 use smallvec::SmallVec;
@@ -23,90 +18,13 @@ use tokio::sync::{Notify, Semaphore};
 use tracing::{info, warn};
 
 use crate::accounts::{AccountCommand, AccountUpdateManager, Subscription};
+use crate::metrics::rpc_metrics as metrics;
 use crate::types::{
     AccountContext, AccountData, AccountInfo, AccountState, AccountsDb, Commitment, Encoding,
     ProgramAccountsDb, Pubkey, SolanaContext,
 };
 
 const BODY_LIMIT: usize = 1024 * 1024 * 100;
-
-struct RpcMetrics {
-    request_types: IntCounterVec,
-    request_encodings: IntCounterVec,
-    account_cache_hits: IntCounter,
-    account_cache_filled: IntCounter,
-    program_accounts_cache_hits: IntCounter,
-    program_accounts_cache_filled: IntCounter,
-    response_uncacheable: IntCounter,
-    backend_response_time: HistogramVec,
-    handler_time: HistogramVec,
-    response_size_bytes: HistogramVec,
-    lru_cache_hits: IntCounter,
-}
-
-fn metrics() -> &'static RpcMetrics {
-    static METRICS: Lazy<RpcMetrics> = Lazy::new(|| RpcMetrics {
-        request_types: register_int_counter_vec!(
-            "request_types",
-            "Request counts by type",
-            &["type"]
-        )
-        .unwrap(),
-        request_encodings: register_int_counter_vec!(
-            "request_encodings",
-            "Request encoding counts by type",
-            &["type", "encoding"]
-        )
-        .unwrap(),
-        account_cache_hits: register_int_counter!("account_cache_hits", "Accounts cache hit")
-            .unwrap(),
-        lru_cache_hits: register_int_counter!("lru_cache_hits", "LRU cache hit").unwrap(),
-        account_cache_filled: register_int_counter!(
-            "account_cache_filled",
-            "Accounts cache filled while waiting for response"
-        )
-        .unwrap(),
-        program_accounts_cache_hits: register_int_counter!(
-            "program_accounts_cache_hits",
-            "Program accounts cache hit"
-        )
-        .unwrap(),
-        program_accounts_cache_filled: register_int_counter!(
-            "program_accounts_cache_filled",
-            "Program accounts cache filled while waiting for response"
-        )
-        .unwrap(),
-        response_uncacheable: register_int_counter!(
-            "response_uncacheable",
-            "Could not cache response"
-        )
-        .unwrap(),
-        backend_response_time: register_histogram_vec!(
-            "backend_response_time",
-            "Backend response time by type",
-            &["type"]
-        )
-        .unwrap(),
-        handler_time: register_histogram_vec!(
-            "handler_time",
-            "Handler processing time by type",
-            &["type"]
-        )
-        .unwrap(),
-        response_size_bytes: register_histogram_vec!(
-            "response_size_bytes",
-            "Response size by type",
-            &["type"],
-            vec![
-                0.0, 1024.0, 4096.0, 16384.0, 65536.0, 524288.0, 1048576.0, 4194304.0, 10485760.0,
-                20971520.0
-            ]
-        )
-        .unwrap(),
-    });
-
-    &METRICS
-}
 
 #[derive(Error, Debug)]
 #[error("can't encode in base58")]
