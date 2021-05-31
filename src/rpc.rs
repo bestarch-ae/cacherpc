@@ -577,38 +577,46 @@ async fn get_account_info(
     };
 
     if let Some(pubkey) = cacheable_for_key {
-        // TODO: handle error case
-        #[derive(Deserialize)]
-        struct Resp<'a> {
-            result: Option<AccountContext>,
-            #[serde(borrow)]
-            error: Option<RpcError<'a>>,
+        #[derive(Deserialize, Debug)]
+        struct Wrap<'a> {
+            #[serde(flatten, borrow)]
+            inner: Response<'a>,
         }
-        let resp: Resp<'_> = serde_json::from_slice(&resp)?;
-        if let Some(info) = resp.result {
-            info!("cached for key {}", pubkey);
-            app_state.insert(pubkey, info, config.commitment.unwrap_or_default());
-            app_state.map_updated.notify();
-        } else {
-            metrics()
-                .backend_errors
-                .with_label_values(&["getAccountInfo"])
-                .inc();
-            info!("can't cache for key {} because {:?}", pubkey, resp.error);
-            // check cache one more time, maybe another thread was more lucky
-            if let Some(data) = app_state.get_account(&pubkey) {
-                let data = data.value();
-                let commitment = config.commitment.unwrap_or_default();
-                if let Some(account) = data.get(commitment) {
-                    metrics().account_cache_hits.inc();
-                    metrics().account_cache_filled.inc();
-                    return account_response(
-                        req.id.clone(),
-                        request_hash,
-                        account,
-                        &app_state,
-                        config,
-                    );
+        #[derive(Deserialize, Debug)]
+        #[serde(rename_all = "lowercase")]
+        enum Response<'a> {
+            Result(AccountContext),
+            #[serde(borrow)]
+            Error(RpcError<'a>),
+        }
+        let resp: Wrap<'_> = serde_json::from_slice(&resp)?;
+        match resp.inner {
+            Response::Result(info) => {
+                info!("cached for key {}", pubkey);
+                app_state.insert(pubkey, info, config.commitment.unwrap_or_default());
+                app_state.map_updated.notify();
+            }
+            Response::Error(error) => {
+                metrics()
+                    .backend_errors
+                    .with_label_values(&["getAccountInfo"])
+                    .inc();
+                info!("can't cache for key {} because {:?}", pubkey, error);
+                // check cache one more time, maybe another thread was more lucky
+                if let Some(data) = app_state.get_account(&pubkey) {
+                    let data = data.value();
+                    let commitment = config.commitment.unwrap_or_default();
+                    if let Some(account) = data.get(commitment) {
+                        metrics().account_cache_hits.inc();
+                        metrics().account_cache_filled.inc();
+                        return account_response(
+                            req.id.clone(),
+                            request_hash,
+                            account,
+                            &app_state,
+                            config,
+                        );
+                    }
                 }
             }
         }
@@ -933,35 +941,54 @@ async fn get_program_accounts(
     };
 
     if let Some(program_pubkey) = cacheable_for_key {
-        #[derive(Deserialize)]
+        #[derive(Deserialize, Debug)]
         struct AccountAndPubkey {
             account: AccountInfo,
             pubkey: Pubkey,
         }
-        #[derive(Deserialize)]
-        struct Resp {
-            result: Vec<AccountAndPubkey>,
+        #[derive(Deserialize, Debug)]
+        struct Wrap<'a> {
+            #[serde(flatten, borrow)]
+            inner: Response<'a>,
         }
-        let resp: Resp = serde_json::from_slice(&resp)?;
-        let mut keys = HashSet::with_capacity(resp.result.len());
-        for acc in resp.result {
-            let AccountAndPubkey { account, pubkey } = acc;
-            app_state.insert(
-                pubkey,
-                AccountContext {
-                    value: Some(account),
-                    context: SolanaContext { slot: 0 },
-                },
-                config.commitment.unwrap_or_default(),
-            );
-            keys.insert(pubkey);
+        #[derive(Deserialize, Debug)]
+        #[serde(rename_all = "lowercase")]
+        enum Response<'a> {
+            Result(Vec<AccountAndPubkey>),
+            #[serde(borrow)]
+            Error(RpcError<'a>),
         }
-        app_state.program_accounts.insert(
-            program_pubkey,
-            keys,
-            config.commitment.unwrap_or_default(),
-        );
-        app_state.map_updated.notify();
+        let resp: Wrap<'_> = serde_json::from_slice(&resp)?;
+        match resp.inner {
+            Response::Result(result) => {
+                let mut keys = HashSet::with_capacity(result.len());
+                for acc in result {
+                    let AccountAndPubkey { account, pubkey } = acc;
+                    app_state.insert(
+                        pubkey,
+                        AccountContext {
+                            value: Some(account),
+                            context: SolanaContext { slot: 0 },
+                        },
+                        config.commitment.unwrap_or_default(),
+                    );
+                    keys.insert(pubkey);
+                }
+                app_state.program_accounts.insert(
+                    program_pubkey,
+                    keys,
+                    config.commitment.unwrap_or_default(),
+                );
+                app_state.map_updated.notify();
+            }
+            Response::Error(error) => {
+                metrics()
+                    .backend_errors
+                    .with_label_values(&["getProgramAccounts"])
+                    .inc();
+                info!("can't cache for key {} because {:?}", pubkey, error);
+            }
+        }
     }
 
     Ok(HttpResponse::Ok()
