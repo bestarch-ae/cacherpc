@@ -3,6 +3,7 @@ name = "cache-rpc"
 version = "0.1.5"
 authors = ["Alexander Polakov <a.polakov@iconic.vc>"]
 edition = "2018"
+license = "MIT"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
