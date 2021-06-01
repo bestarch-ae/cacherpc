@@ -95,11 +95,16 @@ impl AccountUpdateManager {
     fn connect(&self, ctx: &mut Context<Self>) {
         use actix::fut::{ActorFuture, WrapFuture};
         use actix::prelude::AsyncContext;
+        use backoff::backoff::Backoff;
 
         let websocket_url = self.websocket_url.clone();
         let fut = async move {
             loop {
                 info!("connecting to websocket {}", websocket_url);
+                let mut backoff = backoff::ExponentialBackoff {
+                    initial_interval: Duration::from_millis(100),
+                    ..Default::default()
+                };
                 let res = awc::Client::builder()
                     .max_http_version(awc::http::Version::HTTP_11)
                     .finish()
@@ -110,7 +115,12 @@ impl AccountUpdateManager {
                     Ok((_, conn)) => break conn,
                     Err(err) => {
                         error!("failed to connect to {} {:?}", websocket_url, err);
-                        tokio::time::delay_for(Duration::from_secs(1)).await;
+                        tokio::time::delay_for(
+                            backoff
+                                .next_backoff()
+                                .unwrap_or_else(|| Duration::from_secs(1)),
+                        )
+                        .await;
                     }
                 }
             }
