@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use actix::prelude::Addr;
 use actix_web::{web, HttpResponse, ResponseError};
@@ -193,11 +194,17 @@ impl State {
         req: &'_ Request<'_>,
         which: &'_ str,
     ) -> Result<Bytes, awc::error::SendRequestError> {
+        use backoff::backoff::Backoff;
+
         let client = &self.client;
         let limit = &self.program_accounts_request_limit;
-        let mut retries = 10; // todo: proper backoff
+        let mut backoff = backoff::ExponentialBackoff {
+            initial_interval: Duration::from_millis(100),
+            max_interval: Duration::from_secs(5),
+            max_elapsed_time: Some(Duration::from_secs(60)),
+            ..Default::default()
+        };
         loop {
-            retries -= 1;
             let _permit = limit.acquire().await;
             let timer = metrics()
                 .backend_response_time
@@ -205,7 +212,7 @@ impl State {
                 .start_timer();
             let mut resp = client
                 .post(&self.rpc_url)
-                .timeout(std::time::Duration::from_secs(30))
+                .timeout(Duration::from_secs(30))
                 .send_json(&req)
                 .await?;
             let body = resp.body().limit(BODY_LIMIT).await;
@@ -214,13 +221,13 @@ impl State {
                 Ok(body) => {
                     break Ok(body);
                 }
-                Err(err) => {
-                    tokio::time::delay_for(std::time::Duration::from_millis(100)).await;
-                    if retries == 0 {
+                Err(err) => match backoff.next_backoff() {
+                    Some(duration) => tokio::time::delay_for(duration).await,
+                    None => {
                         warn!("request: {:?} error: {:?}", req, err);
                         break Err(awc::error::SendRequestError::Timeout);
                     }
-                }
+                },
             }
         }
     }
