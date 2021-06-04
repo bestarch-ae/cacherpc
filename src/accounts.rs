@@ -43,6 +43,7 @@ pub(crate) struct AccountUpdateManager {
     accounts: AccountsDb,
     program_accounts: ProgramAccountsDb,
     purge_queue: DelayQueueHandle<Subscription>,
+    additional_keys: HashMap<Pubkey, HashSet<Option<u64>>>,
 }
 
 impl std::fmt::Debug for AccountUpdateManager {
@@ -73,6 +74,7 @@ impl AccountUpdateManager {
                 accounts: accounts.clone(),
                 program_accounts: program_accounts.clone(),
                 purge_queue: handle,
+                additional_keys: HashMap::default(),
             }
         })
     }
@@ -232,9 +234,14 @@ impl Handler<AccountCommand> for AccountUpdateManager {
         let _ = (|| -> Result<(), serde_json::Error> {
             let request_id = self.next_request_id();
             match item {
-                AccountCommand::Subscribe(sub, commitment) => {
+                AccountCommand::Subscribe(sub, commitment, data_size) => {
+                    let key = sub.key();
                     metrics().commands.with_label_values(&["subscribe"]).inc();
                     self.subscribe(sub, commitment)?;
+                    self.additional_keys
+                        .entry(key)
+                        .or_default()
+                        .insert(data_size);
                 }
                 AccountCommand::Purge(sub) => {
                     metrics().commands.with_label_values(&["purge"]).inc();
@@ -265,9 +272,20 @@ impl Handler<AccountCommand> for AccountUpdateManager {
                     }
                     match sub {
                         Subscription::Program(key) => {
-                            if let Some(program_accounts) = self.program_accounts.remove(&key) {
-                                for key in program_accounts.into_accounts() {
-                                    self.accounts.remove(&key)
+                            let keys = self
+                                .additional_keys
+                                .remove(&key)
+                                .into_iter()
+                                .flatten()
+                                .map(|filter| (key, filter))
+                                .chain(Some((key, None)));
+                            for (key, filter) in keys {
+                                if let Some(program_accounts) =
+                                    self.program_accounts.remove(&key, filter)
+                                {
+                                    for key in program_accounts.into_accounts() {
+                                        self.accounts.remove(&key)
+                                    }
                                 }
                             }
                         }
@@ -494,7 +512,7 @@ impl std::fmt::Display for Subscription {
 #[derive(Message, Debug)]
 #[rtype(result = "()")]
 pub(crate) enum AccountCommand {
-    Subscribe(Subscription, Commitment),
+    Subscribe(Subscription, Commitment, Option<u64>),
     Reset(Subscription),
     Purge(Subscription),
 }

@@ -42,7 +42,7 @@ impl Default for ProgramState {
 
 #[derive(Clone)]
 pub(crate) struct ProgramAccountsDb {
-    map: Arc<DashMap<Pubkey, ProgramState>>,
+    map: Arc<DashMap<(Pubkey, Option<u64>), ProgramState>>,
 }
 
 impl ProgramAccountsDb {
@@ -52,23 +52,37 @@ impl ProgramAccountsDb {
         }
     }
 
-    pub fn get(&self, key: &Pubkey) -> Option<Ref<'_, Pubkey, ProgramState>> {
-        self.map.get(key)
+    pub fn get(
+        &self,
+        key: &Pubkey,
+        data_size: Option<u64>,
+    ) -> Option<Ref<'_, (Pubkey, Option<u64>), ProgramState>> {
+        if let Some(found) = self.map.get(&(*key, data_size)) {
+            Some(found)
+        } else {
+            self.map.get(&(*key, None))
+        }
     }
 
-    pub fn insert(&self, key: Pubkey, data: HashSet<Pubkey>, commitment: Commitment) {
-        let mut entry = self.map.entry(key).or_default();
+    pub fn insert(
+        &self,
+        key: Pubkey,
+        data: HashSet<Pubkey>,
+        commitment: Commitment,
+        data_size: Option<u64>,
+    ) {
+        let mut entry = self.map.entry((key, data_size)).or_default();
         entry.insert(commitment, data);
     }
 
     pub fn add(&self, key: &Pubkey, data: Pubkey, commitment: Commitment) {
-        if let Some(mut state) = self.map.get_mut(&key) {
+        if let Some(mut state) = self.map.get_mut(&(*key, None)) {
             state.add(commitment, data);
         }
     }
 
-    pub fn remove(&self, key: &Pubkey) -> Option<ProgramState> {
-        self.map.remove(key).map(|(_, state)| state)
+    pub fn remove(&self, key: &Pubkey, data_size: Option<u64>) -> Option<ProgramState> {
+        self.map.remove(&(*key, data_size)).map(|(_, state)| state)
     }
 }
 
@@ -245,7 +259,7 @@ pub(crate) struct AccountInfo {
     pub rent_epoch: u64,
 }
 
-#[derive(Hash, Eq, PartialEq, Copy, Clone, Debug)]
+#[derive(Hash, Eq, PartialEq, Copy, Clone, Debug, Ord, PartialOrd)]
 pub(crate) struct Pubkey([u8; 32]);
 
 impl std::fmt::Display for Pubkey {
