@@ -711,10 +711,10 @@ struct ProgramAccountsConfig<'a> {
     #[serde(rename = "dataSlice")]
     data_slice: Option<Slice>,
     #[serde(borrow)]
-    filters: Option<&'a RawValue>,
+    filters: Option<SmallVec<[Filter<'a>; 2]>>,
 }
 
-impl Default for ProgramAccountsConfig<'static> {
+impl<'a> Default for ProgramAccountsConfig<'a> {
     fn default() -> Self {
         ProgramAccountsConfig {
             encoding: Encoding::Default,
@@ -766,10 +766,7 @@ fn program_accounts_response<'a>(
 
     let commitment = config.commitment.unwrap_or_default();
 
-    let filters: Option<SmallVec<[Filter<'a>; 2]>> = config
-        .filters
-        .map(|s| serde_json::from_str(s.get()))
-        .transpose()?;
+    let filters = &config.filters;
 
     let mut encoded_accounts = Vec::with_capacity(accounts.len());
 
@@ -875,17 +872,13 @@ async fn get_program_accounts(
 
     let mut cacheable_for_key = Some(pubkey);
 
-    let filters: Option<SmallVec<[Filter<'_>; 2]>> = config
+    let uncacheable_filters = config
         .filters
-        .map(|s| serde_json::from_str(s.get()))
-        .transpose()?;
-
-    let uncacheable_filters = filters
         .as_ref()
-        .map(|f| f.iter().any(|f| !f.is_data_size()))
+        .map(|fs| fs.iter().any(|f| !f.is_data_size()))
         .unwrap_or(false);
-    let data_size_filter = filters.and_then(|f| {
-        f.iter().find_map(|filter| match filter {
+    let data_size_filter = config.filters.as_ref().and_then(|fs| {
+        fs.iter().find_map(|filter| match filter {
             Filter::DataSize(len) => Some(*len),
             _ => None,
         })
