@@ -182,9 +182,18 @@ impl State {
         self.accounts.insert(key, data, commitment)
     }
 
-    async fn subscribe(&self, subscription: Subscription, commitment: Commitment) {
+    async fn subscribe(
+        &self,
+        subscription: Subscription,
+        commitment: Commitment,
+        data_size: Option<u64>,
+    ) {
         self.tx
-            .send(AccountCommand::Subscribe(subscription, commitment))
+            .send(AccountCommand::Subscribe(
+                subscription,
+                commitment,
+                data_size,
+            ))
             .await
             .expect("actor is dead");
     }
@@ -548,6 +557,7 @@ async fn get_account_info(
                     .subscribe(
                         Subscription::Account(pubkey),
                         config.commitment.unwrap_or_default(),
+                        None,
                     )
                     .await;
             }
@@ -662,13 +672,13 @@ enum Filter<'a> {
         #[serde(borrow)]
         bytes: &'a str,
     },
-    DataSize(usize),
+    DataSize(u64),
 }
 
 impl<'a> Filter<'a> {
     fn matches(&self, data: &AccountData) -> bool {
         match *self {
-            Filter::DataSize(len) => data.data.len() == len,
+            Filter::DataSize(len) => data.data.len() as u64 == len,
             Filter::Memcmp { offset, bytes } => {
                 // data to match, as base-58 encoded string and limited to less than 129 bytes
                 let mut buf = [0u8; 128];
@@ -687,6 +697,10 @@ impl<'a> Filter<'a> {
             }
         }
     }
+
+    fn is_data_size(&self) -> bool {
+        matches!(self, Filter::DataSize(_))
+    }
 }
 
 #[derive(Deserialize, Debug)]
@@ -697,10 +711,10 @@ struct ProgramAccountsConfig<'a> {
     #[serde(rename = "dataSlice")]
     data_slice: Option<Slice>,
     #[serde(borrow)]
-    filters: Option<&'a RawValue>,
+    filters: Option<SmallVec<[Filter<'a>; 2]>>,
 }
 
-impl Default for ProgramAccountsConfig<'static> {
+impl<'a> Default for ProgramAccountsConfig<'a> {
     fn default() -> Self {
         ProgramAccountsConfig {
             encoding: Encoding::Default,
@@ -752,10 +766,7 @@ fn program_accounts_response<'a>(
 
     let commitment = config.commitment.unwrap_or_default();
 
-    let filters: Option<SmallVec<[Filter<'a>; 2]>> = config
-        .filters
-        .map(|s| serde_json::from_str(s.get()))
-        .transpose()?;
+    let filters = &config.filters;
 
     let mut encoded_accounts = Vec::with_capacity(accounts.len());
 
@@ -861,8 +872,20 @@ async fn get_program_accounts(
 
     let mut cacheable_for_key = Some(pubkey);
 
+    let uncacheable_filters = config
+        .filters
+        .as_ref()
+        .map(|fs| fs.iter().any(|f| !f.is_data_size()))
+        .unwrap_or(false);
+    let data_size_filter = config.filters.as_ref().and_then(|fs| {
+        fs.iter().find_map(|filter| match filter {
+            Filter::DataSize(len) => Some(*len),
+            _ => None,
+        })
+    });
+
     if config.encoding != Encoding::JsonParsed {
-        match app_state.program_accounts.get(&pubkey) {
+        match app_state.program_accounts.get(&pubkey, data_size_filter) {
             Some(data) => {
                 let accounts = data.value();
                 if let Some(accounts) = accounts.get(config.commitment.unwrap_or_default()) {
@@ -875,7 +898,7 @@ async fn get_program_accounts(
                 }
             }
             None => {
-                if config.data_slice.is_some() || config.filters.is_some() {
+                if config.data_slice.is_some() || uncacheable_filters {
                     metrics().response_uncacheable.inc();
                     cacheable_for_key = None;
                 }
@@ -883,6 +906,7 @@ async fn get_program_accounts(
                     .subscribe(
                         Subscription::Program(pubkey),
                         config.commitment.unwrap_or_default(),
+                        data_size_filter,
                     )
                     .await;
             }
@@ -909,7 +933,7 @@ async fn get_program_accounts(
             }
             _ = notified => {
                 if let Some(program_pubkey) = cacheable_for_key {
-                    if let Some(data) = app_state.program_accounts.get(&program_pubkey) {
+                    if let Some(data) = app_state.program_accounts.get(&program_pubkey, data_size_filter) {
                         let data = data.value();
                         metrics().program_accounts_cache_filled.inc();
                         if let Some(accounts) = data.get(config.commitment.unwrap_or_default()) {
@@ -967,6 +991,7 @@ async fn get_program_accounts(
                     program_pubkey,
                     keys,
                     config.commitment.unwrap_or_default(),
+                    data_size_filter,
                 );
                 app_state.map_updated.notify();
             }
