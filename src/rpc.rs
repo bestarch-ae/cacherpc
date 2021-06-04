@@ -192,12 +192,11 @@ impl State {
     async fn request(
         &self,
         req: &'_ Request<'_>,
-        which: &'_ str,
+        limit: &Semaphore,
     ) -> Result<Bytes, awc::error::SendRequestError> {
         use backoff::backoff::Backoff;
 
         let client = &self.client;
-        let limit = &self.program_accounts_request_limit;
         let mut backoff = backoff::ExponentialBackoff {
             initial_interval: Duration::from_millis(100),
             max_interval: Duration::from_secs(5),
@@ -208,7 +207,7 @@ impl State {
             let _permit = limit.acquire().await;
             let timer = metrics()
                 .backend_response_time
-                .with_label_values(&[which])
+                .with_label_values(&[req.method])
                 .start_timer();
             let mut resp = client
                 .post(&self.rpc_url)
@@ -557,7 +556,8 @@ async fn get_account_info(
         cacheable_for_key = None;
     }
 
-    let wait_for_response = app_state.request(&req, "getAccountInfo");
+    let limit = &app_state.account_info_request_limit;
+    let wait_for_response = app_state.request(&req, limit);
 
     tokio::pin!(wait_for_response);
 
@@ -891,7 +891,8 @@ async fn get_program_accounts(
         cacheable_for_key = None;
     }
 
-    let wait_for_response = app_state.request(&req, "getProgramAccounts");
+    let limit = &app_state.program_accounts_request_limit;
+    let wait_for_response = app_state.request(&req, limit);
 
     tokio::pin!(wait_for_response);
 
