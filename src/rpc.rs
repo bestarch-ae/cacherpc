@@ -457,6 +457,8 @@ fn account_response<'a, 'b>(
             .observe(body.len() as f64);
 
         return Ok(HttpResponse::Ok()
+            .header("x-cache-status", "hit")
+            .header("x-cache-type", "lru")
             .content_type("application/json")
             .body(body));
     }
@@ -496,6 +498,8 @@ fn account_response<'a, 'b>(
         .observe(body.len() as f64);
 
     Ok(HttpResponse::Ok()
+        .header("x-cache-status", "hit")
+        .header("x-cache-type", "data")
         .content_type("application/json")
         .body(body))
 }
@@ -662,6 +666,7 @@ async fn get_account_info(
     }
 
     Ok(HttpResponse::Ok()
+        .header("x-cache-status", "miss")
         .content_type("application/json")
         .body(resp))
 }
@@ -831,6 +836,8 @@ fn program_accounts_response<'a>(
         .with_label_values(&["getProgramAccounts"])
         .observe(body.len() as f64);
     Ok(HttpResponse::Ok()
+        .header("x-cache-status", "hit")
+        .header("x-cache-type", "data")
         .content_type("application/json")
         .body(body))
 }
@@ -1017,6 +1024,7 @@ async fn get_program_accounts(
 
     Ok(HttpResponse::Ok()
         .content_type("application/json")
+        .header("x-cache-status", "miss")
         .body(resp))
 }
 
