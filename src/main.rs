@@ -63,16 +63,54 @@ struct Options {
         help = "maximum amount of entries in the response cache"
     )]
     body_cache_size: usize,
+    #[structopt(
+        long = "log-format",
+        default_value = "plain",
+        help = "one of: 'plain', 'json'"
+    )]
+    log_format: LogFormat,
+}
+
+#[derive(Debug)]
+enum LogFormat {
+    Plain,
+    Json,
+}
+
+#[derive(thiserror::Error, Debug)]
+#[error("must be one of: \"plain\", \"json\"")]
+struct LogFormatParseError;
+
+impl std::str::FromStr for LogFormat {
+    type Err = LogFormatParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "plain" => Ok(LogFormat::Plain),
+            "json" => Ok(LogFormat::Json),
+            _ => Err(LogFormatParseError),
+        }
+    }
 }
 
 #[actix_web::main]
 async fn main() {
     let options = Options::from_args();
 
-    let subscriber = tracing_subscriber::FmtSubscriber::new();
-    tracing::subscriber::set_global_default(subscriber).unwrap();
+    match options.log_format {
+        LogFormat::Json => {
+            let subscriber = tracing_subscriber::fmt::Subscriber::builder()
+                .json()
+                .finish();
+            tracing::subscriber::set_global_default(subscriber).unwrap();
+        }
+        LogFormat::Plain => {
+            let subscriber = tracing_subscriber::fmt::Subscriber::builder().finish();
+            tracing::subscriber::set_global_default(subscriber).unwrap();
+        }
+    };
 
-    info!("options: {:?}", options);
+    info!(?options, "configuration options");
 
     run(options).await;
 }

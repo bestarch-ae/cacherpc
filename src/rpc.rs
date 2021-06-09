@@ -578,7 +578,7 @@ async fn get_account_info(
                 if let Ok(body) = body {
                     break body;
                 } else {
-                    info!("reporting gateway timeout"); // TODO: return proper error
+                    info!(%pubkey, ?req.id, "reporting gateway timeout"); // TODO: return proper error
                     return Err(Error::Timeout(req.id.clone()));
                 }
             }
@@ -621,7 +621,7 @@ async fn get_account_info(
         let resp: Wrap<'_> = serde_json::from_slice(&resp)?;
         match resp.inner {
             Response::Result(info) => {
-                info!("cached for key {}", pubkey);
+                info!(%pubkey, "cached for key");
                 app_state.insert(pubkey, info, config.commitment.unwrap_or_default());
                 app_state.map_updated.notify();
             }
@@ -630,7 +630,7 @@ async fn get_account_info(
                     .backend_errors
                     .with_label_values(&["getAccountInfo"])
                     .inc();
-                info!("can't cache for key {} because {:?}", pubkey, error);
+                info!(%pubkey, ?error, "can't cache for key");
                 // check cache one more time, maybe another thread was more lucky
                 if let Some(data) = app_state.get_account(&pubkey) {
                     let data = data.value();
@@ -787,7 +787,7 @@ fn program_accounts_response<'a>(
                         .unwrap_or(false)
                 });
                 if !matches {
-                    info!("skipped {} because of filter", data.key());
+                    info!(pubkey = ?data.key(), "skipped because of filter");
                     continue;
                 }
             }
@@ -927,7 +927,7 @@ async fn get_program_accounts(
                 if let Ok(body) = body {
                     break body;
                 } else {
-                    info!("reporting gateway timeout"); // TODO: return proper error
+                    info!(?req.id, "reporting gateway timeout"); // TODO: return proper error
                     return Err(Error::Timeout(req.id.clone()));
                 }
             }
@@ -1000,7 +1000,7 @@ async fn get_program_accounts(
                     .backend_errors
                     .with_label_values(&["getProgramAccounts"])
                     .inc();
-                info!("can't cache for key {} because {:?}", pubkey, error);
+                info!(%pubkey, ?error, "can't cache for key");
             }
         }
     }

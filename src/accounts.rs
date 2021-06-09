@@ -102,7 +102,7 @@ impl AccountUpdateManager {
         let websocket_url = self.websocket_url.clone();
         let fut = async move {
             loop {
-                info!("connecting to websocket {}", websocket_url);
+                info!(message = "connecting to websocket", url = %websocket_url);
                 let mut backoff = backoff::ExponentialBackoff {
                     initial_interval: Duration::from_millis(100),
                     ..Default::default()
@@ -116,7 +116,7 @@ impl AccountUpdateManager {
                 match res {
                     Ok((_, conn)) => break conn,
                     Err(err) => {
-                        error!("failed to connect to {} {:?}", websocket_url, err);
+                        error!(message = "failed to connect", url = %websocket_url, error = ?err);
                         tokio::time::delay_for(
                             backoff
                                 .next_backoff()
@@ -134,7 +134,7 @@ impl AccountUpdateManager {
                 stream
                     .take_while(|item| {
                         if let Err(err) = &item {
-                            warn!("websocket error {:?}", err);
+                            warn!(message = "websocket error", error = %err);
                         }
                         item.is_ok()
                     })
@@ -192,11 +192,16 @@ impl AccountUpdateManager {
             Subscription::Program(key) => (key, "programSubscribe"),
         };
         if self.subs.contains(&(sub, commitment)) {
-            info!("already trying to subscribe to {}", key);
+            info!(message = "already trying to subscribe", pubkey = %key);
             return Ok(());
         }
 
-        info!("subscribe to {} ({}/{:?})", key, method, commitment);
+        info!(
+            message = "subscribe to",
+            pubkey = %key,
+            method = method,
+            commitment = ?commitment
+        );
 
         let request = Request {
             jsonrpc: "2.0",
@@ -245,7 +250,7 @@ impl Handler<AccountCommand> for AccountUpdateManager {
                 }
                 AccountCommand::Purge(sub) => {
                     metrics().commands.with_label_values(&["purge"]).inc();
-                    info!("purging {}", sub);
+                    info!(message = "purging", sub = ?sub);
 
                     #[derive(Serialize)]
                     struct Request<'a> {
@@ -302,7 +307,7 @@ impl Handler<AccountCommand> for AccountUpdateManager {
             Ok(())
         })()
         .map_err(|err| {
-            error!("error handling AccountCommand: {}", err);
+            error!(error = %err, "error handling AccountCommand");
         });
     }
 }
@@ -376,7 +381,7 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
                                 if let Some((sub, commitment)) = self.id_to_sub.get(&params.subscription) {
                                     self.accounts.insert(sub.key(), params.result, *commitment);
                                 } else {
-                                    warn!("unknown subscription {}", params.subscription);
+                                    warn!(message = "unknown subscription", sub = params.subscription);
                                 }
                                 metrics().notifications_received.with_label_values(&["accountNotification"]).inc();
                             }
@@ -403,7 +408,7 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
                                         value: Some(params.result.value.account), context: params.result.context }, *commitment);
                                     self.program_accounts.add(&program_sub.key(), params.result.value.pubkey, *commitment);
                                 } else {
-                                    warn!("unknown subscription {}", params.subscription);
+                                    warn!(message = "unknown subscription", sub = params.subscription);
                                 }
                                 metrics().notifications_received.with_label_values(&["programNotification"]).inc();
                             }
@@ -426,7 +431,7 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
             }
             Ok(())
         })().map_err(|err| {
-            error!("error handling Frame: {}", err);
+            error!(message = "error handling Frame", error = ?err);
         });
     }
 
@@ -478,7 +483,7 @@ impl Actor for AccountUpdateManager {
 
 impl actix::io::WriteHandler<awc::error::WsProtocolError> for AccountUpdateManager {
     fn error(&mut self, err: awc::error::WsProtocolError, ctx: &mut Self::Context) -> Running {
-        error!("websocket error {:?}", err);
+        error!(message = "websocket error", error = ?err);
         self.connect(ctx);
         Running::Continue
     }
