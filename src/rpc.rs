@@ -166,7 +166,7 @@ pub(crate) struct State {
     pub map_updated: Arc<Notify>,
     pub account_info_request_limit: Arc<Semaphore>,
     pub program_accounts_request_limit: Arc<Semaphore>,
-    pub lru: RefCell<LruCache<u64, Bytes>>,
+    pub lru: RefCell<LruCache<u64, Box<RawValue>>>,
 }
 
 impl State {
@@ -436,12 +436,20 @@ fn account_response<'a, 'b>(
     #[derive(Serialize)]
     struct Resp<'a> {
         jsonrpc: &'a str,
-        result: EncodedAccountContext<'a>,
+        result: &'a RawValue,
         id: Id<'a>,
     }
     let request_and_slot_hash = hash((request_hash, acc.1));
-    if let Some(body) = app_state.lru.borrow_mut().get(&request_and_slot_hash) {
+    if let Some(result) = app_state.lru.borrow_mut().get(&request_and_slot_hash) {
         metrics().lru_cache_hits.inc();
+
+        let resp = Resp {
+            jsonrpc: "2.0",
+            result: &result,
+            id: req_id,
+        };
+
+        let body = serde_json::to_vec(&resp)?;
 
         metrics()
             .response_size_bytes
@@ -449,17 +457,17 @@ fn account_response<'a, 'b>(
             .observe(body.len() as f64);
 
         return Ok(HttpResponse::Ok()
+            .header("x-cache-status", "hit")
+            .header("x-cache-type", "lru")
             .content_type("application/json")
-            .body(body.clone()));
+            .body(body));
     }
 
     let slot = app_state
         .accounts
         .get_slot(config.commitment.unwrap_or_default());
     let ctx = SolanaContext { slot };
-    let resp = Resp {
-        jsonrpc: "2.0",
-        result: acc
+    let result = acc
             .0
             .as_ref()
             .map(|acc| {
@@ -471,14 +479,18 @@ fn account_response<'a, 'b>(
             .transpose()
             .map_err(|_| Error::InvalidRequest(Some(req_id.clone()),
                     Some("Encoded binary (base 58) data should be less than 128 bytes, please use Base64 encoding.")))?
-            .unwrap_or_else(|| EncodedAccountContext::empty(&ctx)),
+            .unwrap_or_else(|| EncodedAccountContext::empty(&ctx));
+    let result = serde_json::value::to_raw_value(&result)?;
+    let resp = Resp {
+        jsonrpc: "2.0",
+        result: &result,
         id: req_id,
     };
-    let body = Bytes::from(serde_json::to_vec(&resp)?);
+    let body = serde_json::to_vec(&resp)?;
     app_state
         .lru
         .borrow_mut()
-        .put(request_and_slot_hash, body.clone());
+        .put(request_and_slot_hash, result);
 
     metrics()
         .response_size_bytes
@@ -486,6 +498,8 @@ fn account_response<'a, 'b>(
         .observe(body.len() as f64);
 
     Ok(HttpResponse::Ok()
+        .header("x-cache-status", "hit")
+        .header("x-cache-type", "data")
         .content_type("application/json")
         .body(body))
 }
@@ -652,6 +666,7 @@ async fn get_account_info(
     }
 
     Ok(HttpResponse::Ok()
+        .header("x-cache-status", "miss")
         .content_type("application/json")
         .body(resp))
 }
@@ -821,6 +836,8 @@ fn program_accounts_response<'a>(
         .with_label_values(&["getProgramAccounts"])
         .observe(body.len() as f64);
     Ok(HttpResponse::Ok()
+        .header("x-cache-status", "hit")
+        .header("x-cache-type", "data")
         .content_type("application/json")
         .body(body))
 }
@@ -1007,6 +1024,7 @@ async fn get_program_accounts(
 
     Ok(HttpResponse::Ok()
         .content_type("application/json")
+        .header("x-cache-status", "miss")
         .body(resp))
 }
 
