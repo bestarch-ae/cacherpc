@@ -9,6 +9,7 @@ use lru::LruCache;
 use structopt::StructOpt;
 use tokio::sync::{Notify, Semaphore};
 use tracing::info;
+use tracing_subscriber::fmt;
 
 mod accounts;
 mod metrics;
@@ -99,13 +100,15 @@ async fn main() {
 
     match options.log_format {
         LogFormat::Json => {
-            let subscriber = tracing_subscriber::fmt::Subscriber::builder()
+            let subscriber = fmt::Subscriber::builder()
+                .with_thread_names(true)
+                .with_timer(fmt::time::ChronoLocal::rfc3339())
                 .json()
                 .finish();
             tracing::subscriber::set_global_default(subscriber).unwrap();
         }
         LogFormat::Plain => {
-            let subscriber = tracing_subscriber::fmt::Subscriber::builder().finish();
+            let subscriber = fmt::Subscriber::builder().finish();
             tracing::subscriber::set_global_default(subscriber).unwrap();
         }
     };
