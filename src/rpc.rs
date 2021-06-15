@@ -16,7 +16,7 @@ use serde_json::value::{to_raw_value, RawValue};
 use smallvec::SmallVec;
 use thiserror::Error;
 use tokio::sync::{Notify, Semaphore};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::accounts::{AccountCommand, AccountUpdateManager, Subscription};
 use crate::metrics::rpc_metrics as metrics;
@@ -161,7 +161,7 @@ pub(crate) struct State {
     pub accounts: AccountsDb,
     pub program_accounts: ProgramAccountsDb,
     pub client: Client,
-    pub tx: Addr<AccountUpdateManager>,
+    pub actor: Addr<AccountUpdateManager>,
     pub rpc_url: String,
     pub map_updated: Arc<Notify>,
     pub account_info_request_limit: Arc<Semaphore>,
@@ -171,9 +171,9 @@ pub(crate) struct State {
 
 impl State {
     fn get_account(&self, key: &Pubkey) -> Option<Ref<'_, Pubkey, AccountState>> {
-        let tx = &self.tx;
+        let actor = &self.actor;
         self.accounts.get(key).map(|v| {
-            tx.do_send(AccountCommand::Reset(Subscription::Account(*key)));
+            actor.do_send(AccountCommand::Reset(Subscription::Account(*key)));
             v
         })
     }
@@ -188,14 +188,17 @@ impl State {
         commitment: Commitment,
         data_size: Option<u64>,
     ) {
-        self.tx
+        let res = self
+            .actor
             .send(AccountCommand::Subscribe(
                 subscription,
                 commitment,
                 data_size,
             ))
-            .await
-            .expect("actor is dead");
+            .await;
+        if let Err(err) = res {
+            error!(error = %err, message = "error sending command to actor");
+        }
     }
 
     async fn request(
