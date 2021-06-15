@@ -150,7 +150,7 @@ async fn run(options: Options) {
             accounts: accounts.clone(),
             program_accounts: program_accounts.clone(),
             client,
-            tx: addr.clone(),
+            actor: addr.clone(),
             rpc_url: rpc_url.clone(),
             map_updated: notify.clone(),
             account_info_request_limit: account_info_request_limit.clone(),

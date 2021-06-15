@@ -8,6 +8,7 @@ use actix::prelude::Addr;
 use actix_web::{web, HttpResponse, ResponseError};
 
 use awc::Client;
+use backoff::backoff::Backoff;
 use bytes::Bytes;
 use dashmap::mapref::one::Ref;
 use lru::LruCache;
@@ -16,7 +17,7 @@ use serde_json::value::{to_raw_value, RawValue};
 use smallvec::SmallVec;
 use thiserror::Error;
 use tokio::sync::{Notify, Semaphore};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::accounts::{AccountCommand, AccountUpdateManager, Subscription};
 use crate::metrics::rpc_metrics as metrics;
@@ -26,6 +27,7 @@ use crate::types::{
 };
 
 const BODY_LIMIT: usize = 1024 * 1024 * 100;
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Error, Debug)]
 #[error("can't encode in base58")]
@@ -161,7 +163,7 @@ pub(crate) struct State {
     pub accounts: AccountsDb,
     pub program_accounts: ProgramAccountsDb,
     pub client: Client,
-    pub tx: Addr<AccountUpdateManager>,
+    pub actor: Addr<AccountUpdateManager>,
     pub rpc_url: String,
     pub map_updated: Arc<Notify>,
     pub account_info_request_limit: Arc<Semaphore>,
@@ -171,9 +173,9 @@ pub(crate) struct State {
 
 impl State {
     fn get_account(&self, key: &Pubkey) -> Option<Ref<'_, Pubkey, AccountState>> {
-        let tx = &self.tx;
+        let actor = &self.actor;
         self.accounts.get(key).map(|v| {
-            tx.do_send(AccountCommand::Reset(Subscription::Account(*key)));
+            actor.do_send(AccountCommand::Reset(Subscription::Account(*key)));
             v
         })
     }
@@ -188,14 +190,17 @@ impl State {
         commitment: Commitment,
         data_size: Option<u64>,
     ) {
-        self.tx
+        let res = self
+            .actor
             .send(AccountCommand::Subscribe(
                 subscription,
                 commitment,
                 data_size,
             ))
-            .await
-            .expect("actor is dead");
+            .await;
+        if let Err(err) = res {
+            error!(error = %err, message = "error sending command to actor");
+        }
     }
 
     async fn request(
@@ -203,15 +208,8 @@ impl State {
         req: &'_ Request<'_>,
         limit: &Semaphore,
     ) -> Result<Bytes, awc::error::SendRequestError> {
-        use backoff::backoff::Backoff;
-
         let client = &self.client;
-        let mut backoff = backoff::ExponentialBackoff {
-            initial_interval: Duration::from_millis(100),
-            max_interval: Duration::from_secs(5),
-            max_elapsed_time: Some(Duration::from_secs(60)),
-            ..Default::default()
-        };
+        let mut backoff = backoff_settings();
         loop {
             let _permit = limit.acquire().await;
             let timer = metrics()
@@ -220,7 +218,7 @@ impl State {
                 .start_timer();
             let mut resp = client
                 .post(&self.rpc_url)
-                .timeout(Duration::from_secs(30))
+                .timeout(REQUEST_TIMEOUT)
                 .send_json(&req)
                 .await?;
             let body = resp.body().limit(BODY_LIMIT).await;
@@ -1075,12 +1073,49 @@ pub(crate) async fn rpc_handler(
         }
     }
 
-    let client = &app_state.client;
-    let resp = client.post(&app_state.rpc_url).send_json(&req).await?;
+    let client = app_state.client.clone();
+    let url = app_state.rpc_url.clone();
+
+    let stream = stream_generator::generate_stream(move |mut stream| async move {
+        use tokio::stream::StreamExt;
+        let mut backoff = backoff_settings();
+        loop {
+            let resp = client
+                .post(&url)
+                .content_type("application/json")
+                .send_body(body.clone())
+                .await;
+            match resp {
+                Ok(mut resp) => {
+                    while let Some(chunk) = resp.next().await {
+                        stream.send(chunk).await;
+                    }
+                    return;
+                }
+                Err(err) => match backoff.next_backoff() {
+                    Some(duration) => tokio::time::delay_for(duration).await,
+                    None => {
+                        warn!("request error: {:?}", err);
+                        // TODO: return error
+                        return;
+                    }
+                },
+            }
+        }
+    });
 
     Ok(HttpResponse::Ok()
         .content_type("application/json")
-        .streaming(resp))
+        .streaming(Box::pin(stream)))
+}
+
+fn backoff_settings() -> backoff::ExponentialBackoff {
+    backoff::ExponentialBackoff {
+        initial_interval: Duration::from_millis(100),
+        max_interval: Duration::from_secs(5),
+        max_elapsed_time: Some(Duration::from_secs(60)),
+        ..Default::default()
+    }
 }
 
 pub(crate) async fn metrics_handler(
