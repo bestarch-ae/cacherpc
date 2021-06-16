@@ -16,6 +16,7 @@ use crate::types::{
     SolanaContext,
 };
 
+const MAILBOX_CAPACITY: usize = 512;
 const PURGE_TIMEOUT: Duration = Duration::from_secs(600);
 
 enum InflightRequest {
@@ -61,6 +62,8 @@ impl AccountUpdateManager {
         AccountUpdateManager::create(|ctx| {
             let (handle, stream) = delay_queue();
             let purge_stream = stream.map(AccountCommand::Purge);
+
+            ctx.set_mailbox_capacity(MAILBOX_CAPACITY);
 
             AccountUpdateManager::add_stream(purge_stream, ctx);
             AccountUpdateManager {
@@ -229,6 +232,10 @@ impl AccountUpdateManager {
 impl StreamHandler<AccountCommand> for AccountUpdateManager {
     fn handle(&mut self, item: AccountCommand, ctx: &mut Context<Self>) {
         let _ = <Self as Handler<AccountCommand>>::handle(self, item, ctx);
+    }
+
+    fn finished(&mut self, ctx: &mut Context<Self>) {
+        info!("purge stream finished");
     }
 }
 
@@ -478,6 +485,15 @@ impl Actor for AccountUpdateManager {
 
     fn started(&mut self, ctx: &mut Context<Self>) {
         self.connect(ctx);
+    }
+
+    fn stopping(&mut self, ctx: &mut Context<Self>) -> Running {
+        info!("pubsub actor stopping");
+        Running::Stop
+    }
+
+    fn stopped(&mut self, ctx: &mut Context<Self>) {
+        info!("pubsub actor stopped");
     }
 }
 
