@@ -234,7 +234,7 @@ impl StreamHandler<AccountCommand> for AccountUpdateManager {
         let _ = <Self as Handler<AccountCommand>>::handle(self, item, ctx);
     }
 
-    fn finished(&mut self, ctx: &mut Context<Self>) {
+    fn finished(&mut self, _ctx: &mut Context<Self>) {
         info!("purge stream finished");
     }
 }
@@ -487,12 +487,12 @@ impl Actor for AccountUpdateManager {
         self.connect(ctx);
     }
 
-    fn stopping(&mut self, ctx: &mut Context<Self>) -> Running {
+    fn stopping(&mut self, _ctx: &mut Context<Self>) -> Running {
         info!("pubsub actor stopping");
         Running::Stop
     }
 
-    fn stopped(&mut self, ctx: &mut Context<Self>) {
+    fn stopped(&mut self, _ctx: &mut Context<Self>) {
         info!("pubsub actor stopped");
     }
 }
