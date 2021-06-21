@@ -36,7 +36,7 @@ pub fn pubsub_metrics() -> &'static PubSubMetrics {
 }
 
 pub struct RpcMetrics {
-    pub request_types: IntCounterVec,
+    request_types: IntCounterVec,
     pub request_encodings: IntCounterVec,
     pub account_cache_hits: IntCounter,
     pub account_cache_filled: IntCounter,
@@ -48,6 +48,75 @@ pub struct RpcMetrics {
     pub handler_time: HistogramVec,
     pub response_size_bytes: HistogramVec,
     pub lru_cache_hits: IntCounter,
+}
+
+impl RpcMetrics {
+    // We have to limit number of label values to avoid slowing
+    // down metrics storage.
+    pub fn request_types(&self, method: &str) -> IntCounter {
+        const KNOWN_METHODS: [&str; 51] = [
+            "getAccountInfo",
+            "getBalance",
+            "getBlock",
+            "getBlockCommitment",
+            "getBlockHeight",
+            "getBlockProduction",
+            "getBlockTime",
+            "getBlocks",
+            "getBlocksWithLimit",
+            "getClusterNodes",
+            "getEpochInfo",
+            "getEpochSchedule",
+            "getFeeCalculatorForBlockhash",
+            "getFeeRateGovernor",
+            "getFees",
+            "getFirstAvailableBlock",
+            "getGenesisHash",
+            "getHealth",
+            "getIdentity",
+            "getInflationGovernor",
+            "getInflationRate",
+            "getInflationReward",
+            "getLargestAccounts",
+            "getLeaderSchedule",
+            "getMaxRetransmitSlot",
+            "getMaxShredInsertSlot",
+            "getMinimumBalanceForRentExemption",
+            "getMultipleAccounts",
+            "getProgramAccounts",
+            "getRecentBlockhash",
+            "getRecentPerformanceSamples",
+            "getSignatureStatuses",
+            "getSignaturesForAddress",
+            "getSlot",
+            "getSlotLeader",
+            "getSlotLeaders",
+            "getStakeActivation",
+            "getSupply",
+            "getTokenAccountBalance",
+            "getTokenAccountsByDelegate",
+            "getTokenAccountsByOwner",
+            "getTokenLargestAccounts",
+            "getTokenSupply",
+            "getTransaction",
+            "getTransactionCount",
+            "getVersion",
+            "getVoteAccounts",
+            "minimumLedgerSlot",
+            "requestAirdrop",
+            "sendTransaction",
+            "simulateTransaction",
+        ];
+
+        if method == "getAccountInfo"
+            || method == "getProgramAccounts" // fast path
+            || KNOWN_METHODS.binary_search(&method).is_ok()
+        {
+            self.request_types.with_label_values(&[method])
+        } else {
+            self.request_types.with_label_values(&["other"])
+        }
+    }
 }
 
 pub fn rpc_metrics() -> &'static RpcMetrics {

@@ -1043,10 +1043,7 @@ pub(crate) async fn rpc_handler(
 
     match req.method {
         "getAccountInfo" => {
-            metrics()
-                .request_types
-                .with_label_values(&["getAccountInfo"])
-                .inc();
+            metrics().request_types("getAccountInfo").inc();
             let timer = metrics()
                 .handler_time
                 .with_label_values(&["getAccountInfo"])
@@ -1056,10 +1053,7 @@ pub(crate) async fn rpc_handler(
             return Ok(resp.unwrap_or_else(|err| err.error_response()));
         }
         "getProgramAccounts" => {
-            metrics()
-                .request_types
-                .with_label_values(&["getProgramAccounts"])
-                .inc();
+            metrics().request_types("getProgramAccounts").inc();
             let timer = metrics()
                 .handler_time
                 .with_label_values(&["getProgramAccounts"])
@@ -1068,8 +1062,8 @@ pub(crate) async fn rpc_handler(
             timer.observe_duration();
             return Ok(resp.unwrap_or_else(|err| err.error_response()));
         }
-        _ => {
-            metrics().request_types.with_label_values(&["other"]).inc();
+        method => {
+            metrics().request_types(method).inc();
         }
     }
 
