@@ -1,7 +1,7 @@
 use once_cell::sync::Lazy;
 use prometheus::{
     register_histogram_vec, register_int_counter, register_int_counter_vec, register_int_gauge,
-    HistogramVec, IntCounter, IntCounterVec, IntGauge,
+    register_int_gauge_vec, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec,
 };
 
 pub struct PubSubMetrics {
@@ -48,6 +48,7 @@ pub struct RpcMetrics {
     pub handler_time: HistogramVec,
     pub response_size_bytes: HistogramVec,
     pub lru_cache_hits: IntCounter,
+    pub lru_cache_filled: IntGaugeVec,
 }
 
 impl RpcMetrics {
@@ -136,6 +137,12 @@ pub fn rpc_metrics() -> &'static RpcMetrics {
         account_cache_hits: register_int_counter!("account_cache_hits", "Accounts cache hit")
             .unwrap(),
         lru_cache_hits: register_int_counter!("lru_cache_hits", "LRU cache hit").unwrap(),
+        lru_cache_filled: register_int_gauge_vec!(
+            "lru_cache_filled",
+            "LRU cache size (in entries)",
+            &["worker"]
+        )
+        .unwrap(),
         account_cache_filled: register_int_counter!(
             "account_cache_filled",
             "Accounts cache filled while waiting for response"
