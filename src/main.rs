@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -133,6 +134,7 @@ async fn run(options: Options) {
     let program_accounts_request_limit =
         Arc::new(Semaphore::new(options.program_accounts_request_limit));
     let body_cache_size = options.body_cache_size;
+    let worker_id_counter = Arc::new(AtomicUsize::new(0));
 
     HttpServer::new(move || {
         let client = Client::builder()
@@ -156,6 +158,10 @@ async fn run(options: Options) {
             account_info_request_limit: account_info_request_limit.clone(),
             program_accounts_request_limit: program_accounts_request_limit.clone(),
             lru: RefCell::new(LruCache::new(body_cache_size)),
+            worker_id: {
+                let id = worker_id_counter.fetch_add(1, Ordering::SeqCst);
+                format!("rpc-{}", id)
+            },
         };
         let cors = Cors::default()
             .allow_any_origin()

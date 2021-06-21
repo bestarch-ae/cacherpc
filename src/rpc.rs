@@ -169,6 +169,7 @@ pub(crate) struct State {
     pub account_info_request_limit: Arc<Semaphore>,
     pub program_accounts_request_limit: Arc<Semaphore>,
     pub lru: RefCell<LruCache<u64, Box<RawValue>>>,
+    pub worker_id: String,
 }
 
 impl State {
@@ -440,7 +441,6 @@ fn account_response<'a, 'b>(
     let request_and_slot_hash = hash((request_hash, acc.1));
     if let Some(result) = app_state.lru.borrow_mut().get(&request_and_slot_hash) {
         metrics().lru_cache_hits.inc();
-
         let resp = Resp {
             jsonrpc: "2.0",
             result: &result,
@@ -489,6 +489,11 @@ fn account_response<'a, 'b>(
         .lru
         .borrow_mut()
         .put(request_and_slot_hash, result);
+
+    metrics()
+        .lru_cache_filled
+        .with_label_values(&[&app_state.worker_id])
+        .set(app_state.lru.borrow().len() as i64);
 
     metrics()
         .response_size_bytes
