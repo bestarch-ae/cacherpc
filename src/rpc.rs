@@ -568,7 +568,10 @@ async fn get_account_info(
             None => {
                 if config.data_slice.is_some() {
                     cacheable_for_key = None;
-                    metrics().response_uncacheable.inc();
+                    metrics()
+                        .response_uncacheable
+                        .with_label_values(&["getAccountInfo", "data_slice"])
+                        .inc();
                 }
                 app_state
                     .subscribe(
@@ -581,6 +584,10 @@ async fn get_account_info(
         }
     } else {
         cacheable_for_key = None;
+        metrics()
+            .response_uncacheable
+            .with_label_values(&["getAccountInfo", "encoding"])
+            .inc();
     }
 
     let limit = &app_state.account_info_request_limit;
@@ -918,8 +925,17 @@ async fn get_program_accounts(
                 }
             }
             None => {
-                if config.data_slice.is_some() || uncacheable_filters {
-                    metrics().response_uncacheable.inc();
+                let reason = match (config.data_slice.is_some(), uncacheable_filters) {
+                    (true, true) => Some("data_slice_and_filters"),
+                    (true, false) => Some("data_slice"),
+                    (false, true) => Some("filters"),
+                    (false, false) => None,
+                };
+                if let Some(reason) = reason {
+                    metrics()
+                        .response_uncacheable
+                        .with_label_values(&["getProgramAccounts", reason])
+                        .inc();
                     cacheable_for_key = None;
                 }
                 app_state
@@ -933,6 +949,10 @@ async fn get_program_accounts(
         }
     } else {
         cacheable_for_key = None;
+        metrics()
+            .response_uncacheable
+            .with_label_values(&["getProgramAccounts", "encoding"])
+            .inc();
     }
 
     let limit = &app_state.program_accounts_request_limit;
