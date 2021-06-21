@@ -42,7 +42,7 @@ pub struct RpcMetrics {
     pub account_cache_filled: IntCounter,
     pub program_accounts_cache_hits: IntCounter,
     pub program_accounts_cache_filled: IntCounter,
-    pub response_uncacheable: IntCounter,
+    pub response_uncacheable: IntCounterVec,
     pub backend_response_time: HistogramVec,
     pub backend_errors: IntCounterVec,
     pub handler_time: HistogramVec,
@@ -158,9 +158,10 @@ pub fn rpc_metrics() -> &'static RpcMetrics {
             "Program accounts cache filled while waiting for response"
         )
         .unwrap(),
-        response_uncacheable: register_int_counter!(
+        response_uncacheable: register_int_counter_vec!(
             "response_uncacheable",
-            "Could not cache response"
+            "Could not cache response",
+            &["type", "reason"]
         )
         .unwrap(),
         backend_response_time: register_histogram_vec!(
