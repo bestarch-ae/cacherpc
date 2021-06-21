@@ -579,6 +579,8 @@ fn delay_queue<T: Clone + std::hash::Hash + Eq>() -> (DelayQueueHandle<T>, impl 
                             DelayQueueCommand::Reset(item, time) => {
                                 if let Some(key) = map.remove(&item) {
                                     delay_queue.reset_at(&key, time);
+                                } else {
+                                    map.insert(item.clone(), delay_queue.insert_at(item, time));
                                 }
                             }
                         }
@@ -588,7 +590,9 @@ fn delay_queue<T: Clone + std::hash::Hash + Eq>() -> (DelayQueueHandle<T>, impl 
                 }
                 out = delay_queue.next(), if !delay_queue.is_empty() => {
                     if let Some(Ok(out)) = out {
-                        stream.send(out.into_inner()).await;
+                        let item = out.into_inner();
+                        map.remove(&item);
+                        stream.send(item).await;
                     }
                 }
             }
