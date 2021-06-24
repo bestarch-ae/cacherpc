@@ -23,7 +23,7 @@ use crate::accounts::{AccountCommand, AccountUpdateManager, Subscription};
 use crate::metrics::rpc_metrics as metrics;
 use crate::types::{
     AccountContext, AccountData, AccountInfo, AccountState, AccountsDb, Commitment, Encoding,
-    ProgramAccountsDb, Pubkey, SolanaContext,
+    Filter, ProgramAccountsDb, Pubkey, SolanaContext,
 };
 
 const BODY_LIMIT: usize = 1024 * 1024 * 100;
@@ -189,15 +189,11 @@ impl State {
         &self,
         subscription: Subscription,
         commitment: Commitment,
-        data_size: Option<u64>,
+        filters: Option<SmallVec<[Filter; 2]>>,
     ) {
         let res = self
             .actor
-            .send(AccountCommand::Subscribe(
-                subscription,
-                commitment,
-                data_size,
-            ))
+            .send(AccountCommand::Subscribe(subscription, commitment, filters))
             .await;
         if let Err(err) = res {
             error!(error = %err, message = "error sending command to actor");
@@ -690,56 +686,16 @@ enum ProgramAccountsResponseError {
 }
 
 #[derive(Deserialize, Debug)]
-#[serde(rename_all = "camelCase")]
-enum Filter<'a> {
-    Memcmp {
-        offset: usize,
-        #[serde(borrow)]
-        bytes: &'a str,
-    },
-    DataSize(u64),
-}
-
-impl<'a> Filter<'a> {
-    fn matches(&self, data: &AccountData) -> bool {
-        match *self {
-            Filter::DataSize(len) => data.data.len() as u64 == len,
-            Filter::Memcmp { offset, bytes } => {
-                // data to match, as base-58 encoded string and limited to less than 129 bytes
-                let mut buf = [0u8; 128];
-
-                // see rpc_filter.rs, same behaviour
-                let len = match bs58::decode(bytes).into(&mut buf) {
-                    Ok(len) => len,
-                    Err(_) => {
-                        return false;
-                    }
-                };
-                match data.data.get(offset..offset + len) {
-                    Some(slice) => slice == &buf[..len],
-                    None => false,
-                }
-            }
-        }
-    }
-
-    fn is_data_size(&self) -> bool {
-        matches!(self, Filter::DataSize(_))
-    }
-}
-
-#[derive(Deserialize, Debug)]
-struct ProgramAccountsConfig<'a> {
+struct ProgramAccountsConfig {
     #[serde(default = "Encoding::default")]
     encoding: Encoding,
     commitment: Option<Commitment>,
     #[serde(rename = "dataSlice")]
     data_slice: Option<Slice>,
-    #[serde(borrow)]
-    filters: Option<SmallVec<[Filter<'a>; 2]>>,
+    filters: Option<SmallVec<[Filter; 2]>>,
 }
 
-impl<'a> Default for ProgramAccountsConfig<'a> {
+impl Default for ProgramAccountsConfig {
     fn default() -> Self {
         ProgramAccountsConfig {
             encoding: Encoding::Default,
@@ -753,7 +709,7 @@ impl<'a> Default for ProgramAccountsConfig<'a> {
 fn program_accounts_response<'a>(
     req_id: Id<'a>,
     accounts: &HashSet<Pubkey>,
-    config: &'a ProgramAccountsConfig<'_>,
+    config: &'_ ProgramAccountsConfig,
     app_state: &web::Data<State>,
 ) -> Result<HttpResponse, ProgramAccountsResponseError> {
     struct Encode<'a, K> {
@@ -880,7 +836,7 @@ async fn get_program_accounts(
             })
         }
     };
-    let config: ProgramAccountsConfig<'_> = {
+    let config: ProgramAccountsConfig = {
         if let Some(param) = params.get(1) {
             serde_json::from_str(param.get()).map_err(|err| Error::InvalidParam {
                 req_id: req.id.clone(),
@@ -899,20 +855,17 @@ async fn get_program_accounts(
 
     let mut cacheable_for_key = Some(pubkey);
 
-    let uncacheable_filters = config
-        .filters
-        .as_ref()
-        .map(|fs| fs.iter().any(|f| !f.is_data_size()))
-        .unwrap_or(false);
-    let data_size_filter = config.filters.as_ref().and_then(|fs| {
-        fs.iter().find_map(|filter| match filter {
-            Filter::DataSize(len) => Some(*len),
-            _ => None,
-        })
-    });
+    let filters: Option<SmallVec<[Filter; 2]>> = if let Some(filters) = &config.filters {
+        let mut filters = filters.clone();
+        filters.sort_unstable();
+        Some(filters)
+    } else {
+        None
+    };
+    let uncacheable_filters = false; // TODO
 
     if config.encoding != Encoding::JsonParsed {
-        match app_state.program_accounts.get(&pubkey, data_size_filter) {
+        match app_state.program_accounts.get(&pubkey, filters.clone()) {
             Some(data) => {
                 let accounts = data.value();
                 if let Some(accounts) = accounts.get(config.commitment.unwrap_or_default()) {
@@ -942,7 +895,7 @@ async fn get_program_accounts(
                     .subscribe(
                         Subscription::Program(pubkey),
                         config.commitment.unwrap_or_default(),
-                        data_size_filter,
+                        filters.clone(),
                     )
                     .await;
             }
@@ -973,7 +926,7 @@ async fn get_program_accounts(
             }
             _ = notified => {
                 if let Some(program_pubkey) = cacheable_for_key {
-                    if let Some(data) = app_state.program_accounts.get(&program_pubkey, data_size_filter) {
+                    if let Some(data) = app_state.program_accounts.get(&program_pubkey, filters.clone()) {
                         let data = data.value();
                         metrics().program_accounts_cache_filled.inc();
                         if let Some(accounts) = data.get(config.commitment.unwrap_or_default()) {
@@ -1031,7 +984,7 @@ async fn get_program_accounts(
                     program_pubkey,
                     keys,
                     config.commitment.unwrap_or_default(),
-                    data_size_filter,
+                    filters,
                 );
                 app_state.map_updated.notify();
             }

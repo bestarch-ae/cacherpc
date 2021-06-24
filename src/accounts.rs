@@ -5,6 +5,7 @@ use actix::io::SinkWrite;
 use actix::prelude::{Actor, Addr, Context, Handler, Message, Running, StreamHandler};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
+use smallvec::SmallVec;
 use tokio::stream::{Stream, StreamExt};
 use tokio::sync::mpsc;
 use tokio::time::{DelayQueue, Instant};
@@ -12,8 +13,8 @@ use tracing::{error, info, warn};
 
 use crate::metrics::pubsub_metrics as metrics;
 use crate::types::{
-    AccountContext, AccountInfo, AccountsDb, Commitment, Encoding, ProgramAccountsDb, Pubkey,
-    SolanaContext,
+    AccountContext, AccountInfo, AccountsDb, Commitment, Encoding, Filter, ProgramAccountsDb,
+    Pubkey, SolanaContext,
 };
 
 const MAILBOX_CAPACITY: usize = 512;
@@ -44,7 +45,7 @@ pub(crate) struct AccountUpdateManager {
     accounts: AccountsDb,
     program_accounts: ProgramAccountsDb,
     purge_queue: DelayQueueHandle<Subscription>,
-    additional_keys: HashMap<Pubkey, HashSet<Option<u64>>>,
+    additional_keys: HashMap<Pubkey, HashSet<SmallVec<[Filter; 2]>>>,
 }
 
 impl std::fmt::Debug for AccountUpdateManager {
@@ -246,14 +247,13 @@ impl Handler<AccountCommand> for AccountUpdateManager {
         let _ = (|| -> Result<(), serde_json::Error> {
             let request_id = self.next_request_id();
             match item {
-                AccountCommand::Subscribe(sub, commitment, data_size) => {
+                AccountCommand::Subscribe(sub, commitment, filters) => {
                     let key = sub.key();
                     metrics().commands.with_label_values(&["subscribe"]).inc();
                     self.subscribe(sub, commitment)?;
-                    self.additional_keys
-                        .entry(key)
-                        .or_default()
-                        .insert(data_size);
+                    if let Some(filters) = filters {
+                        self.additional_keys.entry(key).or_default().insert(filters);
+                    }
                 }
                 AccountCommand::Purge(sub) => {
                     metrics().commands.with_label_values(&["purge"]).inc();
@@ -289,11 +289,11 @@ impl Handler<AccountCommand> for AccountUpdateManager {
                                 .remove(&key)
                                 .into_iter()
                                 .flatten()
-                                .map(|filter| (key, filter))
+                                .map(|filter| (key, Some(filter)))
                                 .chain(Some((key, None)));
                             for (key, filter) in keys {
                                 if let Some(program_accounts) =
-                                    self.program_accounts.remove(&key, filter)
+                                    self.program_accounts.remove_all(&key, filter)
                                 {
                                     for key in program_accounts.into_accounts() {
                                         self.accounts.remove(&key)
@@ -410,10 +410,22 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
                                 }
                                 let params: Params = serde_json::from_str(params.get())?;
                                 if let Some((program_sub, commitment)) = self.id_to_sub.get(&params.subscription) {
+                                    let program_key = program_sub.key();
                                     let key = params.result.value.pubkey;
+                                    let account_info = &params.result.value.account;
+                                    let data = &account_info.data;
+                                    if let Some(filters) = self.additional_keys.get(&program_key) {
+                                        for filter_group in filters {
+                                            if filter_group.iter().all(|f| f.matches(data)) {
+                                                self.program_accounts.add(&program_key, params.result.value.pubkey, Some(filter_group.clone()), *commitment);
+                                            } else {
+                                                self.program_accounts.remove(&program_key, &params.result.value.pubkey, filter_group.clone(), *commitment);
+                                            }
+                                        }
+                                    }
                                     self.accounts.insert(key, AccountContext {
                                         value: Some(params.result.value.account), context: params.result.context }, *commitment);
-                                    self.program_accounts.add(&program_sub.key(), params.result.value.pubkey, *commitment);
+                                    self.program_accounts.add(&program_key, params.result.value.pubkey, None, *commitment);
                                 } else {
                                     warn!(message = "unknown subscription", sub = params.subscription);
                                 }
@@ -533,7 +545,7 @@ impl std::fmt::Display for Subscription {
 #[derive(Message, Debug)]
 #[rtype(result = "()")]
 pub(crate) enum AccountCommand {
-    Subscribe(Subscription, Commitment, Option<u64>),
+    Subscribe(Subscription, Commitment, Option<SmallVec<[Filter; 2]>>),
     Reset(Subscription),
     Purge(Subscription),
 }
