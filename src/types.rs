@@ -5,6 +5,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use dashmap::{mapref::one::Ref, DashMap};
 use serde::{Deserialize, Serialize};
+use smallvec::{smallvec, SmallVec};
 
 pub(crate) struct ProgramState([Option<HashSet<Pubkey>>; 3]);
 
@@ -32,6 +33,12 @@ impl ProgramState {
             self.insert(commitment, set);
         }
     }
+
+    fn remove(&mut self, commitment: Commitment, data: &Pubkey) {
+        if let Some(ref mut keys) = (self.0)[commitment.as_idx()] {
+            keys.remove(data);
+        }
+    }
 }
 
 impl Default for ProgramState {
@@ -40,9 +47,11 @@ impl Default for ProgramState {
     }
 }
 
+type ProgramAccountsKey = (Pubkey, Option<SmallVec<[Filter; 2]>>);
+
 #[derive(Clone)]
 pub(crate) struct ProgramAccountsDb {
-    map: Arc<DashMap<(Pubkey, Option<u64>), ProgramState>>,
+    map: Arc<DashMap<ProgramAccountsKey, ProgramState>>,
 }
 
 impl ProgramAccountsDb {
@@ -55,9 +64,9 @@ impl ProgramAccountsDb {
     pub fn get(
         &self,
         key: &Pubkey,
-        data_size: Option<u64>,
-    ) -> Option<Ref<'_, (Pubkey, Option<u64>), ProgramState>> {
-        if let Some(found) = self.map.get(&(*key, data_size)) {
+        filters: Option<SmallVec<[Filter; 2]>>,
+    ) -> Option<Ref<'_, ProgramAccountsKey, ProgramState>> {
+        if let Some(found) = self.map.get(&(*key, filters)) {
             Some(found)
         } else {
             self.map.get(&(*key, None))
@@ -69,20 +78,49 @@ impl ProgramAccountsDb {
         key: Pubkey,
         data: HashSet<Pubkey>,
         commitment: Commitment,
-        data_size: Option<u64>,
+        filters: Option<SmallVec<[Filter; 2]>>,
     ) {
-        let mut entry = self.map.entry((key, data_size)).or_default();
+        let mut entry = self.map.entry((key, filters)).or_default();
         entry.insert(commitment, data);
     }
 
-    pub fn add(&self, key: &Pubkey, data: Pubkey, commitment: Commitment) {
+    pub fn add(
+        &self,
+        key: &Pubkey,
+        data: Pubkey,
+        filters: Option<SmallVec<[Filter; 2]>>,
+        commitment: Commitment,
+    ) {
+        // add to global
         if let Some(mut state) = self.map.get_mut(&(*key, None)) {
             state.add(commitment, data);
         }
+        // add with filter
+        if filters.is_some() {
+            if let Some(mut state) = self.map.get_mut(&(*key, filters)) {
+                state.add(commitment, data);
+            }
+        }
     }
 
-    pub fn remove(&self, key: &Pubkey, data_size: Option<u64>) -> Option<ProgramState> {
-        self.map.remove(&(*key, data_size)).map(|(_, state)| state)
+    pub fn remove_all(
+        &self,
+        key: &Pubkey,
+        filters: Option<SmallVec<[Filter; 2]>>,
+    ) -> Option<ProgramState> {
+        self.map.remove(&(*key, filters)).map(|(_, state)| state)
+    }
+
+    pub fn remove(
+        &self,
+        program_key: &Pubkey,
+        account_key: &Pubkey,
+        filters: SmallVec<[Filter; 2]>,
+        commitment: Commitment,
+    ) {
+        if let Some(mut accounts) = self.map.get_mut(&(*program_key, Some(filters))) {
+            accounts.value_mut().remove(commitment, account_key);
+        }
     }
 }
 
@@ -312,6 +350,62 @@ impl<'de> Deserialize<'de> for Pubkey {
         }
 
         deserializer.deserialize_str(PubkeyVisitor)
+    }
+}
+
+#[derive(Deserialize, Debug, Hash, Eq, PartialEq, Clone, Ord, PartialOrd)]
+#[serde(rename_all = "camelCase")]
+pub enum Filter {
+    Memcmp {
+        offset: usize,
+        #[serde(deserialize_with = "decode_base58")]
+        bytes: SmallVec<[u8; 128]>,
+    },
+    DataSize(u64),
+}
+
+fn decode_base58<'de, D>(de: D) -> Result<SmallVec<[u8; 128]>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct Base58Visitor;
+    impl<'de> serde::de::Visitor<'de> for Base58Visitor {
+        type Value = SmallVec<[u8; 128]>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("string")
+        }
+
+        fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            use serde::de::Error;
+            let mut buf = smallvec![0; 128];
+            let len = bs58::decode(v)
+                .into(&mut buf)
+                .map_err(|_| Error::custom("can't b58decode"))?;
+            if len > 128 {
+                return Err(Error::custom("bad size"));
+            }
+            Ok(buf)
+        }
+    }
+    de.deserialize_str(Base58Visitor)
+}
+
+impl Filter {
+    pub(crate) fn matches(&self, data: &AccountData) -> bool {
+        match self {
+            Filter::DataSize(len) => data.data.len() as u64 == *len,
+            Filter::Memcmp { offset, bytes } => {
+                let len = bytes.len();
+                match data.data.get(*offset..*offset + len) {
+                    Some(slice) => slice == &bytes[..len],
+                    None => false,
+                }
+            }
+        }
     }
 }
 
