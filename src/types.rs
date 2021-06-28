@@ -388,6 +388,7 @@ where
             if len > 128 {
                 return Err(Error::custom("bad size"));
             }
+            buf.truncate(len);
             Ok(buf)
         }
     }
