@@ -6,6 +6,7 @@ use std::time::Duration;
 use actix_cors::Cors;
 use actix_web::{web, App, HttpServer};
 use awc::Client;
+use either::Either;
 use lru::LruCache;
 use structopt::StructOpt;
 use tokio::sync::{Notify, Semaphore};
@@ -71,6 +72,8 @@ struct Options {
         help = "one of: 'plain', 'json'"
     )]
     log_format: LogFormat,
+    #[structopt(long = "log-file", help = "file path")]
+    log_file: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug)]
@@ -99,17 +102,24 @@ impl std::str::FromStr for LogFormat {
 async fn main() {
     let options = Options::from_args();
 
+    let writer = match &options.log_file {
+        Some(path) => Either::Left(file_reopen::File::open(path).unwrap()),
+        None => Either::Right(std::io::stdout()),
+    };
+    let (writer, _guard) = tracing_appender::non_blocking(writer);
+
     match options.log_format {
         LogFormat::Json => {
             let subscriber = fmt::Subscriber::builder()
                 .with_thread_names(true)
+                .with_writer(writer)
                 .with_timer(fmt::time::ChronoLocal::rfc3339())
                 .json()
                 .finish();
             tracing::subscriber::set_global_default(subscriber).unwrap();
         }
         LogFormat::Plain => {
-            let subscriber = fmt::Subscriber::builder().finish();
+            let subscriber = fmt::Subscriber::builder().with_writer(writer).finish();
             tracing::subscriber::set_global_default(subscriber).unwrap();
         }
     };
