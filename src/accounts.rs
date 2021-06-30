@@ -257,7 +257,7 @@ impl Handler<AccountCommand> for AccountUpdateManager {
                 }
                 AccountCommand::Purge(sub) => {
                     metrics().commands.with_label_values(&["purge"]).inc();
-                    info!(message = "purging", sub = ?sub);
+                    info!(message = "purging", sub = ?sub, key = %sub.key());
 
                     #[derive(Serialize)]
                     struct Request<'a> {
@@ -589,7 +589,7 @@ fn delay_queue<T: Clone + std::hash::Hash + Eq>() -> (DelayQueueHandle<T>, impl 
                                 map.insert(item.clone(), delay_queue.insert_at(item, time));
                             },
                             DelayQueueCommand::Reset(item, time) => {
-                                if let Some(key) = map.remove(&item) {
+                                if let Some(key) = map.get(&item) {
                                     delay_queue.reset_at(&key, time);
                                 } else {
                                     map.insert(item.clone(), delay_queue.insert_at(item, time));
