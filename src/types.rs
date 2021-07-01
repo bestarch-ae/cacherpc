@@ -122,6 +122,10 @@ impl ProgramAccountsDb {
             accounts.value_mut().remove(commitment, account_key);
         }
     }
+
+    pub fn clear(&self) {
+        self.map.clear()
+    }
 }
 
 #[derive(Clone)]

@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -132,9 +132,14 @@ async fn main() {
 async fn run(options: Options) {
     let accounts = AccountsDb::new();
     let program_accounts = ProgramAccountsDb::new();
+    let connected = Arc::new(AtomicBool::new(false));
 
-    let addr =
-        AccountUpdateManager::init(accounts.clone(), program_accounts.clone(), &options.ws_url);
+    let addr = AccountUpdateManager::init(
+        accounts.clone(),
+        program_accounts.clone(),
+        Arc::clone(&connected),
+        &options.ws_url,
+    );
 
     let rpc_url = options.rpc_url;
     let notify = Arc::new(Notify::new());
@@ -151,7 +156,6 @@ async fn run(options: Options) {
             .timeout(Duration::from_secs(60))
             .connector(
                 awc::Connector::new()
-                    .max_http_version(awc::http::Version::HTTP_11)
                     .limit(connection_limit)
                     //.conn_keep_alive(Duration::from_secs(0))
                     //.conn_lifetime(Duration::from_secs(0))
@@ -172,6 +176,7 @@ async fn run(options: Options) {
                 let id = worker_id_counter.fetch_add(1, Ordering::SeqCst);
                 format!("rpc-{}", id)
             },
+            connected: Arc::clone(&connected),
         };
         let cors = Cors::default()
             .allow_any_origin()

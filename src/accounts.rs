@@ -1,8 +1,14 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::Duration;
 
 use actix::io::SinkWrite;
+use actix::prelude::AsyncContext;
 use actix::prelude::{Actor, Addr, Context, Handler, Message, Running, StreamHandler};
+use actix::SpawnHandle;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use smallvec::SmallVec;
@@ -19,6 +25,7 @@ use crate::types::{
 
 const MAILBOX_CAPACITY: usize = 512;
 const PURGE_TIMEOUT: Duration = Duration::from_secs(600);
+const WEBSOCKET_PING_TIMEOUT: Duration = Duration::from_secs(10);
 
 enum InflightRequest {
     Sub(Subscription, Commitment),
@@ -41,11 +48,13 @@ pub(crate) struct AccountUpdateManager {
     subs: HashSet<(Subscription, Commitment)>,
     id_to_sub: HashMap<u64, (Subscription, Commitment)>,
     sub_to_id: HashMap<Subscription, u64>,
-    sink: Option<WsSink>,
+    connection: Option<(WsSink, SpawnHandle)>,
     accounts: AccountsDb,
     program_accounts: ProgramAccountsDb,
     purge_queue: DelayQueueHandle<Subscription>,
     additional_keys: HashMap<Pubkey, HashSet<SmallVec<[Filter; 2]>>>,
+    last_pong: Instant,
+    connected: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for AccountUpdateManager {
@@ -58,6 +67,7 @@ impl AccountUpdateManager {
     pub fn init(
         accounts: AccountsDb,
         program_accounts: ProgramAccountsDb,
+        connected: Arc<AtomicBool>,
         websocket_url: &str,
     ) -> Addr<Self> {
         AccountUpdateManager::create(|ctx| {
@@ -66,10 +76,22 @@ impl AccountUpdateManager {
 
             ctx.set_mailbox_capacity(MAILBOX_CAPACITY);
 
+            ctx.run_interval(Duration::from_secs(1), |actor, ctx| {
+                if actor.connected.load(Ordering::Relaxed) {
+                    if let Some((sink, _)) = &mut actor.connection {
+                        sink.write(awc::ws::Message::Ping(b"hello?".as_ref().into()));
+                    }
+                    if actor.last_pong.elapsed() > WEBSOCKET_PING_TIMEOUT {
+                        warn!("websocket pong not received in time, assume connection lost");
+                        <Self as StreamHandler<awc::ws::Frame>>::finished(actor, ctx);
+                    }
+                }
+            });
+
             AccountUpdateManager::add_stream(purge_stream, ctx);
             AccountUpdateManager {
                 websocket_url: websocket_url.to_owned(),
-                sink: None,
+                connection: None,
                 id_to_sub: HashMap::default(),
                 sub_to_id: HashMap::default(),
                 inflight: HashMap::default(),
@@ -79,6 +101,8 @@ impl AccountUpdateManager {
                 program_accounts: program_accounts.clone(),
                 purge_queue: handle,
                 additional_keys: HashMap::default(),
+                connected,
+                last_pong: Instant::now(),
             }
         })
     }
@@ -90,7 +114,7 @@ impl AccountUpdateManager {
     }
 
     fn send<T: Serialize>(&mut self, request: &T) -> Result<(), serde_json::Error> {
-        if let Some(sink) = &mut self.sink {
+        if let Some((sink, _)) = &mut self.connection {
             sink.write(awc::ws::Message::Text(serde_json::to_string(request)?));
         } else {
             warn!("no sink");
@@ -100,7 +124,6 @@ impl AccountUpdateManager {
 
     fn connect(&self, ctx: &mut Context<Self>) {
         use actix::fut::{ActorFuture, WrapFuture};
-        use actix::prelude::AsyncContext;
         use backoff::backoff::Backoff;
 
         let websocket_url = self.websocket_url.clone();
@@ -145,8 +168,15 @@ impl AccountUpdateManager {
                     .filter_map(Result::ok),
             );
             let sink = SinkWrite::new(sink, ctx);
-            AccountUpdateManager::add_stream(stream, ctx);
-            actor.sink = Some(sink);
+            let stream_handle = AccountUpdateManager::add_stream(stream, ctx);
+            actor.last_pong = Instant::now();
+
+            if let Some((_, handle)) =
+                std::mem::replace(&mut actor.connection, Some((sink, stream_handle)))
+            {
+                // stop old stream
+                ctx.cancel_future(handle);
+            }
             metrics().websocket_connected.set(1);
         });
         ctx.wait(fut);
@@ -325,9 +355,12 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
             use awc::ws::Frame;
             match item {
                 Frame::Ping(data) => {
-                    if let Some(sink) = &mut self.sink {
+                    if let Some((sink, _)) = &mut self.connection {
                         sink.write(awc::ws::Message::Pong(data));
                     }
+                }
+                Frame::Pong(_) => {
+                    self.last_pong = Instant::now();
                 }
                 Frame::Text(text) => {
                     #[derive(Deserialize)]
@@ -454,7 +487,7 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
         });
     }
 
-    fn started(&mut self, _: &mut Context<Self>) {
+    fn started(&mut self, _ctx: &mut Context<Self>) {
         info!("websocket connected");
         // subscribe to slots
         let request_id = self.next_request_id();
@@ -476,17 +509,21 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
             // TODO: it would be nice to retrieve current state for
             // everything we had before
         }
+        self.connected.store(true, Ordering::Relaxed);
     }
 
     fn finished(&mut self, ctx: &mut Context<Self>) {
         info!("websocket disconnected");
         metrics().websocket_connected.set(0);
+        self.connected.store(false, Ordering::Relaxed);
+
         self.inflight.clear();
         self.id_to_sub.clear();
         self.sub_to_id.clear();
 
-        info!("clearing db");
+        info!("purging all caches");
         self.accounts.clear();
+        self.program_accounts.clear();
 
         self.connect(ctx);
     }

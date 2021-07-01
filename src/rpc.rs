@@ -1,7 +1,10 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::Duration;
 
 use actix::prelude::Addr;
@@ -170,6 +173,7 @@ pub(crate) struct State {
     pub program_accounts_request_limit: Arc<Semaphore>,
     pub lru: RefCell<LruCache<u64, Box<RawValue>>>,
     pub worker_id: String,
+    pub connected: Arc<AtomicBool>,
 }
 
 impl State {
@@ -183,6 +187,10 @@ impl State {
 
     fn insert(&self, key: Pubkey, data: AccountContext, commitment: Commitment) {
         self.accounts.insert(key, data, commitment)
+    }
+
+    fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::Relaxed)
     }
 
     async fn subscribe(
@@ -550,7 +558,7 @@ async fn get_account_info(
     let mut cacheable_for_key = Some(pubkey);
 
     // pass through for JsonParsed as we don't support it yet
-    if config.encoding != Encoding::JsonParsed {
+    if config.encoding != Encoding::JsonParsed && app_state.is_connected() {
         match app_state.get_account(&pubkey) {
             Some(data) => {
                 let data = data.value();
@@ -862,9 +870,8 @@ async fn get_program_accounts(
     } else {
         None
     };
-    let uncacheable_filters = false; // TODO
 
-    if config.encoding != Encoding::JsonParsed {
+    if config.encoding != Encoding::JsonParsed && app_state.is_connected() {
         match app_state.program_accounts.get(&pubkey, filters.clone()) {
             Some(data) => {
                 let accounts = data.value();
@@ -878,11 +885,10 @@ async fn get_program_accounts(
                 }
             }
             None => {
-                let reason = match (config.data_slice.is_some(), uncacheable_filters) {
-                    (true, true) => Some("data_slice_and_filters"),
-                    (true, false) => Some("data_slice"),
-                    (false, true) => Some("filters"),
-                    (false, false) => None,
+                let reason = if config.data_slice.is_some() {
+                    Some("data_slice")
+                } else {
+                    None
                 };
                 if let Some(reason) = reason {
                     metrics()
