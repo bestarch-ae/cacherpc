@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use actix_cors::Cors;
 use actix_web::{web, App, HttpServer};
+use anyhow::{Context, Result};
 use awc::Client;
 use either::Either;
 use lru::LruCache;
@@ -99,11 +100,14 @@ impl std::str::FromStr for LogFormat {
 }
 
 #[actix_web::main]
-async fn main() {
+async fn main() -> Result<()> {
     let options = Options::from_args();
 
     let writer = match &options.log_file {
-        Some(path) => Either::Left(file_reopen::File::open(path).unwrap()),
+        Some(path) => Either::Left(
+            file_reopen::File::open(path)
+                .with_context(|| format!("Can't open log file `{}`", path.display()))?,
+        ),
         None => Either::Right(std::io::stdout()),
     };
     let (writer, _guard) = tracing_appender::non_blocking(writer);
@@ -126,10 +130,11 @@ async fn main() {
 
     info!(?options, "configuration options");
 
-    run(options).await;
+    run(options).await?;
+    Ok(())
 }
 
-async fn run(options: Options) {
+async fn run(options: Options) -> Result<()> {
     let accounts = AccountsDb::new();
     let program_accounts = ProgramAccountsDb::new();
     let connected = Arc::new(AtomicBool::new(false));
@@ -148,17 +153,12 @@ async fn run(options: Options) {
         Arc::new(Semaphore::new(options.program_accounts_request_limit));
     let body_cache_size = options.body_cache_size;
     let worker_id_counter = Arc::new(AtomicUsize::new(0));
+    let bind_addr = &options.addr;
 
     HttpServer::new(move || {
         let client = Client::builder()
             .timeout(Duration::from_secs(60))
-            .connector(
-                awc::Connector::new()
-                    //.limit(connection_limit)
-                    //.conn_keep_alive(Duration::from_secs(0))
-                    //.conn_lifetime(Duration::from_secs(0))
-                    .finish(),
-            )
+            .connector(awc::Connector::new().finish())
             .finish();
         let state = rpc::State {
             accounts: accounts.clone(),
@@ -186,9 +186,9 @@ async fn run(options: Options) {
             .service(web::resource("/").route(web::post().to(rpc::rpc_handler)))
             .service(web::resource("/metrics").route(web::get().to(rpc::metrics_handler)))
     })
-    .bind(options.addr)
-    .unwrap()
+    .bind(bind_addr)
+    .with_context(|| format!("failed to bind to {}", bind_addr))?
     .run()
     .await
-    .unwrap();
+    .with_context(|| "failed to start http server")
 }
