@@ -143,8 +143,6 @@ async fn run(options: Options) {
 
     let rpc_url = options.rpc_url;
     let notify = Arc::new(Notify::new());
-    let connection_limit =
-        options.account_info_request_limit + options.program_accounts_request_limit;
     let account_info_request_limit = Arc::new(Semaphore::new(options.account_info_request_limit));
     let program_accounts_request_limit =
         Arc::new(Semaphore::new(options.program_accounts_request_limit));
@@ -156,7 +154,7 @@ async fn run(options: Options) {
             .timeout(Duration::from_secs(60))
             .connector(
                 awc::Connector::new()
-                    .limit(connection_limit)
+                    //.limit(connection_limit)
                     //.conn_keep_alive(Duration::from_secs(0))
                     //.conn_lifetime(Duration::from_secs(0))
                     .finish(),

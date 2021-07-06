@@ -1,7 +1,8 @@
 use once_cell::sync::Lazy;
 use prometheus::{
-    register_histogram_vec, register_int_counter, register_int_counter_vec, register_int_gauge,
-    register_int_gauge_vec, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec,
+    register_histogram, register_histogram_vec, register_int_counter, register_int_counter_vec,
+    register_int_gauge, register_int_gauge_vec, Histogram, HistogramVec, IntCounter, IntCounterVec,
+    IntGauge, IntGaugeVec,
 };
 
 pub struct PubSubMetrics {
@@ -49,6 +50,10 @@ pub struct RpcMetrics {
     pub response_size_bytes: HistogramVec,
     pub lru_cache_hits: IntCounter,
     pub lru_cache_filled: IntGaugeVec,
+    pub passthrough_total_time: Histogram,
+    pub passthrough_request_time: Histogram,
+    pub passthrough_forward_response_time: Histogram,
+    pub passthrough_errors: IntCounter,
 }
 
 impl RpcMetrics {
@@ -190,6 +195,26 @@ pub fn rpc_metrics() -> &'static RpcMetrics {
                 0.0, 1024.0, 4096.0, 16384.0, 65536.0, 524288.0, 1048576.0, 4194304.0, 10485760.0,
                 20971520.0
             ]
+        )
+        .unwrap(),
+        passthrough_errors: register_int_counter!(
+            "passthrough_errors",
+            "Errors while processing passthrough requests"
+        )
+        .unwrap(),
+        passthrough_forward_response_time: register_histogram!(
+            "passthrough_forward_response_time",
+            "Time to forward response"
+        )
+        .unwrap(),
+        passthrough_total_time: register_histogram!(
+            "passthrough_total_time",
+            "Total time to process passthrough request"
+        )
+        .unwrap(),
+        passthrough_request_time: register_histogram!(
+            "passthrough_request_time",
+            "Time to send passthrough request"
         )
         .unwrap(),
     });
