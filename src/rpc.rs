@@ -1057,29 +1057,39 @@ pub(crate) async fn rpc_handler(
     let stream = stream_generator::generate_stream(move |mut stream| async move {
         use tokio::stream::StreamExt;
         let mut backoff = backoff_settings();
+        let total = metrics().passthrough_total_time.start_timer();
         loop {
+            let request_time = metrics().passthrough_request_time.start_timer();
             let resp = client
                 .post(&url)
                 .content_type("application/json")
                 .send_body(body.clone())
                 .await;
+            request_time.observe_duration();
             match resp {
                 Ok(mut resp) => {
+                    let forward_response_time =
+                        metrics().passthrough_forward_response_time.start_timer();
                     while let Some(chunk) = resp.next().await {
                         stream.send(chunk).await;
                     }
-                    return;
+                    forward_response_time.observe_duration();
+                    break;
                 }
-                Err(err) => match backoff.next_backoff() {
-                    Some(duration) => tokio::time::delay_for(duration).await,
-                    None => {
-                        warn!("request error: {:?}", err);
-                        // TODO: return error
-                        return;
+                Err(err) => {
+                    metrics().passthrough_errors.inc();
+                    match backoff.next_backoff() {
+                        Some(duration) => tokio::time::delay_for(duration).await,
+                        None => {
+                            warn!("request error: {:?}", err);
+                            // TODO: return error
+                            break;
+                        }
                     }
-                },
+                }
             }
         }
+        total.observe_duration();
     });
 
     Ok(HttpResponse::Ok()
