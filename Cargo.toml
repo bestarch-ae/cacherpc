@@ -30,6 +30,7 @@ base64 = "0.13"
 zstd = "0.8"
 smallvec = { version = "1.6", features = ["serde", "union"] }
 thiserror = "1.0"
+anyhow = "1.0"
 prometheus = { version = "0.12", default-features = false, features = ["process"] }
 once_cell = "1.7"
 lru = "0.6"
