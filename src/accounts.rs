@@ -350,7 +350,7 @@ impl Handler<AccountCommand> for AccountUpdateManager {
 }
 
 impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
-    fn handle(&mut self, item: awc::ws::Frame, _ctx: &mut Context<Self>) {
+    fn handle(&mut self, item: awc::ws::Frame, ctx: &mut Context<Self>) {
         let _ = (|| -> Result<(), serde_json::Error> {
             use awc::ws::Frame;
             match item {
@@ -363,7 +363,7 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
                     self.last_pong = Instant::now();
                 }
                 Frame::Text(text) => {
-                    #[derive(Deserialize)]
+                    #[derive(Deserialize, Debug)]
                     struct AnyMessage<'a> {
                         #[serde(borrow)]
                         result: Option<&'a RawValue>,
@@ -374,8 +374,9 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
                         params: Option<&'a RawValue>,
                     }
                     let value: AnyMessage<'_> = serde_json::from_slice(&text)?;
-                    // subscription response
-                    if let (Some(result), Some(id)) = (value.result, value.id) {
+                    match value {
+                        // subscription response
+                        AnyMessage { result: Some(result), id: Some(id), .. } => {
                         if let Some(req) = self.inflight.remove(&id) {
                             match req {
                                 InflightRequest::Sub(sub, commitment) => {
@@ -386,18 +387,23 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
                                     metrics().subscriptions_active.inc();
                                 }
                                 InflightRequest::Unsub(sub) => {
-                                    //let _is_ok: bool = serde_json::from_str(result.get()).unwrap();
-                                    if let Some(sub_id) = self.sub_to_id.remove(&sub) {
-                                        if let Some(val) = self.id_to_sub.remove(&sub_id) {
-                                            self.subs.remove(&val);
+                                    let is_ok: bool = serde_json::from_str(result.get())?;
+                                    if is_ok {
+                                        if let Some(sub_id) = self.sub_to_id.remove(&sub) {
+                                            if let Some(val) = self.id_to_sub.remove(&sub_id) {
+                                                self.subs.remove(&val);
+                                            }
+                                            info!(
+                                                message = "unsubscribed from stream",
+                                                sub_id = sub_id,
+                                                key = %sub.key(),
+                                                sub = %sub,
+                                            );
                                         }
-                                        info!(
-                                            message = "unsubscribed from stream",
-                                            sub_id = sub_id,
-                                            sub= %sub,
-                                        );
+                                        metrics().subscriptions_active.dec();
+                                    } else {
+                                        warn!(message = "unsubscribe failed", key = %sub.key());
                                     }
-                                    metrics().subscriptions_active.dec();
                                 }
                                 InflightRequest::SlotSub(_) => {
                                     info!(message = "subscribed to root");
@@ -407,9 +413,8 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
 
                         // TODO: method response
                         return Ok(());
-                    };
-                    // notification
-                    if let (Some(method), Some(params)) = (value.method, value.params) {
+                    }, /* notification */
+                    AnyMessage { method: Some(method), params: Some(params), .. } => {
                         match method {
                             "accountNotification" => {
                                 #[derive(Deserialize, Debug)]
@@ -477,9 +482,22 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
                                 warn!(message = "unknown notification", method = method);
                             }
                         }
+                    },
+                    any => {
+                        warn!(message = "unidentified websocket message", msg = ?any);
                     }
                 }
-                _ => return Ok(()),
+                }
+                Frame::Close(reason) => {
+                    warn!(reason = ?reason, "websocket closing");
+                    <Self as StreamHandler<awc::ws::Frame>>::finished(self, ctx);
+                }
+                Frame::Binary(_) => {
+                    warn!("unexpected binary message");
+                }
+                Frame::Continuation(_) => {
+                    warn!("unexpected continuation message");
+                }
             }
             Ok(())
         })().map_err(|err| {
@@ -516,6 +534,8 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
         info!("websocket disconnected");
         metrics().websocket_connected.set(0);
         self.connected.store(false, Ordering::Relaxed);
+
+        self.connection = None;
 
         self.inflight.clear();
         self.id_to_sub.clear();
