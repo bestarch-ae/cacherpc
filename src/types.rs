@@ -153,7 +153,7 @@ impl Default for AccountState {
 impl AccountState {
     pub fn get(&self, commitment: Commitment) -> Option<(Option<&AccountInfo>, Slot)> {
         match &(self.0)[commitment.as_idx()] {
-            None => return None,
+            None => None,
             Some(data) => {
                 let mut result = None;
                 let mut slot = data.slot;
@@ -203,9 +203,9 @@ impl AccountsDb {
     }
 
     pub fn remove(&self, key: &Pubkey, commitment: Commitment) {
-        self.map
-            .get_mut(key)
-            .map(|mut entry| entry.remove(commitment));
+        if let Some(mut entry) = self.map.get_mut(key) {
+            entry.remove(commitment)
+        }
     }
 
     fn update_slot(&self, commitment: Commitment, val: u64) {
