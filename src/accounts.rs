@@ -91,20 +91,12 @@ impl AccountUpdateManager {
             });
 
             ctx.run_interval(Duration::from_secs(5), |actor, _ctx| {
-                let subs = &mut actor.subs;
-
                 actor.inflight.retain(|request_id, (req, time)| {
                     let elapsed = time.elapsed();
                     let too_long = elapsed > IN_FLIGHT_TIMEOUT;
                     if too_long {
                         warn!(request_id, request = ?req, timeout = ?IN_FLIGHT_TIMEOUT,
                             elapsed = ?elapsed, "request in flight too long, assume dead");
-                        match req {
-                            InflightRequest::Sub(sub, comm) | InflightRequest::Unsub(sub, comm) => {
-                                subs.remove(&(*sub, *comm));
-                            }
-                            _ => {}
-                        }
                     }
                     !too_long
                 })
@@ -409,9 +401,28 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
                         id: Option<u64>,
                         #[serde(borrow)]
                         params: Option<&'a RawValue>,
+                        #[serde(borrow)]
+                        error: Option<&'a RawValue>,
                     }
                     let value: AnyMessage<'_> = serde_json::from_slice(&text)?;
                     match value {
+                        // subscription error
+                        AnyMessage { error: Some(error), id: Some(id), .. } => {
+                            if let Some((req, _)) = self.inflight.remove(&id) {
+                                match req {
+                                    InflightRequest::Sub(sub, commitment) => {
+                                        warn!(request_id = id, error = ?error, key = %sub.key(), commitment = ?commitment, "subscribe failed");
+                                        self.subs.remove(&(sub, commitment));
+                                    }
+                                    InflightRequest::Unsub(sub, commitment) => {
+                                        warn!(request_id = id, error = ?error, key = %sub.key(), commitment = ?commitment, "unsubscribe failed");
+                                    }
+                                    InflightRequest::SlotSub(_) => {
+                                        warn!(request_id = id, error = ?error, "slot subscribe failed");
+                                    }
+                                }
+                            }
+                        }
                         // subscription response
                         AnyMessage { result: Some(result), id: Some(id), .. } => {
                         if let Some((req, _)) = self.inflight.remove(&id) {
