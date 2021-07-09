@@ -29,7 +29,7 @@ const WEBSOCKET_PING_TIMEOUT: Duration = Duration::from_secs(10);
 
 enum InflightRequest {
     Sub(Subscription, Commitment),
-    Unsub(Subscription),
+    Unsub(Subscription, Commitment),
     SlotSub(u64),
 }
 
@@ -47,11 +47,11 @@ pub(crate) struct AccountUpdateManager {
     inflight: HashMap<u64, InflightRequest>,
     subs: HashSet<(Subscription, Commitment)>,
     id_to_sub: HashMap<u64, (Subscription, Commitment)>,
-    sub_to_id: HashMap<Subscription, u64>,
+    sub_to_id: HashMap<(Subscription, Commitment), u64>,
     connection: Option<(WsSink, SpawnHandle)>,
     accounts: AccountsDb,
     program_accounts: ProgramAccountsDb,
-    purge_queue: DelayQueueHandle<Subscription>,
+    purge_queue: DelayQueueHandle<(Subscription, Commitment)>,
     additional_keys: HashMap<Pubkey, HashSet<SmallVec<[Filter; 2]>>>,
     last_pong: Instant,
     connected: Arc<AtomicBool>,
@@ -72,7 +72,7 @@ impl AccountUpdateManager {
     ) -> Addr<Self> {
         AccountUpdateManager::create(|ctx| {
             let (handle, stream) = delay_queue();
-            let purge_stream = stream.map(AccountCommand::Purge);
+            let purge_stream = stream.map(|(sub, com)| AccountCommand::Purge(sub, com));
 
             ctx.set_mailbox_capacity(MAILBOX_CAPACITY);
 
@@ -254,7 +254,7 @@ impl AccountUpdateManager {
             .insert(request_id, InflightRequest::Sub(sub, commitment));
         self.subs.insert((sub, commitment));
         self.send(&request)?;
-        self.purge_queue.insert(sub, PURGE_TIMEOUT);
+        self.purge_queue.insert((sub, commitment), PURGE_TIMEOUT);
 
         Ok(())
     }
@@ -285,9 +285,9 @@ impl Handler<AccountCommand> for AccountUpdateManager {
                         self.additional_keys.entry(key).or_default().insert(filters);
                     }
                 }
-                AccountCommand::Purge(sub) => {
+                AccountCommand::Purge(sub, commitment) => {
                     metrics().commands.with_label_values(&["purge"]).inc();
-                    info!(message = "purging", sub = ?sub, key = %sub.key());
+                    info!(message = "purging", sub = ?sub, key = %sub.key(), commitment = ?commitment);
 
                     #[derive(Serialize)]
                     struct Request<'a> {
@@ -297,7 +297,7 @@ impl Handler<AccountCommand> for AccountUpdateManager {
                         params: [u64; 1],
                     }
 
-                    if let Some(sub_id) = self.sub_to_id.get(&sub) {
+                    if let Some(sub_id) = self.sub_to_id.get(&(sub, commitment)) {
                         let method = match sub {
                             Subscription::Program(_) => "programUnsubscribe",
                             Subscription::Account(_) => "accountUnsubscribe",
@@ -309,7 +309,7 @@ impl Handler<AccountCommand> for AccountUpdateManager {
                             params: [*sub_id],
                         };
                         self.inflight
-                            .insert(request_id, InflightRequest::Unsub(sub));
+                            .insert(request_id, InflightRequest::Unsub(sub, commitment));
                         self.send(&request)?;
                     }
                     match sub {
@@ -336,9 +336,9 @@ impl Handler<AccountCommand> for AccountUpdateManager {
                         }
                     }
                 }
-                AccountCommand::Reset(key) => {
+                AccountCommand::Reset(key, commitment) => {
                     metrics().commands.with_label_values(&["reset"]).inc();
-                    self.purge_queue.reset(key, PURGE_TIMEOUT);
+                    self.purge_queue.reset((key, commitment), PURGE_TIMEOUT);
                 }
             }
             Ok(())
@@ -382,23 +382,23 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
                                 InflightRequest::Sub(sub, commitment) => {
                                     let sub_id: u64 = serde_json::from_str(result.get())?;
                                     self.id_to_sub.insert(sub_id, (sub, commitment));
-                                    self.sub_to_id.insert(sub, sub_id);
+                                    self.sub_to_id.insert((sub, commitment), sub_id);
                                     info!(message = "subscribed to stream", sub_id = sub_id, sub = %sub, commitment = ?commitment);
                                     metrics().subscriptions_active.inc();
                                 }
-                                InflightRequest::Unsub(sub) => {
+                                InflightRequest::Unsub(sub, commitment) => {
                                     let is_ok: bool = serde_json::from_str(result.get())?;
                                     if is_ok {
-                                        if let Some(sub_id) = self.sub_to_id.remove(&sub) {
-                                            if let Some(val) = self.id_to_sub.remove(&sub_id) {
-                                                self.subs.remove(&val);
-                                            }
+                                        if let Some(sub_id) = self.sub_to_id.remove(&(sub, commitment)) {
+                                            self.id_to_sub.remove(&sub_id);
+                                            self.subs.remove(&(sub, commitment));
                                             info!(
                                                 message = "unsubscribed from stream",
                                                 sub_id = sub_id,
                                                 key = %sub.key(),
                                                 sub = %sub,
                                             );
+                                        } else {
                                         }
                                         metrics().subscriptions_active.dec();
                                     } else {
@@ -411,9 +411,9 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
                             }
                         }
 
-                        // TODO: method response
                         return Ok(());
-                    }, /* notification */
+                    },
+                    // notification
                     AnyMessage { method: Some(method), params: Some(params), .. } => {
                         match method {
                             "accountNotification" => {
@@ -603,8 +603,8 @@ impl std::fmt::Display for Subscription {
 #[rtype(result = "()")]
 pub(crate) enum AccountCommand {
     Subscribe(Subscription, Commitment, Option<SmallVec<[Filter; 2]>>),
-    Reset(Subscription),
-    Purge(Subscription),
+    Reset(Subscription, Commitment),
+    Purge(Subscription, Commitment),
 }
 
 enum DelayQueueCommand<T> {
