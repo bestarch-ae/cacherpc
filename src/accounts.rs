@@ -25,8 +25,10 @@ use crate::types::{
 
 const MAILBOX_CAPACITY: usize = 512;
 const PURGE_TIMEOUT: Duration = Duration::from_secs(600);
+const IN_FLIGHT_TIMEOUT: Duration = Duration::from_secs(30);
 const WEBSOCKET_PING_TIMEOUT: Duration = Duration::from_secs(10);
 
+#[derive(Debug)]
 enum InflightRequest {
     Sub(Subscription, Commitment),
     Unsub(Subscription, Commitment),
@@ -44,7 +46,7 @@ type WsSink = SinkWrite<
 pub(crate) struct AccountUpdateManager {
     websocket_url: String,
     request_id: u64,
-    inflight: HashMap<u64, InflightRequest>,
+    inflight: HashMap<u64, (InflightRequest, Instant)>,
     subs: HashSet<(Subscription, Commitment)>,
     id_to_sub: HashMap<u64, (Subscription, Commitment)>,
     sub_to_id: HashMap<(Subscription, Commitment), u64>,
@@ -86,6 +88,26 @@ impl AccountUpdateManager {
                         <Self as StreamHandler<awc::ws::Frame>>::finished(actor, ctx);
                     }
                 }
+            });
+
+            ctx.run_interval(Duration::from_secs(5), |actor, _ctx| {
+                let subs = &mut actor.subs;
+
+                actor.inflight.retain(|request_id, (req, time)| {
+                    let elapsed = time.elapsed();
+                    let too_long = elapsed > IN_FLIGHT_TIMEOUT;
+                    if too_long {
+                        warn!(request_id, request = ?req, timeout = ?IN_FLIGHT_TIMEOUT,
+                            elapsed = ?elapsed, "request in flight too long, assume dead");
+                        match req {
+                            InflightRequest::Sub(sub, comm) | InflightRequest::Unsub(sub, comm) => {
+                                subs.remove(&(*sub, *comm));
+                            }
+                            _ => {}
+                        }
+                    }
+                    !too_long
+                })
             });
 
             AccountUpdateManager::add_stream(purge_stream, ctx);
@@ -234,7 +256,8 @@ impl AccountUpdateManager {
             message = "subscribe to",
             pubkey = %key,
             method = method,
-            commitment = ?commitment
+            commitment = ?commitment,
+            request_id = request_id,
         );
 
         let request = Request {
@@ -250,11 +273,73 @@ impl AccountUpdateManager {
             },
         };
 
-        self.inflight
-            .insert(request_id, InflightRequest::Sub(sub, commitment));
+        self.inflight.insert(
+            request_id,
+            (InflightRequest::Sub(sub, commitment), Instant::now()),
+        );
         self.subs.insert((sub, commitment));
         self.send(&request)?;
         self.purge_queue.insert((sub, commitment), PURGE_TIMEOUT);
+
+        Ok(())
+    }
+
+    fn unsubscribe(
+        &mut self,
+        sub: Subscription,
+        commitment: Commitment,
+    ) -> Result<(), serde_json::Error> {
+        let request_id = self.next_request_id();
+
+        #[derive(Serialize)]
+        struct Request<'a> {
+            jsonrpc: &'a str,
+            id: u64,
+            method: &'a str,
+            params: [u64; 1],
+        }
+
+        if let Some(sub_id) = self.sub_to_id.get(&(sub, commitment)) {
+            info!(message = "unsubscribe", key = %sub.key(), commitment = ?commitment, request_id = request_id);
+
+            let method = match sub {
+                Subscription::Program(_) => "programUnsubscribe",
+                Subscription::Account(_) => "accountUnsubscribe",
+            };
+            let request = Request {
+                jsonrpc: "2.0",
+                id: request_id,
+                method,
+                params: [*sub_id],
+            };
+            self.inflight.insert(
+                request_id,
+                (InflightRequest::Unsub(sub, commitment), Instant::now()),
+            );
+            self.send(&request)?;
+        }
+        info!(message = "purge", key = %sub.key(), commitment = ?commitment);
+        match sub {
+            Subscription::Program(key) => {
+                let keys = self
+                    .additional_keys
+                    .remove(&key)
+                    .into_iter()
+                    .flatten()
+                    .map(|filter| (key, Some(filter)))
+                    .chain(Some((key, None)));
+                for (key, filter) in keys {
+                    if let Some(program_accounts) = self.program_accounts.remove_all(&key, filter) {
+                        for key in program_accounts.into_accounts() {
+                            self.accounts.remove(&key, commitment)
+                        }
+                    }
+                }
+            }
+            Subscription::Account(key) => {
+                self.accounts.remove(&key, commitment);
+            }
+        }
 
         Ok(())
     }
@@ -275,7 +360,6 @@ impl Handler<AccountCommand> for AccountUpdateManager {
 
     fn handle(&mut self, item: AccountCommand, _ctx: &mut Context<Self>) {
         let _ = (|| -> Result<(), serde_json::Error> {
-            let request_id = self.next_request_id();
             match item {
                 AccountCommand::Subscribe(sub, commitment, filters) => {
                     let key = sub.key();
@@ -287,54 +371,7 @@ impl Handler<AccountCommand> for AccountUpdateManager {
                 }
                 AccountCommand::Purge(sub, commitment) => {
                     metrics().commands.with_label_values(&["purge"]).inc();
-                    info!(message = "purging", key = %sub.key(), commitment = ?commitment);
-
-                    #[derive(Serialize)]
-                    struct Request<'a> {
-                        jsonrpc: &'a str,
-                        id: u64,
-                        method: &'a str,
-                        params: [u64; 1],
-                    }
-
-                    if let Some(sub_id) = self.sub_to_id.get(&(sub, commitment)) {
-                        let method = match sub {
-                            Subscription::Program(_) => "programUnsubscribe",
-                            Subscription::Account(_) => "accountUnsubscribe",
-                        };
-                        let request = Request {
-                            jsonrpc: "2.0",
-                            id: request_id,
-                            method,
-                            params: [*sub_id],
-                        };
-                        self.inflight
-                            .insert(request_id, InflightRequest::Unsub(sub, commitment));
-                        self.send(&request)?;
-                    }
-                    match sub {
-                        Subscription::Program(key) => {
-                            let keys = self
-                                .additional_keys
-                                .remove(&key)
-                                .into_iter()
-                                .flatten()
-                                .map(|filter| (key, Some(filter)))
-                                .chain(Some((key, None)));
-                            for (key, filter) in keys {
-                                if let Some(program_accounts) =
-                                    self.program_accounts.remove_all(&key, filter)
-                                {
-                                    for key in program_accounts.into_accounts() {
-                                        self.accounts.remove(&key, commitment)
-                                    }
-                                }
-                            }
-                        }
-                        Subscription::Account(key) => {
-                            self.accounts.remove(&key, commitment);
-                        }
-                    }
+                    self.unsubscribe(sub, commitment)?;
                 }
                 AccountCommand::Reset(key, commitment) => {
                     metrics().commands.with_label_values(&["reset"]).inc();
@@ -377,7 +414,7 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
                     match value {
                         // subscription response
                         AnyMessage { result: Some(result), id: Some(id), .. } => {
-                        if let Some(req) = self.inflight.remove(&id) {
+                        if let Some((req, _)) = self.inflight.remove(&id) {
                             match req {
                                 InflightRequest::Sub(sub, commitment) => {
                                     let sub_id: u64 = serde_json::from_str(result.get())?;
@@ -410,8 +447,6 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
                                 }
                             }
                         }
-
-                        return Ok(());
                     },
                     // notification
                     AnyMessage { method: Some(method), params: Some(params), .. } => {
@@ -484,7 +519,7 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
                         }
                     },
                     any => {
-                        warn!(message = "unidentified websocket message", msg = ?any);
+                        warn!(msg = ?any, text = ?text, "unidentified websocket message");
                     }
                 }
                 }
@@ -492,11 +527,11 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
                     warn!(reason = ?reason, "websocket closing");
                     <Self as StreamHandler<awc::ws::Frame>>::finished(self, ctx);
                 }
-                Frame::Binary(_) => {
-                    warn!("unexpected binary message");
+                Frame::Binary(msg) => {
+                    warn!(msg = ?msg, "unexpected binary message");
                 }
-                Frame::Continuation(_) => {
-                    warn!("unexpected continuation message");
+                Frame::Continuation(msg) => {
+                    warn!(msg = ?msg, "unexpected continuation message");
                 }
             }
             Ok(())
@@ -514,8 +549,10 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
             "id": request_id,
             "method": "rootSubscribe",
         });
-        self.inflight
-            .insert(request_id, InflightRequest::SlotSub(request_id));
+        self.inflight.insert(
+            request_id,
+            (InflightRequest::SlotSub(request_id), Instant::now()),
+        );
         let _ = self.send(&request);
 
         // restore subscriptions
