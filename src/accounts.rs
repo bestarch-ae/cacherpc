@@ -287,7 +287,7 @@ impl Handler<AccountCommand> for AccountUpdateManager {
                 }
                 AccountCommand::Purge(sub, commitment) => {
                     metrics().commands.with_label_values(&["purge"]).inc();
-                    info!(message = "purging", sub = ?sub, key = %sub.key(), commitment = ?commitment);
+                    info!(message = "purging", key = %sub.key(), commitment = ?commitment);
 
                     #[derive(Serialize)]
                     struct Request<'a> {
@@ -326,13 +326,13 @@ impl Handler<AccountCommand> for AccountUpdateManager {
                                     self.program_accounts.remove_all(&key, filter)
                                 {
                                     for key in program_accounts.into_accounts() {
-                                        self.accounts.remove(&key)
+                                        self.accounts.remove(&key, commitment)
                                     }
                                 }
                             }
                         }
                         Subscription::Account(key) => {
-                            self.accounts.remove(&key);
+                            self.accounts.remove(&key, commitment);
                         }
                     }
                 }
