@@ -28,7 +28,7 @@ use crate::types::{
 const MAILBOX_CAPACITY: usize = 512;
 const PURGE_TIMEOUT: Duration = Duration::from_secs(600);
 const IN_FLIGHT_TIMEOUT: Duration = Duration::from_secs(30);
-const WEBSOCKET_PING_TIMEOUT: Duration = Duration::from_secs(10);
+const WEBSOCKET_PING_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 enum InflightRequest {
@@ -433,6 +433,7 @@ impl AccountUpdateManager {
                         }
                         let params: Params = serde_json::from_str(params.get())?;
                         if let Some((sub, commitment)) = self.id_to_sub.get(&params.subscription) {
+                            info!(key = %sub.key(), "received account notification");
                             self.accounts.insert(sub.key(), params.result, *commitment);
                         } else {
                             warn!(message = "unknown subscription", sub = params.subscription);
@@ -648,7 +649,9 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
         metrics().websocket_connected.set(0);
         self.connected.store(false, Ordering::Relaxed);
 
-        self.connection = None;
+        if let Some((_, stream)) = self.connection.take() {
+            ctx.cancel_future(stream);
+        }
 
         self.inflight.clear();
         self.id_to_sub.clear();
