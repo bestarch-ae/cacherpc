@@ -7,6 +7,8 @@ use prometheus::{
 
 pub struct PubSubMetrics {
     pub subscriptions_active: IntGauge,
+    pub subscribe_requests: IntCounter,
+    pub subscribe_errors: IntCounter,
     pub websocket_connected: IntGauge,
     pub notifications_received: IntCounterVec,
     pub commands: IntCounterVec,
@@ -19,6 +21,13 @@ pub fn pubsub_metrics() -> &'static PubSubMetrics {
             "number of active subcriptions"
         )
         .unwrap(),
+        subscribe_requests: register_int_counter!(
+            "subscribe_requests",
+            "number of subcribe requests sent"
+        )
+        .unwrap(),
+        subscribe_errors: register_int_counter!("subscribe_errors", "number of subscribe errors")
+            .unwrap(),
         websocket_connected: register_int_gauge!(
             "websocket_connected",
             "websocket connection status"

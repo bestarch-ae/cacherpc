@@ -237,17 +237,17 @@ impl AccountUpdateManager {
             }
         }
 
+        if self.subs.contains(&(sub, commitment)) {
+            info!(message = "already trying to subscribe", pubkey = %sub.key());
+            return Ok(());
+        }
+
         let request_id = self.next_request_id();
 
         let (key, method) = match sub {
             Subscription::Account(key) => (key, "accountSubscribe"),
             Subscription::Program(key) => (key, "programSubscribe"),
         };
-        if self.subs.contains(&(sub, commitment)) {
-            info!(message = "already trying to subscribe", pubkey = %key);
-            return Ok(());
-        }
-
         info!(
             message = "subscribe to",
             pubkey = %key,
@@ -276,6 +276,7 @@ impl AccountUpdateManager {
         self.subs.insert((sub, commitment));
         self.send(&request)?;
         self.purge_queue.insert((sub, commitment), PURGE_TIMEOUT);
+        metrics().subscribe_requests.inc();
 
         Ok(())
     }
@@ -365,6 +366,7 @@ impl AccountUpdateManager {
                     match req {
                         InflightRequest::Sub(sub, commitment) => {
                             warn!(request_id = id, error = ?error, key = %sub.key(), commitment = ?commitment, "subscribe failed");
+                            metrics().subscribe_errors.inc();
                             self.subs.remove(&(sub, commitment));
                         }
                         InflightRequest::Unsub(sub, commitment) => {
