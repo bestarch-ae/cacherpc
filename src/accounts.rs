@@ -636,6 +636,7 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
         info!("adding subscriptions");
         let subs_len = self.subs.len();
         let subs = std::mem::replace(&mut self.subs, HashSet::with_capacity(subs_len));
+
         for (sub, commitment) in subs {
             self.subscribe(sub, commitment).unwrap()
             // TODO: it would be nice to retrieve current state for
@@ -647,6 +648,7 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
     fn finished(&mut self, ctx: &mut Context<Self>) {
         info!("websocket disconnected");
         metrics().websocket_connected.set(0);
+        metrics().subscriptions_active.set(0);
         self.connected.store(false, Ordering::Relaxed);
 
         if let Some((_, stream)) = self.connection.take() {
