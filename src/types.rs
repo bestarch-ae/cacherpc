@@ -233,6 +233,14 @@ impl Commitment {
             Commitment::Processed => 2,
         }
     }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Commitment::Confirmed => "confirmed",
+            Commitment::Processed => "processed",
+            Commitment::Finalized => "finalized",
+        }
+    }
 }
 
 impl<'de> Deserialize<'de> for Commitment {

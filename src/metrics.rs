@@ -39,6 +39,7 @@ pub fn pubsub_metrics() -> &'static PubSubMetrics {
 pub struct RpcMetrics {
     request_types: IntCounterVec,
     pub request_encodings: IntCounterVec,
+    pub request_commitments: IntCounterVec,
     pub account_cache_hits: IntCounter,
     pub account_cache_filled: IntCounter,
     pub program_accounts_cache_hits: IntCounter,
@@ -137,6 +138,12 @@ pub fn rpc_metrics() -> &'static RpcMetrics {
             "request_encodings",
             "Request encoding counts by type",
             &["type", "encoding"]
+        )
+        .unwrap(),
+        request_commitments: register_int_counter_vec!(
+            "request_commitments",
+            "Request commitment counts by type",
+            &["type", "commitment"]
         )
         .unwrap(),
         account_cache_hits: register_int_counter!("account_cache_hits", "Accounts cache hit")

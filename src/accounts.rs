@@ -9,6 +9,8 @@ use actix::io::SinkWrite;
 use actix::prelude::AsyncContext;
 use actix::prelude::{Actor, Addr, Context, Handler, Message, Running, StreamHandler};
 use actix::SpawnHandle;
+use actix_http::ws;
+use bytes::BytesMut;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use smallvec::SmallVec;
@@ -57,6 +59,7 @@ pub(crate) struct AccountUpdateManager {
     additional_keys: HashMap<Pubkey, HashSet<SmallVec<[Filter; 2]>>>,
     last_pong: Instant,
     connected: Arc<AtomicBool>,
+    buffer: BytesMut,
 }
 
 impl std::fmt::Debug for AccountUpdateManager {
@@ -117,6 +120,7 @@ impl AccountUpdateManager {
                 additional_keys: HashMap::default(),
                 connected,
                 last_pong: Instant::now(),
+                buffer: BytesMut::new(),
             }
         })
     }
@@ -335,6 +339,193 @@ impl AccountUpdateManager {
 
         Ok(())
     }
+
+    fn process_ws_message(&mut self, text: &[u8]) -> Result<(), serde_json::Error> {
+        #[derive(Deserialize, Debug)]
+        struct AnyMessage<'a> {
+            #[serde(borrow)]
+            result: Option<&'a RawValue>,
+            #[serde(borrow)]
+            method: Option<&'a str>,
+            id: Option<u64>,
+            #[serde(borrow)]
+            params: Option<&'a RawValue>,
+            #[serde(borrow)]
+            error: Option<&'a RawValue>,
+        }
+        let value: AnyMessage<'_> = serde_json::from_slice(&text)?;
+        match value {
+            // subscription error
+            AnyMessage {
+                error: Some(error),
+                id: Some(id),
+                ..
+            } => {
+                if let Some((req, _)) = self.inflight.remove(&id) {
+                    match req {
+                        InflightRequest::Sub(sub, commitment) => {
+                            warn!(request_id = id, error = ?error, key = %sub.key(), commitment = ?commitment, "subscribe failed");
+                            self.subs.remove(&(sub, commitment));
+                        }
+                        InflightRequest::Unsub(sub, commitment) => {
+                            warn!(request_id = id, error = ?error, key = %sub.key(), commitment = ?commitment, "unsubscribe failed");
+                        }
+                        InflightRequest::SlotSub(_) => {
+                            warn!(request_id = id, error = ?error, "slot subscribe failed");
+                        }
+                    }
+                }
+            }
+            // subscription response
+            AnyMessage {
+                result: Some(result),
+                id: Some(id),
+                ..
+            } => {
+                if let Some((req, _)) = self.inflight.remove(&id) {
+                    match req {
+                        InflightRequest::Sub(sub, commitment) => {
+                            let sub_id: u64 = serde_json::from_str(result.get())?;
+                            self.id_to_sub.insert(sub_id, (sub, commitment));
+                            self.sub_to_id.insert((sub, commitment), sub_id);
+                            info!(message = "subscribed to stream", sub_id = sub_id, sub = %sub, commitment = ?commitment);
+                            metrics().subscriptions_active.inc();
+                        }
+                        InflightRequest::Unsub(sub, commitment) => {
+                            let is_ok: bool = serde_json::from_str(result.get())?;
+                            if is_ok {
+                                if let Some(sub_id) = self.sub_to_id.remove(&(sub, commitment)) {
+                                    self.id_to_sub.remove(&sub_id);
+                                    self.subs.remove(&(sub, commitment));
+                                    info!(
+                                        message = "unsubscribed from stream",
+                                        sub_id = sub_id,
+                                        key = %sub.key(),
+                                        sub = %sub,
+                                    );
+                                } else {
+                                }
+                                metrics().subscriptions_active.dec();
+                            } else {
+                                warn!(message = "unsubscribe failed", key = %sub.key());
+                            }
+                        }
+                        InflightRequest::SlotSub(_) => {
+                            info!(message = "subscribed to root");
+                        }
+                    }
+                }
+            }
+            // notification
+            AnyMessage {
+                method: Some(method),
+                params: Some(params),
+                ..
+            } => {
+                match method {
+                    "accountNotification" => {
+                        #[derive(Deserialize, Debug)]
+                        struct Params {
+                            result: AccountContext,
+                            subscription: u64,
+                        }
+                        let params: Params = serde_json::from_str(params.get())?;
+                        if let Some((sub, commitment)) = self.id_to_sub.get(&params.subscription) {
+                            self.accounts.insert(sub.key(), params.result, *commitment);
+                        } else {
+                            warn!(message = "unknown subscription", sub = params.subscription);
+                        }
+                        metrics()
+                            .notifications_received
+                            .with_label_values(&["accountNotification"])
+                            .inc();
+                    }
+                    "programNotification" => {
+                        #[derive(Deserialize, Debug)]
+                        struct Value {
+                            account: AccountInfo,
+                            pubkey: Pubkey,
+                        }
+                        #[derive(Deserialize, Debug)]
+                        struct Result {
+                            context: SolanaContext,
+                            value: Value,
+                        }
+                        #[derive(Deserialize, Debug)]
+                        struct Params {
+                            result: Result,
+                            subscription: u64,
+                        }
+                        let params: Params = serde_json::from_str(params.get())?;
+                        if let Some((program_sub, commitment)) =
+                            self.id_to_sub.get(&params.subscription)
+                        {
+                            let program_key = program_sub.key();
+                            let key = params.result.value.pubkey;
+                            let account_info = &params.result.value.account;
+                            let data = &account_info.data;
+                            if let Some(filters) = self.additional_keys.get(&program_key) {
+                                for filter_group in filters {
+                                    if filter_group.iter().all(|f| f.matches(data)) {
+                                        self.program_accounts.add(
+                                            &program_key,
+                                            params.result.value.pubkey,
+                                            Some(filter_group.clone()),
+                                            *commitment,
+                                        );
+                                    } else {
+                                        self.program_accounts.remove(
+                                            &program_key,
+                                            &params.result.value.pubkey,
+                                            filter_group.clone(),
+                                            *commitment,
+                                        );
+                                    }
+                                }
+                            }
+                            self.accounts.insert(
+                                key,
+                                AccountContext {
+                                    value: Some(params.result.value.account),
+                                    context: params.result.context,
+                                },
+                                *commitment,
+                            );
+                            self.program_accounts.add(
+                                &program_key,
+                                params.result.value.pubkey,
+                                None,
+                                *commitment,
+                            );
+                        } else {
+                            warn!(message = "unknown subscription", sub = params.subscription);
+                        }
+                        metrics()
+                            .notifications_received
+                            .with_label_values(&["programNotification"])
+                            .inc();
+                    }
+                    "rootNotification" => {
+                        #[derive(Deserialize)]
+                        struct Params {
+                            result: u64, //SlotInfo,
+                        }
+                        let params: Params = serde_json::from_str(params.get())?;
+                        //info!("slot {} root {} parent {}", params.result.slot, params.result.root, params.result.parent);
+                        let _slot = params.result; // TODO: figure out which slot validator *actually* reports
+                    }
+                    _ => {
+                        warn!(message = "unknown notification", method = method);
+                    }
+                }
+            }
+            any => {
+                warn!(msg = ?any, text = ?text, "unidentified websocket message");
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl StreamHandler<AccountCommand> for AccountUpdateManager {
@@ -391,149 +582,7 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
                 Frame::Pong(_) => {
                     self.last_pong = Instant::now();
                 }
-                Frame::Text(text) => {
-                    #[derive(Deserialize, Debug)]
-                    struct AnyMessage<'a> {
-                        #[serde(borrow)]
-                        result: Option<&'a RawValue>,
-                        #[serde(borrow)]
-                        method: Option<&'a str>,
-                        id: Option<u64>,
-                        #[serde(borrow)]
-                        params: Option<&'a RawValue>,
-                        #[serde(borrow)]
-                        error: Option<&'a RawValue>,
-                    }
-                    let value: AnyMessage<'_> = serde_json::from_slice(&text)?;
-                    match value {
-                        // subscription error
-                        AnyMessage { error: Some(error), id: Some(id), .. } => {
-                            if let Some((req, _)) = self.inflight.remove(&id) {
-                                match req {
-                                    InflightRequest::Sub(sub, commitment) => {
-                                        warn!(request_id = id, error = ?error, key = %sub.key(), commitment = ?commitment, "subscribe failed");
-                                        self.subs.remove(&(sub, commitment));
-                                    }
-                                    InflightRequest::Unsub(sub, commitment) => {
-                                        warn!(request_id = id, error = ?error, key = %sub.key(), commitment = ?commitment, "unsubscribe failed");
-                                    }
-                                    InflightRequest::SlotSub(_) => {
-                                        warn!(request_id = id, error = ?error, "slot subscribe failed");
-                                    }
-                                }
-                            }
-                        }
-                        // subscription response
-                        AnyMessage { result: Some(result), id: Some(id), .. } => {
-                        if let Some((req, _)) = self.inflight.remove(&id) {
-                            match req {
-                                InflightRequest::Sub(sub, commitment) => {
-                                    let sub_id: u64 = serde_json::from_str(result.get())?;
-                                    self.id_to_sub.insert(sub_id, (sub, commitment));
-                                    self.sub_to_id.insert((sub, commitment), sub_id);
-                                    info!(message = "subscribed to stream", sub_id = sub_id, sub = %sub, commitment = ?commitment);
-                                    metrics().subscriptions_active.inc();
-                                }
-                                InflightRequest::Unsub(sub, commitment) => {
-                                    let is_ok: bool = serde_json::from_str(result.get())?;
-                                    if is_ok {
-                                        if let Some(sub_id) = self.sub_to_id.remove(&(sub, commitment)) {
-                                            self.id_to_sub.remove(&sub_id);
-                                            self.subs.remove(&(sub, commitment));
-                                            info!(
-                                                message = "unsubscribed from stream",
-                                                sub_id = sub_id,
-                                                key = %sub.key(),
-                                                sub = %sub,
-                                            );
-                                        } else {
-                                        }
-                                        metrics().subscriptions_active.dec();
-                                    } else {
-                                        warn!(message = "unsubscribe failed", key = %sub.key());
-                                    }
-                                }
-                                InflightRequest::SlotSub(_) => {
-                                    info!(message = "subscribed to root");
-                                }
-                            }
-                        }
-                    },
-                    // notification
-                    AnyMessage { method: Some(method), params: Some(params), .. } => {
-                        match method {
-                            "accountNotification" => {
-                                #[derive(Deserialize, Debug)]
-                                struct Params {
-                                    result: AccountContext,
-                                    subscription: u64,
-                                }
-                                let params: Params = serde_json::from_str(params.get())?;
-                                if let Some((sub, commitment)) = self.id_to_sub.get(&params.subscription) {
-                                    self.accounts.insert(sub.key(), params.result, *commitment);
-                                } else {
-                                    warn!(message = "unknown subscription", sub = params.subscription);
-                                }
-                                metrics().notifications_received.with_label_values(&["accountNotification"]).inc();
-                            }
-                            "programNotification" => {
-                                #[derive(Deserialize, Debug)]
-                                struct Value {
-                                    account: AccountInfo,
-                                    pubkey: Pubkey,
-                                }
-                                #[derive(Deserialize, Debug)]
-                                struct Result {
-                                    context: SolanaContext,
-                                    value: Value,
-                                }
-                                #[derive(Deserialize, Debug)]
-                                struct Params {
-                                    result: Result,
-                                    subscription: u64,
-                                }
-                                let params: Params = serde_json::from_str(params.get())?;
-                                if let Some((program_sub, commitment)) = self.id_to_sub.get(&params.subscription) {
-                                    let program_key = program_sub.key();
-                                    let key = params.result.value.pubkey;
-                                    let account_info = &params.result.value.account;
-                                    let data = &account_info.data;
-                                    if let Some(filters) = self.additional_keys.get(&program_key) {
-                                        for filter_group in filters {
-                                            if filter_group.iter().all(|f| f.matches(data)) {
-                                                self.program_accounts.add(&program_key, params.result.value.pubkey, Some(filter_group.clone()), *commitment);
-                                            } else {
-                                                self.program_accounts.remove(&program_key, &params.result.value.pubkey, filter_group.clone(), *commitment);
-                                            }
-                                        }
-                                    }
-                                    self.accounts.insert(key, AccountContext {
-                                        value: Some(params.result.value.account), context: params.result.context }, *commitment);
-                                    self.program_accounts.add(&program_key, params.result.value.pubkey, None, *commitment);
-                                } else {
-                                    warn!(message = "unknown subscription", sub = params.subscription);
-                                }
-                                metrics().notifications_received.with_label_values(&["programNotification"]).inc();
-                            }
-                            "rootNotification" => {
-                                #[derive(Deserialize)]
-                                struct Params {
-                                    result: u64, //SlotInfo,
-                                }
-                                let params: Params = serde_json::from_str(params.get())?;
-                                //info!("slot {} root {} parent {}", params.result.slot, params.result.root, params.result.parent);
-                                let _slot = params.result; // TODO: figure out which slot validator *actually* reports
-                            }
-                            _ => {
-                                warn!(message = "unknown notification", method = method);
-                            }
-                        }
-                    },
-                    any => {
-                        warn!(msg = ?any, text = ?text, "unidentified websocket message");
-                    }
-                }
-                }
+                Frame::Text(text) => self.process_ws_message(&text)?,
                 Frame::Close(reason) => {
                     warn!(reason = ?reason, "websocket closing");
                     <Self as StreamHandler<awc::ws::Frame>>::finished(self, ctx);
@@ -541,12 +590,26 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
                 Frame::Binary(msg) => {
                     warn!(msg = ?msg, "unexpected binary message");
                 }
-                Frame::Continuation(msg) => {
-                    warn!(msg = ?msg, "unexpected continuation message");
-                }
+                Frame::Continuation(msg) => match msg {
+                    ws::Item::FirstText(bytes) => {
+                        self.buffer.extend(&bytes);
+                    }
+                    ws::Item::Continue(bytes) => {
+                        self.buffer.extend(&bytes);
+                    }
+                    ws::Item::Last(bytes) => {
+                        self.buffer.extend(&bytes);
+                        let text = std::mem::replace(&mut self.buffer, BytesMut::new());
+                        self.process_ws_message(&text)?;
+                    }
+                    ws::Item::FirstBinary(_) => {
+                        warn!(msg = ?msg, "unexpected continuation message");
+                    }
+                },
             }
             Ok(())
-        })().map_err(|err| {
+        })()
+        .map_err(|err| {
             error!(message = "error handling Frame", error = ?err);
         });
     }

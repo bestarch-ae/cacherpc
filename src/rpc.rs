@@ -551,6 +551,11 @@ async fn get_account_info(
         .with_label_values(&["getAccountInfo", config.encoding.as_str()])
         .inc();
 
+    metrics().request_commitments.with_label_values(&[
+        "getAccountInfo",
+        config.commitment.unwrap_or_default().as_str(),
+    ]);
+
     let mut cacheable_for_key = Some(pubkey);
 
     // pass through for JsonParsed as we don't support it yet
@@ -858,6 +863,11 @@ async fn get_program_accounts(
         .request_encodings
         .with_label_values(&["getProgramAccounts", config.encoding.as_str()])
         .inc();
+
+    metrics().request_commitments.with_label_values(&[
+        "getProgramAccounts",
+        config.commitment.unwrap_or_default().as_str(),
+    ]);
 
     let mut cacheable_for_key = Some(pubkey);
 
