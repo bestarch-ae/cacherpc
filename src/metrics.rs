@@ -57,6 +57,8 @@ pub struct RpcMetrics {
     pub backend_response_time: HistogramVec,
     pub backend_errors: IntCounterVec,
     pub handler_time: HistogramVec,
+    pub wait_time: HistogramVec,
+    pub available_permits: IntGaugeVec,
     pub response_size_bytes: HistogramVec,
     pub lru_cache_hits: IntCounter,
     pub lru_cache_filled: IntGaugeVec,
@@ -200,6 +202,18 @@ pub fn rpc_metrics() -> &'static RpcMetrics {
         handler_time: register_histogram_vec!(
             "handler_time",
             "Handler processing time by type",
+            &["type"]
+        )
+        .unwrap(),
+        wait_time: register_histogram_vec!(
+            "wait_time",
+            "Time spent waiting for request limit by type",
+            &["type"]
+        )
+        .unwrap(),
+        available_permits: register_int_gauge_vec!(
+            "available_permits",
+            "Permits available to make backend requests",
             &["type"]
         )
         .unwrap(),

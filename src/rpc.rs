@@ -212,7 +212,16 @@ impl State {
         let client = &self.client;
         let mut backoff = backoff_settings();
         loop {
+            let wait_time = metrics()
+                .wait_time
+                .with_label_values(&[req.method])
+                .start_timer();
             let _permit = limit.acquire().await;
+            metrics()
+                .available_permits
+                .with_label_values(&[req.method])
+                .set(limit.available_permits() as i64);
+            wait_time.observe_duration();
             let timer = metrics()
                 .backend_response_time
                 .with_label_values(&[req.method])
