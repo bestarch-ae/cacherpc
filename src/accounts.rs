@@ -57,7 +57,7 @@ pub(crate) struct AccountUpdateManager {
     program_accounts: ProgramAccountsDb,
     purge_queue: DelayQueueHandle<(Subscription, Commitment)>,
     additional_keys: HashMap<Pubkey, HashSet<SmallVec<[Filter; 2]>>>,
-    last_pong: Instant,
+    last_received_at: Instant,
     connected: Arc<AtomicBool>,
     buffer: BytesMut,
 }
@@ -81,14 +81,18 @@ impl AccountUpdateManager {
 
             ctx.set_mailbox_capacity(MAILBOX_CAPACITY);
 
-            ctx.run_interval(Duration::from_secs(1), |actor, ctx| {
+            ctx.run_interval(Duration::from_secs(5), |actor, ctx| {
                 if actor.connected.load(Ordering::Relaxed) {
                     if let Some((sink, _)) = &mut actor.connection {
                         sink.write(awc::ws::Message::Ping(b"hello?".as_ref().into()));
-                    }
-                    if actor.last_pong.elapsed() > WEBSOCKET_PING_TIMEOUT {
-                        warn!("websocket pong not received in time, assume connection lost");
-                        <Self as StreamHandler<awc::ws::Frame>>::finished(actor, ctx);
+
+                        if actor.last_received_at.elapsed() > WEBSOCKET_PING_TIMEOUT {
+                            warn!(
+                                "no messages received in {:?}, assume connection lost",
+                                WEBSOCKET_PING_TIMEOUT
+                            );
+                            <Self as StreamHandler<awc::ws::Frame>>::finished(actor, ctx);
+                        }
                     }
                 }
             });
@@ -121,7 +125,7 @@ impl AccountUpdateManager {
                 purge_queue: handle,
                 additional_keys: HashMap::default(),
                 connected,
-                last_pong: Instant::now(),
+                last_received_at: Instant::now(),
                 buffer: BytesMut::new(),
             }
         })
@@ -189,7 +193,7 @@ impl AccountUpdateManager {
             );
             let sink = SinkWrite::new(sink, ctx);
             let stream_handle = AccountUpdateManager::add_stream(stream, ctx);
-            actor.last_pong = Instant::now();
+            actor.last_received_at = Instant::now();
 
             if let Some((_, handle)) =
                 std::mem::replace(&mut actor.connection, Some((sink, stream_handle)))
@@ -576,8 +580,11 @@ impl Handler<AccountCommand> for AccountUpdateManager {
 
 impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
     fn handle(&mut self, item: awc::ws::Frame, ctx: &mut Context<Self>) {
+        self.last_received_at = Instant::now();
+
         let _ = (|| -> Result<(), serde_json::Error> {
             use awc::ws::Frame;
+
             match item {
                 Frame::Ping(data) => {
                     if let Some((sink, _)) = &mut self.connection {
@@ -585,7 +592,7 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
                     }
                 }
                 Frame::Pong(_) => {
-                    self.last_pong = Instant::now();
+                    // do nothing
                 }
                 Frame::Text(text) => self.process_ws_message(&text).map_err(|err| {
                             error!(error = %err, bytes = ?text, "error while parsing message");
