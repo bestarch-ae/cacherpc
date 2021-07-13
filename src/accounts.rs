@@ -435,7 +435,7 @@ impl AccountUpdateManager {
                         }
                         let params: Params = serde_json::from_str(params.get())?;
                         if let Some((sub, commitment)) = self.id_to_sub.get(&params.subscription) {
-                            info!(key = %sub.key(), "received account notification");
+                            //info!(key = %sub.key(), "received account notification");
                             self.accounts.insert(sub.key(), params.result, *commitment);
                         } else {
                             warn!(message = "unknown subscription", sub = params.subscription);
@@ -587,7 +587,10 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
                 Frame::Pong(_) => {
                     self.last_pong = Instant::now();
                 }
-                Frame::Text(text) => self.process_ws_message(&text)?,
+                Frame::Text(text) => self.process_ws_message(&text).map_err(|err| {
+                            error!(error = %err, bytes = ?text, "error while parsing message");
+                            err
+                        })?,
                 Frame::Close(reason) => {
                     warn!(reason = ?reason, "websocket closing");
                     <Self as StreamHandler<awc::ws::Frame>>::finished(self, ctx);
@@ -605,7 +608,10 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
                     ws::Item::Last(bytes) => {
                         self.buffer.extend(&bytes);
                         let text = std::mem::replace(&mut self.buffer, BytesMut::new());
-                        self.process_ws_message(&text)?;
+                        self.process_ws_message(&text).map_err(|err| {
+                            error!(error = %err, bytes = ?text, "error while parsing fragmented message");
+                            err
+                        })?;
                     }
                     ws::Item::FirstBinary(_) => {
                         warn!(msg = ?msg, "unexpected continuation message");
@@ -657,6 +663,7 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
             ctx.cancel_future(stream);
         }
 
+        self.buffer.clear();
         self.inflight.clear();
         self.id_to_sub.clear();
         self.sub_to_id.clear();
