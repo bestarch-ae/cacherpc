@@ -94,15 +94,17 @@ impl AccountUpdateManager {
             });
 
             ctx.run_interval(Duration::from_secs(5), |actor, _ctx| {
-                actor.inflight.retain(|request_id, (req, time)| {
-                    let elapsed = time.elapsed();
-                    let too_long = elapsed > IN_FLIGHT_TIMEOUT;
-                    if too_long {
-                        warn!(request_id, request = ?req, timeout = ?IN_FLIGHT_TIMEOUT,
-                            elapsed = ?elapsed, "request in flight too long, assume dead");
-                    }
-                    !too_long
-                })
+                if actor.connected.load(Ordering::Relaxed) {
+                    actor.inflight.retain(|request_id, (req, time)| {
+                        let elapsed = time.elapsed();
+                        let too_long = elapsed > IN_FLIGHT_TIMEOUT;
+                        if too_long {
+                            warn!(request_id, request = ?req, timeout = ?IN_FLIGHT_TIMEOUT,
+                                elapsed = ?elapsed, "request in flight too long, assume dead");
+                        }
+                        !too_long
+                    })
+                }
             });
 
             AccountUpdateManager::add_stream(purge_stream, ctx);
