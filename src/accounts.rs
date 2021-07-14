@@ -614,6 +614,7 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
 
             match item {
                 Frame::Ping(data) => {
+                    metrics().bytes_received.inc_by(data.len() as u64);
                     if let Some((sink, _)) = &mut self.connection {
                         sink.write(awc::ws::Message::Pong(data));
                     }
@@ -621,10 +622,13 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
                 Frame::Pong(_) => {
                     // do nothing
                 }
-                Frame::Text(text) => self.process_ws_message(&text).map_err(|err| {
+                Frame::Text(text) => {
+                    metrics().bytes_received.inc_by(text.len() as u64);
+                    self.process_ws_message(&text).map_err(|err| {
                             error!(error = %err, bytes = ?text, "error while parsing message");
                             err
-                        })?,
+                        })?
+                }
                 Frame::Close(reason) => {
                     warn!(reason = ?reason, "websocket closing");
                     self.reconnect(ctx);
@@ -634,12 +638,15 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
                 }
                 Frame::Continuation(msg) => match msg {
                     ws::Item::FirstText(bytes) => {
+                        metrics().bytes_received.inc_by(bytes.len() as u64);
                         self.buffer.extend(&bytes);
                     }
                     ws::Item::Continue(bytes) => {
+                        metrics().bytes_received.inc_by(bytes.len() as u64);
                         self.buffer.extend(&bytes);
                     }
                     ws::Item::Last(bytes) => {
+                        metrics().bytes_received.inc_by(bytes.len() as u64);
                         self.buffer.extend(&bytes);
                         let text = std::mem::replace(&mut self.buffer, BytesMut::new());
                         self.process_ws_message(&text).map_err(|err| {
