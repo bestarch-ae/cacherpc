@@ -75,6 +75,13 @@ struct Options {
     log_format: LogFormat,
     #[structopt(long = "log-file", help = "file path")]
     log_file: Option<std::path::PathBuf>,
+    #[structopt(
+        short = "c",
+        long = "websocket-connections",
+        help = "number of WebSocket connections to validator",
+        default_value = "1"
+    )]
+    websocket_connections: u32,
 }
 
 #[derive(Debug)]
@@ -134,17 +141,61 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+struct Addrs<T: actix::Actor>(Vec<actix::Addr<T>>);
+
+impl<T: actix::Actor> Clone for Addrs<T> {
+    fn clone(&self) -> Self {
+        Addrs(self.0.clone())
+    }
+}
+
+impl Addrs<AccountUpdateManager> {
+    fn get_addr_by_key(&self, key: types::Pubkey) -> actix::Addr<AccountUpdateManager> {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        let hash = hasher.finish();
+        let idx = (hash % self.0.len() as u64) as usize;
+        self.0[idx].clone()
+    }
+
+    fn reset(&self, sub: accounts::Subscription, commitment: types::Commitment) {
+        let addr = self.get_addr_by_key(sub.key());
+        addr.do_send(accounts::AccountCommand::Reset(sub, commitment))
+    }
+
+    fn subscribe(
+        &self,
+        sub: accounts::Subscription,
+        commitment: types::Commitment,
+        filters: Option<smallvec::SmallVec<[types::Filter; 2]>>,
+    ) {
+        let addr = self.get_addr_by_key(sub.key());
+        addr.do_send(accounts::AccountCommand::Subscribe(
+            sub, commitment, filters,
+        ))
+    }
+}
+
 async fn run(options: Options) -> Result<()> {
     let accounts = AccountsDb::new();
     let program_accounts = ProgramAccountsDb::new();
     let connected = Arc::new(AtomicBool::new(false));
 
-    let addr = AccountUpdateManager::init(
-        accounts.clone(),
-        program_accounts.clone(),
-        Arc::clone(&connected),
-        &options.ws_url,
-    );
+    let mut addrs = Vec::new();
+    for id in 0..options.websocket_connections {
+        let addr = AccountUpdateManager::init(
+            id,
+            accounts.clone(),
+            program_accounts.clone(),
+            Arc::clone(&connected),
+            &options.ws_url,
+        );
+        addrs.push(addr)
+    }
+    let addrs = Addrs(addrs);
 
     let rpc_url = options.rpc_url;
     let notify = Arc::new(Notify::new());
@@ -173,7 +224,7 @@ async fn run(options: Options) -> Result<()> {
             accounts: accounts.clone(),
             program_accounts: program_accounts.clone(),
             client,
-            actor: addr.clone(),
+            actor: addrs.clone(),
             rpc_url: rpc_url.clone(),
             map_updated: notify.clone(),
             account_info_request_limit: account_info_request_limit.clone(),

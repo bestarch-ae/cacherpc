@@ -7,7 +7,6 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use actix::prelude::Addr;
 use actix_web::{web, HttpResponse, ResponseError};
 
 use awc::Client;
@@ -22,7 +21,7 @@ use thiserror::Error;
 use tokio::sync::{Notify, Semaphore};
 use tracing::{error, info, warn};
 
-use crate::accounts::{AccountCommand, AccountUpdateManager, Subscription};
+use crate::accounts::{AccountUpdateManager, Subscription};
 use crate::metrics::rpc_metrics as metrics;
 use crate::types::{
     AccountContext, AccountData, AccountInfo, AccountState, AccountsDb, Commitment, Encoding,
@@ -166,7 +165,7 @@ pub(crate) struct State {
     pub accounts: AccountsDb,
     pub program_accounts: ProgramAccountsDb,
     pub client: Client,
-    pub actor: Addr<AccountUpdateManager>,
+    pub actor: crate::Addrs<AccountUpdateManager>,
     pub rpc_url: String,
     pub map_updated: Arc<Notify>,
     pub account_info_request_limit: Arc<Semaphore>,
@@ -178,7 +177,7 @@ pub(crate) struct State {
 
 impl State {
     fn reset(&self, sub: Subscription, commitment: Commitment) {
-        self.actor.do_send(AccountCommand::Reset(sub, commitment));
+        self.actor.reset(sub, commitment);
     }
 
     fn insert(&self, key: Pubkey, data: AccountContext, commitment: Commitment) {
@@ -195,13 +194,17 @@ impl State {
         commitment: Commitment,
         filters: Option<SmallVec<[Filter; 2]>>,
     ) {
+        self.actor.subscribe(subscription, commitment, filters);
+        /*
         let res = self
             .actor
+            .get()
             .send(AccountCommand::Subscribe(subscription, commitment, filters))
             .await;
         if let Err(err) = res {
             error!(error = %err, message = "error sending command to actor");
         }
+        */
     }
 
     async fn request(
