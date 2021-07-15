@@ -45,8 +45,70 @@ type WsSink = SinkWrite<
     >,
 >;
 
+#[derive(Clone)]
+pub(crate) struct PubSubManager(Vec<(actix::Addr<AccountUpdateManager>, Arc<AtomicBool>)>);
+
+impl PubSubManager {
+    pub(crate) fn init(
+        connections: u32,
+        accounts: AccountsDb,
+        program_accounts: ProgramAccountsDb,
+        websocket_url: &str,
+    ) -> Self {
+        let mut addrs = Vec::new();
+        for id in 0..connections {
+            let connected = Arc::new(AtomicBool::new(false));
+            let addr = AccountUpdateManager::init(
+                id,
+                accounts.clone(),
+                program_accounts.clone(),
+                Arc::clone(&connected),
+                &websocket_url,
+            );
+            addrs.push((addr, connected))
+        }
+        PubSubManager(addrs)
+    }
+
+    fn get_idx_by_key(&self, key: Pubkey) -> usize {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        let hash = hasher.finish();
+        (hash % self.0.len() as u64) as usize
+    }
+
+    fn get_addr_by_key(&self, key: Pubkey) -> actix::Addr<AccountUpdateManager> {
+        let idx = self.get_idx_by_key(key);
+        self.0[idx].0.clone()
+    }
+
+    pub fn is_connected(&self, key: Pubkey) -> bool {
+        let idx = self.get_idx_by_key(key);
+        self.0[idx].1.load(Ordering::Relaxed)
+    }
+
+    pub fn reset(&self, sub: Subscription, commitment: Commitment) {
+        let addr = self.get_addr_by_key(sub.key());
+        addr.do_send(AccountCommand::Reset(sub, commitment))
+    }
+
+    pub fn subscribe(
+        &self,
+        sub: Subscription,
+        commitment: Commitment,
+        filters: Option<smallvec::SmallVec<[Filter; 2]>>,
+    ) {
+        let addr = self.get_addr_by_key(sub.key());
+        addr.do_send(AccountCommand::Subscribe(sub, commitment, filters))
+    }
+}
+
 pub(crate) struct AccountUpdateManager {
     websocket_url: String,
+    actor_id: u32,
     request_id: u64,
     inflight: HashMap<u64, (InflightRequest, Instant)>,
     subs: HashSet<(Subscription, Commitment)>,
@@ -70,6 +132,7 @@ impl std::fmt::Debug for AccountUpdateManager {
 
 impl AccountUpdateManager {
     pub fn init(
+        actor_id: u32,
         accounts: AccountsDb,
         program_accounts: ProgramAccountsDb,
         connected: Arc<AtomicBool>,
@@ -81,7 +144,7 @@ impl AccountUpdateManager {
 
             ctx.set_mailbox_capacity(MAILBOX_CAPACITY);
 
-            ctx.run_interval(Duration::from_secs(5), |actor, ctx| {
+            ctx.run_interval(Duration::from_secs(5), move |actor, ctx| {
                 if actor.connected.load(Ordering::Relaxed) {
                     if let Some((sink, _)) = &mut actor.connection {
                         if sink
@@ -103,7 +166,7 @@ impl AccountUpdateManager {
                 }
             });
 
-            ctx.run_interval(Duration::from_secs(5), |actor, _ctx| {
+            ctx.run_interval(Duration::from_secs(5), move |actor, _ctx| {
                 if actor.connected.load(Ordering::Relaxed) {
                     actor.inflight.retain(|request_id, (req, time)| {
                         let elapsed = time.elapsed();
@@ -119,6 +182,7 @@ impl AccountUpdateManager {
 
             AccountUpdateManager::add_stream(purge_stream, ctx);
             AccountUpdateManager {
+                actor_id,
                 websocket_url: websocket_url.to_owned(),
                 connection: None,
                 id_to_sub: HashMap::default(),
@@ -157,9 +221,10 @@ impl AccountUpdateManager {
         use backoff::backoff::Backoff;
 
         let websocket_url = self.websocket_url.clone();
+        let actor_id = self.actor_id;
         let fut = async move {
             loop {
-                info!(message = "connecting to websocket", url = %websocket_url);
+                info!(message = "connecting to websocket", url = %websocket_url, actor_id = %actor_id);
                 let mut backoff = backoff::ExponentialBackoff {
                     initial_interval: Duration::from_millis(100),
                     ..Default::default()
@@ -173,7 +238,7 @@ impl AccountUpdateManager {
                 match res {
                     Ok((_, conn)) => break conn,
                     Err(err) => {
-                        error!(message = "failed to connect", url = %websocket_url, error = ?err);
+                        error!(message = "failed to connect", url = %websocket_url, error = ?err, actor_id = %actor_id);
                         tokio::time::delay_for(
                             backoff
                                 .next_backoff()
@@ -186,25 +251,17 @@ impl AccountUpdateManager {
         };
         let fut = fut.into_actor(self).map(|conn, actor, ctx| {
             let (sink, stream) = futures_util::stream::StreamExt::split(conn);
-            let (sink, stream) = (
-                sink,
-                stream
-                    .take_while(|item| {
-                        if let Err(err) = &item {
-                            warn!(message = "websocket error", error = %err);
-                        }
-                        item.is_ok()
-                    })
-                    .filter_map(Result::ok),
-            );
+            let actor_id = actor.actor_id;
             let sink = SinkWrite::new(sink, ctx);
             let stream_handle = AccountUpdateManager::add_stream(stream, ctx);
 
             let old = std::mem::replace(&mut actor.connection, Some((sink, stream_handle)));
-            if old.is_some() {
-                warn!("old connection not canceled properly");
+            if let Some((mut sink, stream)) = old {
+                warn!(message = "old connection not canceled properly", actor_id = %actor_id);
+                sink.close();
+                ctx.cancel_future(stream);
             }
-            metrics().websocket_connected.set(1);
+            metrics().websocket_connected.inc();
             actor.last_received_at = Instant::now();
         });
         ctx.wait(fut);
@@ -325,7 +382,13 @@ impl AccountUpdateManager {
             );
             self.send(&request)?;
         }
-        info!(message = "purge", key = %sub.key(), commitment = ?commitment);
+        self.purge_key(&sub, commitment);
+
+        Ok(())
+    }
+
+    fn purge_key(&mut self, sub: &Subscription, commitment: Commitment) {
+        info!(self.actor_id, message = "purge", key = %sub.key(), commitment = ?commitment);
         match sub {
             Subscription::Program(key) => {
                 let keys = self
@@ -347,8 +410,6 @@ impl AccountUpdateManager {
                 self.accounts.remove(&key, commitment);
             }
         }
-
-        Ok(())
     }
 
     fn process_ws_message(&mut self, text: &[u8]) -> Result<(), serde_json::Error> {
@@ -375,15 +436,15 @@ impl AccountUpdateManager {
                 if let Some((req, _)) = self.inflight.remove(&id) {
                     match req {
                         InflightRequest::Sub(sub, commitment) => {
-                            warn!(request_id = id, error = ?error, key = %sub.key(), commitment = ?commitment, "subscribe failed");
+                            warn!(self.actor_id, request_id = id, error = ?error, key = %sub.key(), commitment = ?commitment, "subscribe failed");
                             metrics().subscribe_errors.inc();
                             self.subs.remove(&(sub, commitment));
                         }
                         InflightRequest::Unsub(sub, commitment) => {
-                            warn!(request_id = id, error = ?error, key = %sub.key(), commitment = ?commitment, "unsubscribe failed");
+                            warn!(self.actor_id, request_id = id, error = ?error, key = %sub.key(), commitment = ?commitment, "unsubscribe failed");
                         }
                         InflightRequest::SlotSub(_) => {
-                            warn!(request_id = id, error = ?error, "slot subscribe failed");
+                            warn!(self.actor_id, request_id = id, error = ?error, "slot subscribe failed");
                         }
                     }
                 }
@@ -400,7 +461,7 @@ impl AccountUpdateManager {
                             let sub_id: u64 = serde_json::from_str(result.get())?;
                             self.id_to_sub.insert(sub_id, (sub, commitment));
                             self.sub_to_id.insert((sub, commitment), sub_id);
-                            info!(message = "subscribed to stream", sub_id = sub_id, sub = %sub, commitment = ?commitment);
+                            info!(self.actor_id, message = "subscribed to stream", sub_id = sub_id, sub = %sub, commitment = ?commitment);
                             metrics().subscriptions_active.inc();
                         }
                         InflightRequest::Unsub(sub, commitment) => {
@@ -419,11 +480,11 @@ impl AccountUpdateManager {
                                 }
                                 metrics().subscriptions_active.dec();
                             } else {
-                                warn!(message = "unsubscribe failed", key = %sub.key());
+                                warn!(self.actor_id, message = "unsubscribe failed", key = %sub.key());
                             }
                         }
                         InflightRequest::SlotSub(_) => {
-                            info!(message = "subscribed to root");
+                            info!(self.actor_id, message = "subscribed to root");
                         }
                     }
                 }
@@ -541,8 +602,9 @@ impl AccountUpdateManager {
     }
 
     fn reconnect(&mut self, ctx: &mut Context<Self>) {
-        info!("websocket disconnected");
-        metrics().websocket_connected.set(0);
+        let actor_id = self.actor_id;
+        info!(actor_id, "websocket disconnected");
+        metrics().websocket_connected.dec();
         metrics().subscriptions_active.set(0);
         self.connected.store(false, Ordering::Relaxed);
 
@@ -556,9 +618,11 @@ impl AccountUpdateManager {
         self.id_to_sub.clear();
         self.sub_to_id.clear();
 
-        info!("purging all caches");
-        self.accounts.clear();
-        self.program_accounts.clear();
+        info!(actor_id, "purging related caches");
+        let to_purge: Vec<_> = self.subs.iter().cloned().collect();
+        for (sub, commitment) in to_purge {
+            self.purge_key(&sub, commitment);
+        }
 
         self.connect(ctx);
     }
@@ -605,9 +669,22 @@ impl Handler<AccountCommand> for AccountUpdateManager {
     }
 }
 
-impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
-    fn handle(&mut self, item: awc::ws::Frame, ctx: &mut Context<Self>) {
+impl StreamHandler<Result<awc::ws::Frame, awc::error::WsProtocolError>> for AccountUpdateManager {
+    fn handle(
+        &mut self,
+        item: Result<awc::ws::Frame, awc::error::WsProtocolError>,
+        ctx: &mut Context<Self>,
+    ) {
         self.last_received_at = Instant::now();
+
+        let item = match item {
+            Ok(item) => item,
+            Err(err) => {
+                error!(error = %err, "websocket protocol error");
+                self.reconnect(ctx);
+                return;
+            }
+        };
 
         let _ = (|| -> Result<(), serde_json::Error> {
             use awc::ws::Frame;
@@ -667,7 +744,7 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
     }
 
     fn started(&mut self, _ctx: &mut Context<Self>) {
-        info!("websocket connected");
+        info!(self.actor_id, "websocket connected");
         // subscribe to slots
         let request_id = self.next_request_id();
         let request = serde_json::json!({
@@ -682,7 +759,7 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
         let _ = self.send(&request);
 
         // restore subscriptions
-        info!("adding subscriptions");
+        info!(self.actor_id, "adding subscriptions");
         let subs_len = self.subs.len();
         let subs = std::mem::replace(&mut self.subs, HashSet::with_capacity(subs_len));
 
@@ -718,7 +795,7 @@ impl Actor for AccountUpdateManager {
 
 impl actix::io::WriteHandler<awc::error::WsProtocolError> for AccountUpdateManager {
     fn error(&mut self, err: awc::error::WsProtocolError, ctx: &mut Self::Context) -> Running {
-        error!(message = "websocket error", error = ?err);
+        error!(message = "websocket write error", error = ?err);
         self.reconnect(ctx);
         Running::Continue
     }
@@ -735,7 +812,7 @@ pub(crate) enum Subscription {
 }
 
 impl Subscription {
-    fn key(&self) -> Pubkey {
+    pub fn key(&self) -> Pubkey {
         match *self {
             Subscription::Account(key) => key,
             Subscription::Program(key) => key,

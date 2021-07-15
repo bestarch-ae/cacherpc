@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,7 +19,7 @@ mod metrics;
 mod rpc;
 mod types;
 
-use accounts::AccountUpdateManager;
+use accounts::PubSubManager;
 use types::{AccountsDb, ProgramAccountsDb};
 
 #[derive(Debug, structopt::StructOpt)]
@@ -75,6 +75,13 @@ struct Options {
     log_format: LogFormat,
     #[structopt(long = "log-file", help = "file path")]
     log_file: Option<std::path::PathBuf>,
+    #[structopt(
+        short = "c",
+        long = "websocket-connections",
+        help = "number of WebSocket connections to validator",
+        default_value = "1"
+    )]
+    websocket_connections: u32,
 }
 
 #[derive(Debug)]
@@ -137,12 +144,11 @@ async fn main() -> Result<()> {
 async fn run(options: Options) -> Result<()> {
     let accounts = AccountsDb::new();
     let program_accounts = ProgramAccountsDb::new();
-    let connected = Arc::new(AtomicBool::new(false));
 
-    let addr = AccountUpdateManager::init(
+    let pubsub = PubSubManager::init(
+        options.websocket_connections,
         accounts.clone(),
         program_accounts.clone(),
-        Arc::clone(&connected),
         &options.ws_url,
     );
 
@@ -173,7 +179,7 @@ async fn run(options: Options) -> Result<()> {
             accounts: accounts.clone(),
             program_accounts: program_accounts.clone(),
             client,
-            actor: addr.clone(),
+            pubsub: pubsub.clone(),
             rpc_url: rpc_url.clone(),
             map_updated: notify.clone(),
             account_info_request_limit: account_info_request_limit.clone(),
@@ -183,7 +189,6 @@ async fn run(options: Options) -> Result<()> {
                 let id = worker_id_counter.fetch_add(1, Ordering::SeqCst);
                 format!("rpc-{}", id)
             },
-            connected: Arc::clone(&connected),
         };
         let cors = Cors::default()
             .allow_any_origin()

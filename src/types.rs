@@ -122,10 +122,6 @@ impl ProgramAccountsDb {
             accounts.value_mut().remove(commitment, account_key);
         }
     }
-
-    pub fn clear(&self) {
-        self.map.clear()
-    }
 }
 
 #[derive(Clone)]
@@ -186,10 +182,6 @@ impl AccountsDb {
             map: Arc::new(DashMap::new()),
             slot: Arc::new([AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)]),
         }
-    }
-
-    pub fn clear(&self) {
-        self.map.clear();
     }
 
     pub fn get(&self, key: &Pubkey) -> Option<Ref<'_, Pubkey, AccountState>> {
