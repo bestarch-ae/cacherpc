@@ -38,3 +38,4 @@ backoff = "0.2"
 signal-hook = "0.1.11"
 file-reopen = { git = "https://github.com/polachok/file-reopen.git", rev = "da89261" }
 either = "1.6"
+actix-http = "2.2"
