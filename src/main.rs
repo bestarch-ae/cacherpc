@@ -151,6 +151,8 @@ async fn run(options: Options) -> Result<()> {
     let account_info_request_limit = Arc::new(Semaphore::new(options.account_info_request_limit));
     let program_accounts_request_limit =
         Arc::new(Semaphore::new(options.program_accounts_request_limit));
+    let total_connection_limit =
+        2 * (options.account_info_request_limit + options.program_accounts_request_limit);
     let body_cache_size = options.body_cache_size;
     let worker_id_counter = Arc::new(AtomicUsize::new(0));
     let bind_addr = &options.addr;
@@ -158,7 +160,14 @@ async fn run(options: Options) -> Result<()> {
     HttpServer::new(move || {
         let client = Client::builder()
             .timeout(Duration::from_secs(60))
-            .connector(awc::Connector::new().finish())
+            .no_default_headers()
+            .connector(
+                awc::Connector::new()
+                    .conn_keep_alive(Duration::from_secs(60))
+                    .conn_lifetime(Duration::from_secs(600))
+                    .limit(total_connection_limit)
+                    .finish(),
+            )
             .finish();
         let state = rpc::State {
             accounts: accounts.clone(),
