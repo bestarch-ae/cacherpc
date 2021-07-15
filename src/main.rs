@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,7 +19,7 @@ mod metrics;
 mod rpc;
 mod types;
 
-use accounts::AccountUpdateManager;
+use accounts::PubSubManager;
 use types::{AccountsDb, ProgramAccountsDb};
 
 #[derive(Debug, structopt::StructOpt)]
@@ -141,61 +141,16 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-struct Addrs<T: actix::Actor>(Vec<actix::Addr<T>>);
-
-impl<T: actix::Actor> Clone for Addrs<T> {
-    fn clone(&self) -> Self {
-        Addrs(self.0.clone())
-    }
-}
-
-impl Addrs<AccountUpdateManager> {
-    fn get_addr_by_key(&self, key: types::Pubkey) -> actix::Addr<AccountUpdateManager> {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let mut hasher = DefaultHasher::new();
-        key.hash(&mut hasher);
-        let hash = hasher.finish();
-        let idx = (hash % self.0.len() as u64) as usize;
-        self.0[idx].clone()
-    }
-
-    fn reset(&self, sub: accounts::Subscription, commitment: types::Commitment) {
-        let addr = self.get_addr_by_key(sub.key());
-        addr.do_send(accounts::AccountCommand::Reset(sub, commitment))
-    }
-
-    fn subscribe(
-        &self,
-        sub: accounts::Subscription,
-        commitment: types::Commitment,
-        filters: Option<smallvec::SmallVec<[types::Filter; 2]>>,
-    ) {
-        let addr = self.get_addr_by_key(sub.key());
-        addr.do_send(accounts::AccountCommand::Subscribe(
-            sub, commitment, filters,
-        ))
-    }
-}
-
 async fn run(options: Options) -> Result<()> {
     let accounts = AccountsDb::new();
     let program_accounts = ProgramAccountsDb::new();
-    let connected = Arc::new(AtomicBool::new(false));
 
-    let mut addrs = Vec::new();
-    for id in 0..options.websocket_connections {
-        let addr = AccountUpdateManager::init(
-            id,
-            accounts.clone(),
-            program_accounts.clone(),
-            Arc::clone(&connected),
-            &options.ws_url,
-        );
-        addrs.push(addr)
-    }
-    let addrs = Addrs(addrs);
+    let pubsub = PubSubManager::init(
+        options.websocket_connections,
+        accounts.clone(),
+        program_accounts.clone(),
+        &options.ws_url,
+    );
 
     let rpc_url = options.rpc_url;
     let notify = Arc::new(Notify::new());
@@ -224,7 +179,7 @@ async fn run(options: Options) -> Result<()> {
             accounts: accounts.clone(),
             program_accounts: program_accounts.clone(),
             client,
-            actor: addrs.clone(),
+            pubsub: pubsub.clone(),
             rpc_url: rpc_url.clone(),
             map_updated: notify.clone(),
             account_info_request_limit: account_info_request_limit.clone(),
@@ -234,7 +189,6 @@ async fn run(options: Options) -> Result<()> {
                 let id = worker_id_counter.fetch_add(1, Ordering::SeqCst);
                 format!("rpc-{}", id)
             },
-            connected: Arc::clone(&connected),
         };
         let cors = Cors::default()
             .allow_any_origin()

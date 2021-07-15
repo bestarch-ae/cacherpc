@@ -1,10 +1,7 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashSet;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
+use std::sync::Arc;
 use std::time::Duration;
 
 use actix_web::{web, HttpResponse, ResponseError};
@@ -21,7 +18,7 @@ use thiserror::Error;
 use tokio::sync::{Notify, Semaphore};
 use tracing::{error, info, warn};
 
-use crate::accounts::{AccountUpdateManager, Subscription};
+use crate::accounts::Subscription;
 use crate::metrics::rpc_metrics as metrics;
 use crate::types::{
     AccountContext, AccountData, AccountInfo, AccountState, AccountsDb, Commitment, Encoding,
@@ -165,27 +162,26 @@ pub(crate) struct State {
     pub accounts: AccountsDb,
     pub program_accounts: ProgramAccountsDb,
     pub client: Client,
-    pub actor: crate::Addrs<AccountUpdateManager>,
+    pub pubsub: crate::PubSubManager,
     pub rpc_url: String,
     pub map_updated: Arc<Notify>,
     pub account_info_request_limit: Arc<Semaphore>,
     pub program_accounts_request_limit: Arc<Semaphore>,
     pub lru: RefCell<LruCache<u64, Box<RawValue>>>,
     pub worker_id: String,
-    pub connected: Arc<AtomicBool>,
 }
 
 impl State {
     fn reset(&self, sub: Subscription, commitment: Commitment) {
-        self.actor.reset(sub, commitment);
+        self.pubsub.reset(sub, commitment);
     }
 
     fn insert(&self, key: Pubkey, data: AccountContext, commitment: Commitment) {
         self.accounts.insert(key, data, commitment)
     }
 
-    fn is_connected(&self) -> bool {
-        self.connected.load(Ordering::Relaxed)
+    fn is_connected(&self, key: Pubkey) -> bool {
+        self.pubsub.is_connected(key)
     }
 
     async fn subscribe(
@@ -194,7 +190,7 @@ impl State {
         commitment: Commitment,
         filters: Option<SmallVec<[Filter; 2]>>,
     ) {
-        self.actor.subscribe(subscription, commitment, filters);
+        self.pubsub.subscribe(subscription, commitment, filters);
         /*
         let res = self
             .actor
@@ -574,7 +570,7 @@ async fn get_account_info(
     let mut cacheable_for_key = Some(pubkey);
 
     // pass through for JsonParsed as we don't support it yet
-    if config.encoding != Encoding::JsonParsed && app_state.is_connected() {
+    if config.encoding != Encoding::JsonParsed && app_state.is_connected(pubkey) {
         let commitment = config.commitment.unwrap_or_default();
         match app_state.accounts.get(&pubkey) {
             Some(data) => {
@@ -897,7 +893,7 @@ async fn get_program_accounts(
         None
     };
 
-    if config.encoding != Encoding::JsonParsed && app_state.is_connected() {
+    if config.encoding != Encoding::JsonParsed && app_state.is_connected(pubkey) {
         let commitment = config.commitment.unwrap_or_default();
         match app_state.program_accounts.get(&pubkey, filters.clone()) {
             Some(data) => {

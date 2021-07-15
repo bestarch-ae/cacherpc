@@ -45,6 +45,67 @@ type WsSink = SinkWrite<
     >,
 >;
 
+#[derive(Clone)]
+pub(crate) struct PubSubManager(Vec<(actix::Addr<AccountUpdateManager>, Arc<AtomicBool>)>);
+
+impl PubSubManager {
+    pub(crate) fn init(
+        connections: u32,
+        accounts: AccountsDb,
+        program_accounts: ProgramAccountsDb,
+        websocket_url: &str,
+    ) -> Self {
+        let mut addrs = Vec::new();
+        for id in 0..connections {
+            let connected = Arc::new(AtomicBool::new(false));
+            let addr = AccountUpdateManager::init(
+                id,
+                accounts.clone(),
+                program_accounts.clone(),
+                Arc::clone(&connected),
+                &websocket_url,
+            );
+            addrs.push((addr, connected))
+        }
+        PubSubManager(addrs)
+    }
+
+    fn get_idx_by_key(&self, key: Pubkey) -> usize {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        let hash = hasher.finish();
+        (hash % self.0.len() as u64) as usize
+    }
+
+    fn get_addr_by_key(&self, key: Pubkey) -> actix::Addr<AccountUpdateManager> {
+        let idx = self.get_idx_by_key(key);
+        self.0[idx].0.clone()
+    }
+
+    pub fn is_connected(&self, key: Pubkey) -> bool {
+        let idx = self.get_idx_by_key(key);
+        self.0[idx].1.load(Ordering::Relaxed)
+    }
+
+    pub fn reset(&self, sub: Subscription, commitment: Commitment) {
+        let addr = self.get_addr_by_key(sub.key());
+        addr.do_send(AccountCommand::Reset(sub, commitment))
+    }
+
+    pub fn subscribe(
+        &self,
+        sub: Subscription,
+        commitment: Commitment,
+        filters: Option<smallvec::SmallVec<[Filter; 2]>>,
+    ) {
+        let addr = self.get_addr_by_key(sub.key());
+        addr.do_send(AccountCommand::Subscribe(sub, commitment, filters))
+    }
+}
+
 pub(crate) struct AccountUpdateManager {
     websocket_url: String,
     actor_id: u32,
