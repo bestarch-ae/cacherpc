@@ -9,6 +9,8 @@ use actix::io::SinkWrite;
 use actix::prelude::AsyncContext;
 use actix::prelude::{Actor, Addr, Context, Handler, Message, Running, StreamHandler};
 use actix::SpawnHandle;
+use actix_http::ws;
+use bytes::BytesMut;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use smallvec::SmallVec;
@@ -25,11 +27,13 @@ use crate::types::{
 
 const MAILBOX_CAPACITY: usize = 512;
 const PURGE_TIMEOUT: Duration = Duration::from_secs(600);
-const WEBSOCKET_PING_TIMEOUT: Duration = Duration::from_secs(10);
+const IN_FLIGHT_TIMEOUT: Duration = Duration::from_secs(30);
+const WEBSOCKET_PING_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[derive(Debug)]
 enum InflightRequest {
     Sub(Subscription, Commitment),
-    Unsub(Subscription),
+    Unsub(Subscription, Commitment),
     SlotSub(u64),
 }
 
@@ -44,17 +48,18 @@ type WsSink = SinkWrite<
 pub(crate) struct AccountUpdateManager {
     websocket_url: String,
     request_id: u64,
-    inflight: HashMap<u64, InflightRequest>,
+    inflight: HashMap<u64, (InflightRequest, Instant)>,
     subs: HashSet<(Subscription, Commitment)>,
     id_to_sub: HashMap<u64, (Subscription, Commitment)>,
-    sub_to_id: HashMap<Subscription, u64>,
+    sub_to_id: HashMap<(Subscription, Commitment), u64>,
     connection: Option<(WsSink, SpawnHandle)>,
     accounts: AccountsDb,
     program_accounts: ProgramAccountsDb,
-    purge_queue: DelayQueueHandle<Subscription>,
+    purge_queue: DelayQueueHandle<(Subscription, Commitment)>,
     additional_keys: HashMap<Pubkey, HashSet<SmallVec<[Filter; 2]>>>,
-    last_pong: Instant,
+    last_received_at: Instant,
     connected: Arc<AtomicBool>,
+    buffer: BytesMut,
 }
 
 impl std::fmt::Debug for AccountUpdateManager {
@@ -72,19 +77,43 @@ impl AccountUpdateManager {
     ) -> Addr<Self> {
         AccountUpdateManager::create(|ctx| {
             let (handle, stream) = delay_queue();
-            let purge_stream = stream.map(AccountCommand::Purge);
+            let purge_stream = stream.map(|(sub, com)| AccountCommand::Purge(sub, com));
 
             ctx.set_mailbox_capacity(MAILBOX_CAPACITY);
 
-            ctx.run_interval(Duration::from_secs(1), |actor, ctx| {
+            ctx.run_interval(Duration::from_secs(5), |actor, ctx| {
                 if actor.connected.load(Ordering::Relaxed) {
                     if let Some((sink, _)) = &mut actor.connection {
-                        sink.write(awc::ws::Message::Ping(b"hello?".as_ref().into()));
+                        if sink
+                            .write(awc::ws::Message::Ping(b"hello?".as_ref().into()))
+                            .is_some()
+                        {
+                            warn!("failed to write ping");
+                        }
+
+                        let elapsed = actor.last_received_at.elapsed();
+                        if elapsed > WEBSOCKET_PING_TIMEOUT {
+                            warn!(
+                                "no messages received in {:?}, assume connection lost ({:?})",
+                                elapsed, actor.last_received_at
+                            );
+                            actor.reconnect(ctx);
+                        }
                     }
-                    if actor.last_pong.elapsed() > WEBSOCKET_PING_TIMEOUT {
-                        warn!("websocket pong not received in time, assume connection lost");
-                        <Self as StreamHandler<awc::ws::Frame>>::finished(actor, ctx);
-                    }
+                }
+            });
+
+            ctx.run_interval(Duration::from_secs(5), |actor, _ctx| {
+                if actor.connected.load(Ordering::Relaxed) {
+                    actor.inflight.retain(|request_id, (req, time)| {
+                        let elapsed = time.elapsed();
+                        let too_long = elapsed > IN_FLIGHT_TIMEOUT;
+                        if too_long {
+                            warn!(request_id, request = ?req, timeout = ?IN_FLIGHT_TIMEOUT,
+                                elapsed = ?elapsed, "request in flight too long, assume dead");
+                        }
+                        !too_long
+                    })
                 }
             });
 
@@ -102,7 +131,8 @@ impl AccountUpdateManager {
                 purge_queue: handle,
                 additional_keys: HashMap::default(),
                 connected,
-                last_pong: Instant::now(),
+                last_received_at: Instant::now(),
+                buffer: BytesMut::new(),
             }
         })
     }
@@ -169,15 +199,13 @@ impl AccountUpdateManager {
             );
             let sink = SinkWrite::new(sink, ctx);
             let stream_handle = AccountUpdateManager::add_stream(stream, ctx);
-            actor.last_pong = Instant::now();
 
-            if let Some((_, handle)) =
-                std::mem::replace(&mut actor.connection, Some((sink, stream_handle)))
-            {
-                // stop old stream
-                ctx.cancel_future(handle);
+            let old = std::mem::replace(&mut actor.connection, Some((sink, stream_handle)));
+            if old.is_some() {
+                warn!("old connection not canceled properly");
             }
             metrics().websocket_connected.set(1);
+            actor.last_received_at = Instant::now();
         });
         ctx.wait(fut);
     }
@@ -219,22 +247,23 @@ impl AccountUpdateManager {
             }
         }
 
+        if self.subs.contains(&(sub, commitment)) {
+            info!(message = "already trying to subscribe", pubkey = %sub.key());
+            return Ok(());
+        }
+
         let request_id = self.next_request_id();
 
         let (key, method) = match sub {
             Subscription::Account(key) => (key, "accountSubscribe"),
             Subscription::Program(key) => (key, "programSubscribe"),
         };
-        if self.subs.contains(&(sub, commitment)) {
-            info!(message = "already trying to subscribe", pubkey = %key);
-            return Ok(());
-        }
-
         info!(
             message = "subscribe to",
             pubkey = %key,
             method = method,
-            commitment = ?commitment
+            commitment = ?commitment,
+            request_id = request_id,
         );
 
         let request = Request {
@@ -250,13 +279,288 @@ impl AccountUpdateManager {
             },
         };
 
-        self.inflight
-            .insert(request_id, InflightRequest::Sub(sub, commitment));
+        self.inflight.insert(
+            request_id,
+            (InflightRequest::Sub(sub, commitment), Instant::now()),
+        );
         self.subs.insert((sub, commitment));
         self.send(&request)?;
-        self.purge_queue.insert(sub, PURGE_TIMEOUT);
+        self.purge_queue.insert((sub, commitment), PURGE_TIMEOUT);
+        metrics().subscribe_requests.inc();
 
         Ok(())
+    }
+
+    fn unsubscribe(
+        &mut self,
+        sub: Subscription,
+        commitment: Commitment,
+    ) -> Result<(), serde_json::Error> {
+        let request_id = self.next_request_id();
+
+        #[derive(Serialize)]
+        struct Request<'a> {
+            jsonrpc: &'a str,
+            id: u64,
+            method: &'a str,
+            params: [u64; 1],
+        }
+
+        if let Some(sub_id) = self.sub_to_id.get(&(sub, commitment)) {
+            info!(message = "unsubscribe", key = %sub.key(), commitment = ?commitment, request_id = request_id);
+
+            let method = match sub {
+                Subscription::Program(_) => "programUnsubscribe",
+                Subscription::Account(_) => "accountUnsubscribe",
+            };
+            let request = Request {
+                jsonrpc: "2.0",
+                id: request_id,
+                method,
+                params: [*sub_id],
+            };
+            self.inflight.insert(
+                request_id,
+                (InflightRequest::Unsub(sub, commitment), Instant::now()),
+            );
+            self.send(&request)?;
+        }
+        info!(message = "purge", key = %sub.key(), commitment = ?commitment);
+        match sub {
+            Subscription::Program(key) => {
+                let keys = self
+                    .additional_keys
+                    .remove(&key)
+                    .into_iter()
+                    .flatten()
+                    .map(|filter| (key, Some(filter)))
+                    .chain(Some((key, None)));
+                for (key, filter) in keys {
+                    if let Some(program_accounts) = self.program_accounts.remove_all(&key, filter) {
+                        for key in program_accounts.into_accounts() {
+                            self.accounts.remove(&key, commitment)
+                        }
+                    }
+                }
+            }
+            Subscription::Account(key) => {
+                self.accounts.remove(&key, commitment);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn process_ws_message(&mut self, text: &[u8]) -> Result<(), serde_json::Error> {
+        #[derive(Deserialize, Debug)]
+        struct AnyMessage<'a> {
+            #[serde(borrow)]
+            result: Option<&'a RawValue>,
+            #[serde(borrow)]
+            method: Option<&'a str>,
+            id: Option<u64>,
+            #[serde(borrow)]
+            params: Option<&'a RawValue>,
+            #[serde(borrow)]
+            error: Option<&'a RawValue>,
+        }
+        let value: AnyMessage<'_> = serde_json::from_slice(&text)?;
+        match value {
+            // subscription error
+            AnyMessage {
+                error: Some(error),
+                id: Some(id),
+                ..
+            } => {
+                if let Some((req, _)) = self.inflight.remove(&id) {
+                    match req {
+                        InflightRequest::Sub(sub, commitment) => {
+                            warn!(request_id = id, error = ?error, key = %sub.key(), commitment = ?commitment, "subscribe failed");
+                            metrics().subscribe_errors.inc();
+                            self.subs.remove(&(sub, commitment));
+                        }
+                        InflightRequest::Unsub(sub, commitment) => {
+                            warn!(request_id = id, error = ?error, key = %sub.key(), commitment = ?commitment, "unsubscribe failed");
+                        }
+                        InflightRequest::SlotSub(_) => {
+                            warn!(request_id = id, error = ?error, "slot subscribe failed");
+                        }
+                    }
+                }
+            }
+            // subscription response
+            AnyMessage {
+                result: Some(result),
+                id: Some(id),
+                ..
+            } => {
+                if let Some((req, _)) = self.inflight.remove(&id) {
+                    match req {
+                        InflightRequest::Sub(sub, commitment) => {
+                            let sub_id: u64 = serde_json::from_str(result.get())?;
+                            self.id_to_sub.insert(sub_id, (sub, commitment));
+                            self.sub_to_id.insert((sub, commitment), sub_id);
+                            info!(message = "subscribed to stream", sub_id = sub_id, sub = %sub, commitment = ?commitment);
+                            metrics().subscriptions_active.inc();
+                        }
+                        InflightRequest::Unsub(sub, commitment) => {
+                            let is_ok: bool = serde_json::from_str(result.get())?;
+                            if is_ok {
+                                if let Some(sub_id) = self.sub_to_id.remove(&(sub, commitment)) {
+                                    self.id_to_sub.remove(&sub_id);
+                                    self.subs.remove(&(sub, commitment));
+                                    info!(
+                                        message = "unsubscribed from stream",
+                                        sub_id = sub_id,
+                                        key = %sub.key(),
+                                        sub = %sub,
+                                    );
+                                } else {
+                                }
+                                metrics().subscriptions_active.dec();
+                            } else {
+                                warn!(message = "unsubscribe failed", key = %sub.key());
+                            }
+                        }
+                        InflightRequest::SlotSub(_) => {
+                            info!(message = "subscribed to root");
+                        }
+                    }
+                }
+            }
+            // notification
+            AnyMessage {
+                method: Some(method),
+                params: Some(params),
+                ..
+            } => {
+                match method {
+                    "accountNotification" => {
+                        #[derive(Deserialize, Debug)]
+                        struct Params {
+                            result: AccountContext,
+                            subscription: u64,
+                        }
+                        let params: Params = serde_json::from_str(params.get())?;
+                        if let Some((sub, commitment)) = self.id_to_sub.get(&params.subscription) {
+                            //info!(key = %sub.key(), "received account notification");
+                            self.accounts.insert(sub.key(), params.result, *commitment);
+                        } else {
+                            warn!(message = "unknown subscription", sub = params.subscription);
+                        }
+                        metrics()
+                            .notifications_received
+                            .with_label_values(&["accountNotification"])
+                            .inc();
+                    }
+                    "programNotification" => {
+                        #[derive(Deserialize, Debug)]
+                        struct Value {
+                            account: AccountInfo,
+                            pubkey: Pubkey,
+                        }
+                        #[derive(Deserialize, Debug)]
+                        struct Result {
+                            context: SolanaContext,
+                            value: Value,
+                        }
+                        #[derive(Deserialize, Debug)]
+                        struct Params {
+                            result: Result,
+                            subscription: u64,
+                        }
+                        let params: Params = serde_json::from_str(params.get())?;
+                        if let Some((program_sub, commitment)) =
+                            self.id_to_sub.get(&params.subscription)
+                        {
+                            let program_key = program_sub.key();
+                            let key = params.result.value.pubkey;
+                            let account_info = &params.result.value.account;
+                            let data = &account_info.data;
+                            if let Some(filters) = self.additional_keys.get(&program_key) {
+                                for filter_group in filters {
+                                    if filter_group.iter().all(|f| f.matches(data)) {
+                                        self.program_accounts.add(
+                                            &program_key,
+                                            params.result.value.pubkey,
+                                            Some(filter_group.clone()),
+                                            *commitment,
+                                        );
+                                    } else {
+                                        self.program_accounts.remove(
+                                            &program_key,
+                                            &params.result.value.pubkey,
+                                            filter_group.clone(),
+                                            *commitment,
+                                        );
+                                    }
+                                }
+                            }
+                            self.accounts.insert(
+                                key,
+                                AccountContext {
+                                    value: Some(params.result.value.account),
+                                    context: params.result.context,
+                                },
+                                *commitment,
+                            );
+                            self.program_accounts.add(
+                                &program_key,
+                                params.result.value.pubkey,
+                                None,
+                                *commitment,
+                            );
+                        } else {
+                            warn!(message = "unknown subscription", sub = params.subscription);
+                        }
+                        metrics()
+                            .notifications_received
+                            .with_label_values(&["programNotification"])
+                            .inc();
+                    }
+                    "rootNotification" => {
+                        #[derive(Deserialize)]
+                        struct Params {
+                            result: u64, //SlotInfo,
+                        }
+                        let params: Params = serde_json::from_str(params.get())?;
+                        //info!("slot {} root {} parent {}", params.result.slot, params.result.root, params.result.parent);
+                        let _slot = params.result; // TODO: figure out which slot validator *actually* reports
+                    }
+                    _ => {
+                        warn!(message = "unknown notification", method = method);
+                    }
+                }
+            }
+            any => {
+                warn!(msg = ?any, text = ?text, "unidentified websocket message");
+            }
+        }
+
+        Ok(())
+    }
+
+    fn reconnect(&mut self, ctx: &mut Context<Self>) {
+        info!("websocket disconnected");
+        metrics().websocket_connected.set(0);
+        metrics().subscriptions_active.set(0);
+        self.connected.store(false, Ordering::Relaxed);
+
+        if let Some((mut sink, stream)) = self.connection.take() {
+            sink.close();
+            ctx.cancel_future(stream);
+        }
+
+        self.buffer.clear();
+        self.inflight.clear();
+        self.id_to_sub.clear();
+        self.sub_to_id.clear();
+
+        info!("purging all caches");
+        self.accounts.clear();
+        self.program_accounts.clear();
+
+        self.connect(ctx);
     }
 }
 
@@ -275,7 +579,6 @@ impl Handler<AccountCommand> for AccountUpdateManager {
 
     fn handle(&mut self, item: AccountCommand, _ctx: &mut Context<Self>) {
         let _ = (|| -> Result<(), serde_json::Error> {
-            let request_id = self.next_request_id();
             match item {
                 AccountCommand::Subscribe(sub, commitment, filters) => {
                     let key = sub.key();
@@ -285,60 +588,13 @@ impl Handler<AccountCommand> for AccountUpdateManager {
                         self.additional_keys.entry(key).or_default().insert(filters);
                     }
                 }
-                AccountCommand::Purge(sub) => {
+                AccountCommand::Purge(sub, commitment) => {
                     metrics().commands.with_label_values(&["purge"]).inc();
-                    info!(message = "purging", sub = ?sub, key = %sub.key());
-
-                    #[derive(Serialize)]
-                    struct Request<'a> {
-                        jsonrpc: &'a str,
-                        id: u64,
-                        method: &'a str,
-                        params: [u64; 1],
-                    }
-
-                    if let Some(sub_id) = self.sub_to_id.get(&sub) {
-                        let method = match sub {
-                            Subscription::Program(_) => "programUnsubscribe",
-                            Subscription::Account(_) => "accountUnsubscribe",
-                        };
-                        let request = Request {
-                            jsonrpc: "2.0",
-                            id: request_id,
-                            method,
-                            params: [*sub_id],
-                        };
-                        self.inflight
-                            .insert(request_id, InflightRequest::Unsub(sub));
-                        self.send(&request)?;
-                    }
-                    match sub {
-                        Subscription::Program(key) => {
-                            let keys = self
-                                .additional_keys
-                                .remove(&key)
-                                .into_iter()
-                                .flatten()
-                                .map(|filter| (key, Some(filter)))
-                                .chain(Some((key, None)));
-                            for (key, filter) in keys {
-                                if let Some(program_accounts) =
-                                    self.program_accounts.remove_all(&key, filter)
-                                {
-                                    for key in program_accounts.into_accounts() {
-                                        self.accounts.remove(&key)
-                                    }
-                                }
-                            }
-                        }
-                        Subscription::Account(key) => {
-                            self.accounts.remove(&key);
-                        }
-                    }
+                    self.unsubscribe(sub, commitment)?;
                 }
-                AccountCommand::Reset(key) => {
+                AccountCommand::Reset(key, commitment) => {
                     metrics().commands.with_label_values(&["reset"]).inc();
-                    self.purge_queue.reset(key, PURGE_TIMEOUT);
+                    self.purge_queue.reset((key, commitment), PURGE_TIMEOUT);
                 }
             }
             Ok(())
@@ -350,139 +606,62 @@ impl Handler<AccountCommand> for AccountUpdateManager {
 }
 
 impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
-    fn handle(&mut self, item: awc::ws::Frame, _ctx: &mut Context<Self>) {
+    fn handle(&mut self, item: awc::ws::Frame, ctx: &mut Context<Self>) {
+        self.last_received_at = Instant::now();
+
         let _ = (|| -> Result<(), serde_json::Error> {
             use awc::ws::Frame;
+
             match item {
                 Frame::Ping(data) => {
+                    metrics().bytes_received.inc_by(data.len() as u64);
                     if let Some((sink, _)) = &mut self.connection {
                         sink.write(awc::ws::Message::Pong(data));
                     }
                 }
                 Frame::Pong(_) => {
-                    self.last_pong = Instant::now();
+                    // do nothing
                 }
                 Frame::Text(text) => {
-                    #[derive(Deserialize)]
-                    struct AnyMessage<'a> {
-                        #[serde(borrow)]
-                        result: Option<&'a RawValue>,
-                        #[serde(borrow)]
-                        method: Option<&'a str>,
-                        id: Option<u64>,
-                        #[serde(borrow)]
-                        params: Option<&'a RawValue>,
-                    }
-                    let value: AnyMessage<'_> = serde_json::from_slice(&text)?;
-                    // subscription response
-                    if let (Some(result), Some(id)) = (value.result, value.id) {
-                        if let Some(req) = self.inflight.remove(&id) {
-                            match req {
-                                InflightRequest::Sub(sub, commitment) => {
-                                    let sub_id: u64 = serde_json::from_str(result.get())?;
-                                    self.id_to_sub.insert(sub_id, (sub, commitment));
-                                    self.sub_to_id.insert(sub, sub_id);
-                                    info!(message = "subscribed to stream", sub_id = sub_id, sub = %sub, commitment = ?commitment);
-                                    metrics().subscriptions_active.inc();
-                                }
-                                InflightRequest::Unsub(sub) => {
-                                    //let _is_ok: bool = serde_json::from_str(result.get()).unwrap();
-                                    if let Some(sub_id) = self.sub_to_id.remove(&sub) {
-                                        if let Some(val) = self.id_to_sub.remove(&sub_id) {
-                                            self.subs.remove(&val);
-                                        }
-                                        info!(
-                                            message = "unsubscribed from stream",
-                                            sub_id = sub_id,
-                                            sub= %sub,
-                                        );
-                                    }
-                                    metrics().subscriptions_active.dec();
-                                }
-                                InflightRequest::SlotSub(_) => {
-                                    info!(message = "subscribed to root");
-                                }
-                            }
-                        }
-
-                        // TODO: method response
-                        return Ok(());
-                    };
-                    // notification
-                    if let (Some(method), Some(params)) = (value.method, value.params) {
-                        match method {
-                            "accountNotification" => {
-                                #[derive(Deserialize, Debug)]
-                                struct Params {
-                                    result: AccountContext,
-                                    subscription: u64,
-                                }
-                                let params: Params = serde_json::from_str(params.get())?;
-                                if let Some((sub, commitment)) = self.id_to_sub.get(&params.subscription) {
-                                    self.accounts.insert(sub.key(), params.result, *commitment);
-                                } else {
-                                    warn!(message = "unknown subscription", sub = params.subscription);
-                                }
-                                metrics().notifications_received.with_label_values(&["accountNotification"]).inc();
-                            }
-                            "programNotification" => {
-                                #[derive(Deserialize, Debug)]
-                                struct Value {
-                                    account: AccountInfo,
-                                    pubkey: Pubkey,
-                                }
-                                #[derive(Deserialize, Debug)]
-                                struct Result {
-                                    context: SolanaContext,
-                                    value: Value,
-                                }
-                                #[derive(Deserialize, Debug)]
-                                struct Params {
-                                    result: Result,
-                                    subscription: u64,
-                                }
-                                let params: Params = serde_json::from_str(params.get())?;
-                                if let Some((program_sub, commitment)) = self.id_to_sub.get(&params.subscription) {
-                                    let program_key = program_sub.key();
-                                    let key = params.result.value.pubkey;
-                                    let account_info = &params.result.value.account;
-                                    let data = &account_info.data;
-                                    if let Some(filters) = self.additional_keys.get(&program_key) {
-                                        for filter_group in filters {
-                                            if filter_group.iter().all(|f| f.matches(data)) {
-                                                self.program_accounts.add(&program_key, params.result.value.pubkey, Some(filter_group.clone()), *commitment);
-                                            } else {
-                                                self.program_accounts.remove(&program_key, &params.result.value.pubkey, filter_group.clone(), *commitment);
-                                            }
-                                        }
-                                    }
-                                    self.accounts.insert(key, AccountContext {
-                                        value: Some(params.result.value.account), context: params.result.context }, *commitment);
-                                    self.program_accounts.add(&program_key, params.result.value.pubkey, None, *commitment);
-                                } else {
-                                    warn!(message = "unknown subscription", sub = params.subscription);
-                                }
-                                metrics().notifications_received.with_label_values(&["programNotification"]).inc();
-                            }
-                            "rootNotification" => {
-                                #[derive(Deserialize)]
-                                struct Params {
-                                    result: u64, //SlotInfo,
-                                }
-                                let params: Params = serde_json::from_str(params.get())?;
-                                //info!("slot {} root {} parent {}", params.result.slot, params.result.root, params.result.parent);
-                                let _slot = params.result; // TODO: figure out which slot validator *actually* reports
-                            }
-                            _ => {
-                                warn!(message = "unknown notification", method = method);
-                            }
-                        }
-                    }
+                    metrics().bytes_received.inc_by(text.len() as u64);
+                    self.process_ws_message(&text).map_err(|err| {
+                            error!(error = %err, bytes = ?text, "error while parsing message");
+                            err
+                        })?
                 }
-                _ => return Ok(()),
+                Frame::Close(reason) => {
+                    warn!(reason = ?reason, "websocket closing");
+                    self.reconnect(ctx);
+                }
+                Frame::Binary(msg) => {
+                    warn!(msg = ?msg, "unexpected binary message");
+                }
+                Frame::Continuation(msg) => match msg {
+                    ws::Item::FirstText(bytes) => {
+                        metrics().bytes_received.inc_by(bytes.len() as u64);
+                        self.buffer.extend(&bytes);
+                    }
+                    ws::Item::Continue(bytes) => {
+                        metrics().bytes_received.inc_by(bytes.len() as u64);
+                        self.buffer.extend(&bytes);
+                    }
+                    ws::Item::Last(bytes) => {
+                        metrics().bytes_received.inc_by(bytes.len() as u64);
+                        self.buffer.extend(&bytes);
+                        let text = std::mem::replace(&mut self.buffer, BytesMut::new());
+                        self.process_ws_message(&text).map_err(|err| {
+                            error!(error = %err, bytes = ?text, "error while parsing fragmented message");
+                            err
+                        })?;
+                    }
+                    ws::Item::FirstBinary(_) => {
+                        warn!(msg = ?msg, "unexpected continuation message");
+                    }
+                },
             }
             Ok(())
-        })().map_err(|err| {
+        })()
+        .map_err(|err| {
             error!(message = "error handling Frame", error = ?err);
         });
     }
@@ -496,14 +675,17 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
             "id": request_id,
             "method": "rootSubscribe",
         });
-        self.inflight
-            .insert(request_id, InflightRequest::SlotSub(request_id));
+        self.inflight.insert(
+            request_id,
+            (InflightRequest::SlotSub(request_id), Instant::now()),
+        );
         let _ = self.send(&request);
 
         // restore subscriptions
         info!("adding subscriptions");
         let subs_len = self.subs.len();
         let subs = std::mem::replace(&mut self.subs, HashSet::with_capacity(subs_len));
+
         for (sub, commitment) in subs {
             self.subscribe(sub, commitment).unwrap()
             // TODO: it would be nice to retrieve current state for
@@ -513,19 +695,7 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
     }
 
     fn finished(&mut self, ctx: &mut Context<Self>) {
-        info!("websocket disconnected");
-        metrics().websocket_connected.set(0);
-        self.connected.store(false, Ordering::Relaxed);
-
-        self.inflight.clear();
-        self.id_to_sub.clear();
-        self.sub_to_id.clear();
-
-        info!("purging all caches");
-        self.accounts.clear();
-        self.program_accounts.clear();
-
-        self.connect(ctx);
+        self.reconnect(ctx);
     }
 }
 
@@ -549,8 +719,12 @@ impl Actor for AccountUpdateManager {
 impl actix::io::WriteHandler<awc::error::WsProtocolError> for AccountUpdateManager {
     fn error(&mut self, err: awc::error::WsProtocolError, ctx: &mut Self::Context) -> Running {
         error!(message = "websocket error", error = ?err);
-        self.connect(ctx);
+        self.reconnect(ctx);
         Running::Continue
+    }
+
+    fn finished(&mut self, _ctx: &mut Self::Context) {
+        info!("writer finished");
     }
 }
 
@@ -583,8 +757,8 @@ impl std::fmt::Display for Subscription {
 #[rtype(result = "()")]
 pub(crate) enum AccountCommand {
     Subscribe(Subscription, Commitment, Option<SmallVec<[Filter; 2]>>),
-    Reset(Subscription),
-    Purge(Subscription),
+    Reset(Subscription, Commitment),
+    Purge(Subscription, Commitment),
 }
 
 enum DelayQueueCommand<T> {

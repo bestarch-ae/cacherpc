@@ -152,15 +152,20 @@ impl Default for AccountState {
 
 impl AccountState {
     pub fn get(&self, commitment: Commitment) -> Option<(Option<&AccountInfo>, Slot)> {
-        let mut result = None;
-        let mut slot = 0;
-        for acc in self.0.iter().take(commitment.as_idx() + 1).flatten() {
-            if acc.slot >= slot {
-                result = Some((acc.data.as_ref(), acc.slot));
-                slot = acc.slot;
+        match &(self.0)[commitment.as_idx()] {
+            None => None,
+            Some(data) => {
+                let mut result = None;
+                let mut slot = data.slot;
+                for acc in self.0.iter().take(commitment.as_idx() + 1).flatten() {
+                    if acc.slot >= slot {
+                        result = Some((acc.data.as_ref(), acc.slot));
+                        slot = acc.slot;
+                    }
+                }
+                result
             }
         }
-        result
     }
 
     fn insert(&mut self, commitment: Commitment, data: AccountContext) {
@@ -168,6 +173,10 @@ impl AccountState {
             data: data.value,
             slot: data.context.slot,
         })
+    }
+
+    fn remove(&mut self, commitment: Commitment) {
+        (self.0)[commitment.as_idx()] = None;
     }
 }
 
@@ -193,8 +202,10 @@ impl AccountsDb {
         entry.insert(commitment, data);
     }
 
-    pub fn remove(&self, key: &Pubkey) {
-        self.map.remove(key);
+    pub fn remove(&self, key: &Pubkey, commitment: Commitment) {
+        if let Some(mut entry) = self.map.get_mut(key) {
+            entry.remove(commitment)
+        }
     }
 
     fn update_slot(&self, commitment: Commitment, val: u64) {
@@ -220,6 +231,14 @@ impl Commitment {
             Commitment::Finalized => 0,
             Commitment::Confirmed => 1,
             Commitment::Processed => 2,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Commitment::Confirmed => "confirmed",
+            Commitment::Processed => "processed",
+            Commitment::Finalized => "finalized",
         }
     }
 }

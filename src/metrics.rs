@@ -7,9 +7,12 @@ use prometheus::{
 
 pub struct PubSubMetrics {
     pub subscriptions_active: IntGauge,
+    pub subscribe_requests: IntCounter,
+    pub subscribe_errors: IntCounter,
     pub websocket_connected: IntGauge,
     pub notifications_received: IntCounterVec,
     pub commands: IntCounterVec,
+    pub bytes_received: IntCounter,
 }
 
 pub fn pubsub_metrics() -> &'static PubSubMetrics {
@@ -19,6 +22,19 @@ pub fn pubsub_metrics() -> &'static PubSubMetrics {
             "number of active subcriptions"
         )
         .unwrap(),
+        subscribe_requests: register_int_counter!(
+            "subscribe_requests",
+            "number of subcribe requests sent"
+        )
+        .unwrap(),
+        bytes_received: register_int_counter!(
+            "bytes_received",
+            "number of bytes received in websocket frames"
+        )
+        .unwrap(),
+
+        subscribe_errors: register_int_counter!("subscribe_errors", "number of subscribe errors")
+            .unwrap(),
         websocket_connected: register_int_gauge!(
             "websocket_connected",
             "websocket connection status"
@@ -39,6 +55,7 @@ pub fn pubsub_metrics() -> &'static PubSubMetrics {
 pub struct RpcMetrics {
     request_types: IntCounterVec,
     pub request_encodings: IntCounterVec,
+    pub request_commitments: IntCounterVec,
     pub account_cache_hits: IntCounter,
     pub account_cache_filled: IntCounter,
     pub program_accounts_cache_hits: IntCounter,
@@ -47,6 +64,8 @@ pub struct RpcMetrics {
     pub backend_response_time: HistogramVec,
     pub backend_errors: IntCounterVec,
     pub handler_time: HistogramVec,
+    pub wait_time: HistogramVec,
+    pub available_permits: IntGaugeVec,
     pub response_size_bytes: HistogramVec,
     pub lru_cache_hits: IntCounter,
     pub lru_cache_filled: IntGaugeVec,
@@ -139,6 +158,12 @@ pub fn rpc_metrics() -> &'static RpcMetrics {
             &["type", "encoding"]
         )
         .unwrap(),
+        request_commitments: register_int_counter_vec!(
+            "request_commitments",
+            "Request commitment counts by type",
+            &["type", "commitment"]
+        )
+        .unwrap(),
         account_cache_hits: register_int_counter!("account_cache_hits", "Accounts cache hit")
             .unwrap(),
         lru_cache_hits: register_int_counter!("lru_cache_hits", "LRU cache hit").unwrap(),
@@ -184,6 +209,18 @@ pub fn rpc_metrics() -> &'static RpcMetrics {
         handler_time: register_histogram_vec!(
             "handler_time",
             "Handler processing time by type",
+            &["type"]
+        )
+        .unwrap(),
+        wait_time: register_histogram_vec!(
+            "wait_time",
+            "Time spent waiting for request limit by type",
+            &["type"]
+        )
+        .unwrap(),
+        available_permits: register_int_gauge_vec!(
+            "available_permits",
+            "Permits available to make backend requests",
             &["type"]
         )
         .unwrap(),

@@ -177,12 +177,8 @@ pub(crate) struct State {
 }
 
 impl State {
-    fn get_account(&self, key: &Pubkey) -> Option<Ref<'_, Pubkey, AccountState>> {
-        let actor = &self.actor;
-        self.accounts.get(key).map(|v| {
-            actor.do_send(AccountCommand::Reset(Subscription::Account(*key)));
-            v
-        })
+    fn reset(&self, sub: Subscription, commitment: Commitment) {
+        self.actor.do_send(AccountCommand::Reset(sub, commitment));
     }
 
     fn insert(&self, key: Pubkey, data: AccountContext, commitment: Commitment) {
@@ -216,7 +212,16 @@ impl State {
         let client = &self.client;
         let mut backoff = backoff_settings();
         loop {
+            let wait_time = metrics()
+                .wait_time
+                .with_label_values(&[req.method])
+                .start_timer();
             let _permit = limit.acquire().await;
+            metrics()
+                .available_permits
+                .with_label_values(&[req.method])
+                .set(limit.available_permits() as i64);
+            wait_time.observe_duration();
             let timer = metrics()
                 .backend_response_time
                 .with_label_values(&[req.method])
@@ -555,17 +560,26 @@ async fn get_account_info(
         .with_label_values(&["getAccountInfo", config.encoding.as_str()])
         .inc();
 
+    metrics()
+        .request_commitments
+        .with_label_values(&[
+            "getAccountInfo",
+            config.commitment.unwrap_or_default().as_str(),
+        ])
+        .inc();
+
     let mut cacheable_for_key = Some(pubkey);
 
     // pass through for JsonParsed as we don't support it yet
     if config.encoding != Encoding::JsonParsed && app_state.is_connected() {
-        match app_state.get_account(&pubkey) {
+        let commitment = config.commitment.unwrap_or_default();
+        match app_state.accounts.get(&pubkey) {
             Some(data) => {
                 let data = data.value();
-                let commitment = config.commitment.unwrap_or_default();
                 let account = data.get(commitment);
                 if let Some(account) = account {
                     metrics().account_cache_hits.inc();
+                    app_state.reset(Subscription::Account(pubkey), commitment);
                     return account_response(req.id, request_hash, account, &app_state, config);
                 }
             }
@@ -577,15 +591,11 @@ async fn get_account_info(
                         .with_label_values(&["getAccountInfo", "data_slice"])
                         .inc();
                 }
-                app_state
-                    .subscribe(
-                        Subscription::Account(pubkey),
-                        config.commitment.unwrap_or_default(),
-                        None,
-                    )
-                    .await;
             }
         }
+        app_state
+            .subscribe(Subscription::Account(pubkey), commitment, None)
+            .await;
     } else {
         cacheable_for_key = None;
         metrics()
@@ -612,10 +622,11 @@ async fn get_account_info(
             }
             _ = notified => {
                 if let Some(pubkey) = cacheable_for_key {
-                    if let Some(data) = app_state.get_account(&pubkey) {
+                    if let Some(data) = app_state.accounts.get(&pubkey) {
                         let data = data.value();
                         let commitment = config.commitment.unwrap_or_default();
                         if let Some(account) = data.get(commitment) {
+                            app_state.reset(Subscription::Account(pubkey), commitment);
                             metrics().account_cache_hits.inc();
                             metrics().account_cache_filled.inc();
                             return account_response(
@@ -649,8 +660,9 @@ async fn get_account_info(
         let resp: Wrap<'_> = serde_json::from_slice(&resp)?;
         match resp.inner {
             Response::Result(info) => {
-                info!(%pubkey, "cached for key");
-                app_state.insert(pubkey, info, config.commitment.unwrap_or_default());
+                let commitment = config.commitment.unwrap_or_default();
+                info!(%pubkey, ?commitment, "cached for key");
+                app_state.insert(pubkey, info, commitment);
                 app_state.map_updated.notify();
             }
             Response::Error(error) => {
@@ -660,10 +672,11 @@ async fn get_account_info(
                     .inc();
                 info!(%pubkey, ?error, "can't cache for key");
                 // check cache one more time, maybe another thread was more lucky
-                if let Some(data) = app_state.get_account(&pubkey) {
+                if let Some(data) = app_state.accounts.get(&pubkey) {
                     let data = data.value();
                     let commitment = config.commitment.unwrap_or_default();
                     if let Some(account) = data.get(commitment) {
+                        app_state.reset(Subscription::Account(pubkey), commitment);
                         metrics().account_cache_hits.inc();
                         metrics().account_cache_filled.inc();
                         return account_response(
@@ -760,10 +773,12 @@ fn program_accounts_response<'a>(
     let mut encoded_accounts = Vec::with_capacity(accounts.len());
 
     for key in accounts {
-        if let Some(data) = app_state.get_account(&key) {
+        if let Some(data) = app_state.accounts.get(&key) {
             if data.value().get(commitment).is_none() {
                 warn!("data for key {}/{:?} not found", key, commitment);
                 return Err(ProgramAccountsResponseError::Inconsistency);
+            } else {
+                app_state.reset(Subscription::Account(*key), commitment);
             }
 
             if let Some(filters) = &filters {
@@ -861,6 +876,14 @@ async fn get_program_accounts(
         .with_label_values(&["getProgramAccounts", config.encoding.as_str()])
         .inc();
 
+    metrics()
+        .request_commitments
+        .with_label_values(&[
+            "getProgramAccounts",
+            config.commitment.unwrap_or_default().as_str(),
+        ])
+        .inc();
+
     let mut cacheable_for_key = Some(pubkey);
 
     let filters: Option<SmallVec<[Filter; 2]>> = if let Some(filters) = &config.filters {
@@ -872,10 +895,12 @@ async fn get_program_accounts(
     };
 
     if config.encoding != Encoding::JsonParsed && app_state.is_connected() {
+        let commitment = config.commitment.unwrap_or_default();
         match app_state.program_accounts.get(&pubkey, filters.clone()) {
             Some(data) => {
                 let accounts = data.value();
-                if let Some(accounts) = accounts.get(config.commitment.unwrap_or_default()) {
+                if let Some(accounts) = accounts.get(commitment) {
+                    app_state.reset(Subscription::Program(pubkey), commitment);
                     metrics().program_accounts_cache_hits.inc();
                     if let Ok(resp) =
                         program_accounts_response(req.id.clone(), accounts, &config, &app_state)
@@ -897,15 +922,11 @@ async fn get_program_accounts(
                         .inc();
                     cacheable_for_key = None;
                 }
-                app_state
-                    .subscribe(
-                        Subscription::Program(pubkey),
-                        config.commitment.unwrap_or_default(),
-                        filters.clone(),
-                    )
-                    .await;
             }
         }
+        app_state
+            .subscribe(Subscription::Program(pubkey), commitment, filters.clone())
+            .await;
     } else {
         cacheable_for_key = None;
         metrics()
@@ -934,8 +955,10 @@ async fn get_program_accounts(
                 if let Some(program_pubkey) = cacheable_for_key {
                     if let Some(data) = app_state.program_accounts.get(&program_pubkey, filters.clone()) {
                         let data = data.value();
+                        let commitment = config.commitment.unwrap_or_default();
                         metrics().program_accounts_cache_filled.inc();
-                        if let Some(accounts) = data.get(config.commitment.unwrap_or_default()) {
+                        if let Some(accounts) = data.get(commitment) {
+                            app_state.reset(Subscription::Program(pubkey), commitment);
                             if let Ok(resp) = program_accounts_response(
                                 req.id.clone(),
                                 accounts,
