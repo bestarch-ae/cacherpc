@@ -204,6 +204,7 @@ impl AccountsDb {
         self.slot[commitment.as_idx()].fetch_max(val, Ordering::AcqRel);
     }
 
+    #[allow(unused)]
     pub fn get_slot(&self, commitment: Commitment) -> u64 {
         self.slot[commitment.as_idx()].load(Ordering::Acquire)
     }
