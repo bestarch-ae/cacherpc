@@ -469,9 +469,7 @@ fn account_response<'a, 'b>(
             .body(body));
     }
 
-    let slot = app_state
-        .accounts
-        .get_slot(config.commitment.unwrap_or_default());
+    let slot = acc.1;
     let ctx = SolanaContext { slot };
     let result = acc
             .0
