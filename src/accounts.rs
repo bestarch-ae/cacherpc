@@ -605,7 +605,9 @@ impl AccountUpdateManager {
         let actor_id = self.actor_id;
         info!(actor_id, "websocket disconnected");
         metrics().websocket_connected.dec();
-        metrics().subscriptions_active.set(0);
+        metrics()
+            .subscriptions_active
+            .sub(self.id_to_sub.len() as i64);
         self.connected.store(false, Ordering::Relaxed);
 
         if let Some((mut sink, stream)) = self.connection.take() {
