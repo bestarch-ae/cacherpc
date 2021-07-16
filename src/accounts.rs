@@ -603,30 +603,36 @@ impl AccountUpdateManager {
 
     fn reconnect(&mut self, ctx: &mut Context<Self>) {
         let actor_id = self.actor_id;
-        info!(actor_id, "websocket disconnected");
-        metrics().websocket_connected.dec();
-        metrics()
-            .subscriptions_active
-            .sub(self.id_to_sub.len() as i64);
-        self.connected.store(false, Ordering::Relaxed);
+        let was_connected = self.connected.fetch_and(false, Ordering::Relaxed);
 
-        if let Some((mut sink, stream)) = self.connection.take() {
-            sink.close();
-            ctx.cancel_future(stream);
+        if was_connected {
+            info!(actor_id, "websocket disconnected");
+
+            metrics().websocket_connected.dec();
+            metrics()
+                .subscriptions_active
+                .sub(self.id_to_sub.len() as i64);
+
+            if let Some((mut sink, stream)) = self.connection.take() {
+                sink.close();
+                ctx.cancel_future(stream);
+            }
+
+            self.buffer.clear();
+            self.inflight.clear();
+            self.id_to_sub.clear();
+            self.sub_to_id.clear();
+
+            info!(actor_id, "purging related caches");
+            let to_purge: Vec<_> = self.subs.iter().cloned().collect();
+            for (sub, commitment) in to_purge {
+                self.purge_key(&sub, commitment);
+            }
+
+            self.connect(ctx);
+        } else {
+            warn!(actor_id, "reconnect while not connected?");
         }
-
-        self.buffer.clear();
-        self.inflight.clear();
-        self.id_to_sub.clear();
-        self.sub_to_id.clear();
-
-        info!(actor_id, "purging related caches");
-        let to_purge: Vec<_> = self.subs.iter().cloned().collect();
-        for (sub, commitment) in to_purge {
-            self.purge_key(&sub, commitment);
-        }
-
-        self.connect(ctx);
     }
 }
 
