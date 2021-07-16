@@ -331,7 +331,7 @@ impl AccountUpdateManager {
                 key,
                 config: Config {
                     commitment,
-                    encoding: Encoding::Base64,
+                    encoding: Encoding::Base64Zstd,
                 },
             },
         };
