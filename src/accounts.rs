@@ -8,9 +8,9 @@ use std::time::Duration;
 use actix::io::SinkWrite;
 use actix::prelude::AsyncContext;
 use actix::prelude::{Actor, Addr, Context, Handler, Message, Running, StreamHandler};
-use actix::SpawnHandle;
 use actix_http::ws;
 use bytes::BytesMut;
+use futures_util::future::AbortHandle;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use smallvec::SmallVec;
@@ -109,7 +109,7 @@ impl PubSubManager {
 enum Connection {
     Disconnected,
     Connecting,
-    Connected { sink: WsSink, stream: SpawnHandle },
+    Connected { sink: WsSink, stream: AbortHandle },
 }
 
 impl Connection {
@@ -121,12 +121,12 @@ impl Connection {
         matches!(self, Connection::Connecting { .. })
     }
 
-    fn disconnect(&mut self, ctx: &mut Context<AccountUpdateManager>) {
+    fn disconnect(&mut self) {
         let old_connection = std::mem::replace(self, Connection::Disconnected);
 
         if let Connection::Connected { mut sink, stream } = old_connection {
             sink.close();
-            ctx.cancel_future(stream);
+            stream.abort();
         }
     }
 
@@ -183,7 +183,7 @@ impl AccountUpdateManager {
                         .send(awc::ws::Message::Ping(b"hello?".as_ref().into()))
                         .is_err()
                     {
-                        actor.connection.disconnect(ctx);
+                        actor.disconnect(ctx);
                     }
 
                     let elapsed = actor.last_received_at.elapsed();
@@ -258,20 +258,21 @@ impl AccountUpdateManager {
 
         if self.connection.is_connected() {
             warn!(message = "old connection not canceled properly", actor_id = %actor_id);
-            self.connection.disconnect(ctx);
+            self.connection.disconnect();
             self.connection = Connection::Connecting;
         }
 
         self.update_status();
 
         let fut = async move {
+            let mut backoff = backoff::ExponentialBackoff {
+                current_interval: Duration::from_millis(300),
+                initial_interval: Duration::from_millis(300),
+                ..Default::default()
+            };
+
             loop {
                 info!(message = "connecting to websocket", url = %websocket_url, actor_id = %actor_id);
-                let mut backoff = backoff::ExponentialBackoff {
-                    current_interval: Duration::from_millis(300),
-                    initial_interval: Duration::from_millis(300),
-                    ..Default::default()
-                };
                 let res = awc::Client::builder()
                     .max_http_version(awc::http::Version::HTTP_11)
                     .finish()
@@ -281,26 +282,29 @@ impl AccountUpdateManager {
                 match res {
                     Ok((_, conn)) => break conn,
                     Err(err) => {
-                        error!(message = "failed to connect", url = %websocket_url, error = ?err, actor_id = %actor_id);
-                        tokio::time::delay_for(
-                            backoff
-                                .next_backoff()
-                                .unwrap_or_else(|| Duration::from_secs(1)),
-                        )
-                        .await;
+                        let delay = backoff
+                            .next_backoff()
+                            .unwrap_or_else(|| Duration::from_secs(1));
+                        error!(message = "failed to connect, waiting", url = %websocket_url,
+                                error = ?err, actor_id = %actor_id, delay = ?delay);
+                        tokio::time::delay_for(delay).await;
                     }
                 }
             }
         };
         let fut = fut.into_actor(self).map(|conn, actor, ctx| {
             let (sink, stream) = futures_util::stream::StreamExt::split(conn);
+            let (stream, abort_handle) = futures_util::stream::abortable(stream);
             let actor_id = actor.actor_id;
             let sink = SinkWrite::new(sink, ctx);
-            let stream = AccountUpdateManager::add_stream(stream, ctx);
+            AccountUpdateManager::add_stream(stream, ctx);
 
             let old = std::mem::replace(
                 &mut actor.connection,
-                Connection::Connected { sink, stream },
+                Connection::Connected {
+                    sink,
+                    stream: abort_handle,
+                },
             );
             if old.is_connected() {
                 warn!(actor_id, "was connected, should not have happened");
@@ -661,17 +665,14 @@ impl AccountUpdateManager {
         Ok(())
     }
 
-    fn disconnect(&mut self, ctx: &mut Context<Self>) {
+    fn disconnect(&mut self, _ctx: &mut Context<Self>) {
         info!(self.actor_id, "websocket disconnected");
-        let was_connected = self.connection.is_connected();
-        self.connection.disconnect(ctx);
+        self.connection.disconnect();
 
-        if was_connected {
-            metrics().websocket_connected.dec();
-            metrics()
-                .subscriptions_active
-                .sub(self.id_to_sub.len() as i64);
-        }
+        metrics().websocket_connected.dec();
+        metrics()
+            .subscriptions_active
+            .sub(self.id_to_sub.len() as i64);
         self.update_status();
 
         self.buffer.clear();
@@ -691,7 +692,10 @@ impl AccountUpdateManager {
 
         if !self.connection.is_connecting() {
             info!(actor_id, "websocket reconnecting");
-            self.disconnect(ctx);
+            if self.connection.is_connected() {
+                error!(actor_id, "was connected, while doing reconnect");
+                self.disconnect(ctx);
+            }
 
             self.connect(ctx);
             self.update_status();
@@ -844,6 +848,7 @@ impl StreamHandler<Result<awc::ws::Frame, awc::error::WsProtocolError>> for Acco
     }
 
     fn finished(&mut self, ctx: &mut Context<Self>) {
+        info!(self.actor_id, "websocket stream finished");
         self.reconnect(ctx);
     }
 }
@@ -872,9 +877,8 @@ impl actix::io::WriteHandler<awc::error::WsProtocolError> for AccountUpdateManag
         Running::Continue
     }
 
-    fn finished(&mut self, ctx: &mut Self::Context) {
+    fn finished(&mut self, _ctx: &mut Self::Context) {
         info!("writer closed");
-        self.reconnect(ctx);
     }
 }
 
