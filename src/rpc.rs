@@ -716,6 +716,7 @@ enum ProgramAccountsResponseError {
 struct ProgramAccountsConfig {
     #[serde(default = "Encoding::default")]
     encoding: Encoding,
+    #[serde(flatten)]
     commitment: Option<CommitmentConfig>,
     #[serde(rename = "dataSlice")]
     data_slice: Option<Slice>,
