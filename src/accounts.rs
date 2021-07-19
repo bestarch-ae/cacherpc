@@ -27,8 +27,8 @@ use crate::types::{
 
 const MAILBOX_CAPACITY: usize = 512;
 const PURGE_TIMEOUT: Duration = Duration::from_secs(600);
-const IN_FLIGHT_TIMEOUT: Duration = Duration::from_secs(30);
-const WEBSOCKET_PING_TIMEOUT: Duration = Duration::from_secs(30);
+const IN_FLIGHT_TIMEOUT: Duration = Duration::from_secs(60);
+const WEBSOCKET_PING_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug)]
 enum InflightRequest {
@@ -57,15 +57,15 @@ impl PubSubManager {
     ) -> Self {
         let mut addrs = Vec::new();
         for id in 0..connections {
-            let connected = Arc::new(AtomicBool::new(false));
+            let active = Arc::new(AtomicBool::new(false));
             let addr = AccountUpdateManager::init(
                 id,
                 accounts.clone(),
                 program_accounts.clone(),
-                Arc::clone(&connected),
+                Arc::clone(&active),
                 &websocket_url,
             );
-            addrs.push((addr, connected))
+            addrs.push((addr, active))
         }
         PubSubManager(addrs)
     }
@@ -85,7 +85,7 @@ impl PubSubManager {
         self.0[idx].0.clone()
     }
 
-    pub fn is_connected(&self, key: Pubkey) -> bool {
+    pub fn subscription_active(&self, key: Pubkey) -> bool {
         let idx = self.get_idx_by_key(key);
         self.0[idx].1.load(Ordering::Relaxed)
     }
@@ -106,6 +106,38 @@ impl PubSubManager {
     }
 }
 
+enum Connection {
+    Disconnected,
+    Connecting,
+    Connected { sink: WsSink, stream: SpawnHandle },
+}
+
+impl Connection {
+    fn is_connected(&self) -> bool {
+        matches!(self, Connection::Connected { .. })
+    }
+
+    fn is_connecting(&self) -> bool {
+        matches!(self, Connection::Connecting { .. })
+    }
+
+    fn disconnect(&mut self, ctx: &mut Context<AccountUpdateManager>) {
+        let old_connection = std::mem::replace(self, Connection::Disconnected);
+
+        if let Connection::Connected { mut sink, stream } = old_connection {
+            sink.close();
+            ctx.cancel_future(stream);
+        }
+    }
+
+    fn send(&mut self, msg: ws::Message) -> Result<(), ws::Message> {
+        if let Connection::Connected { sink, .. } = self {
+            sink.write(msg).map_or(Ok(()), Err)?;
+        }
+        Ok(())
+    }
+}
+
 pub(crate) struct AccountUpdateManager {
     websocket_url: String,
     actor_id: u32,
@@ -114,13 +146,13 @@ pub(crate) struct AccountUpdateManager {
     subs: HashSet<(Subscription, Commitment)>,
     id_to_sub: HashMap<u64, (Subscription, Commitment)>,
     sub_to_id: HashMap<(Subscription, Commitment), u64>,
-    connection: Option<(WsSink, SpawnHandle)>,
+    connection: Connection,
     accounts: AccountsDb,
     program_accounts: ProgramAccountsDb,
     purge_queue: DelayQueueHandle<(Subscription, Commitment)>,
     additional_keys: HashMap<Pubkey, HashSet<SmallVec<[Filter; 2]>>>,
     last_received_at: Instant,
-    connected: Arc<AtomicBool>,
+    active: Arc<AtomicBool>,
     buffer: BytesMut,
 }
 
@@ -135,7 +167,7 @@ impl AccountUpdateManager {
         actor_id: u32,
         accounts: AccountsDb,
         program_accounts: ProgramAccountsDb,
-        connected: Arc<AtomicBool>,
+        active: Arc<AtomicBool>,
         websocket_url: &str,
     ) -> Addr<Self> {
         AccountUpdateManager::create(|ctx| {
@@ -145,29 +177,28 @@ impl AccountUpdateManager {
             ctx.set_mailbox_capacity(MAILBOX_CAPACITY);
 
             ctx.run_interval(Duration::from_secs(5), move |actor, ctx| {
-                if actor.connected.load(Ordering::Relaxed) {
-                    if let Some((sink, _)) = &mut actor.connection {
-                        if sink
-                            .write(awc::ws::Message::Ping(b"hello?".as_ref().into()))
-                            .is_some()
-                        {
-                            warn!("failed to write ping");
-                        }
+                if actor.connection.is_connected() {
+                    if actor
+                        .connection
+                        .send(awc::ws::Message::Ping(b"hello?".as_ref().into()))
+                        .is_err()
+                    {
+                        actor.connection.disconnect(ctx);
+                    }
 
-                        let elapsed = actor.last_received_at.elapsed();
-                        if elapsed > WEBSOCKET_PING_TIMEOUT {
-                            warn!(
-                                "no messages received in {:?}, assume connection lost ({:?})",
-                                elapsed, actor.last_received_at
-                            );
-                            actor.reconnect(ctx);
-                        }
+                    let elapsed = actor.last_received_at.elapsed();
+                    if elapsed > WEBSOCKET_PING_TIMEOUT {
+                        warn!(
+                            "no messages received in {:?}, assume connection lost ({:?})",
+                            elapsed, actor.last_received_at
+                        );
+                        actor.disconnect(ctx);
                     }
                 }
             });
 
             ctx.run_interval(Duration::from_secs(5), move |actor, _ctx| {
-                if actor.connected.load(Ordering::Relaxed) {
+                if actor.connection.is_connected() {
                     actor.inflight.retain(|request_id, (req, time)| {
                         let elapsed = time.elapsed();
                         let too_long = elapsed > IN_FLIGHT_TIMEOUT;
@@ -184,7 +215,7 @@ impl AccountUpdateManager {
             AccountUpdateManager {
                 actor_id,
                 websocket_url: websocket_url.to_owned(),
-                connection: None,
+                connection: Connection::Disconnected,
                 id_to_sub: HashMap::default(),
                 sub_to_id: HashMap::default(),
                 inflight: HashMap::default(),
@@ -194,7 +225,7 @@ impl AccountUpdateManager {
                 program_accounts: program_accounts.clone(),
                 purge_queue: handle,
                 additional_keys: HashMap::default(),
-                connected,
+                active,
                 last_received_at: Instant::now(),
                 buffer: BytesMut::new(),
             }
@@ -208,25 +239,37 @@ impl AccountUpdateManager {
     }
 
     fn send<T: Serialize>(&mut self, request: &T) -> Result<(), serde_json::Error> {
-        if let Some((sink, _)) = &mut self.connection {
-            sink.write(awc::ws::Message::Text(serde_json::to_string(request)?));
+        if self.connection.is_connected() {
+            let _ = self
+                .connection
+                .send(awc::ws::Message::Text(serde_json::to_string(request)?));
         } else {
-            warn!("no sink");
+            warn!("not connected");
         }
         Ok(())
     }
 
-    fn connect(&self, ctx: &mut Context<Self>) {
+    fn connect(&mut self, ctx: &mut Context<Self>) {
         use actix::fut::{ActorFuture, WrapFuture};
         use backoff::backoff::Backoff;
 
         let websocket_url = self.websocket_url.clone();
         let actor_id = self.actor_id;
+
+        if self.connection.is_connected() {
+            warn!(message = "old connection not canceled properly", actor_id = %actor_id);
+            self.connection.disconnect(ctx);
+            self.connection = Connection::Connecting;
+        }
+
+        self.update_status();
+
         let fut = async move {
             loop {
                 info!(message = "connecting to websocket", url = %websocket_url, actor_id = %actor_id);
                 let mut backoff = backoff::ExponentialBackoff {
-                    initial_interval: Duration::from_millis(100),
+                    current_interval: Duration::from_millis(300),
+                    initial_interval: Duration::from_millis(300),
                     ..Default::default()
                 };
                 let res = awc::Client::builder()
@@ -253,18 +296,20 @@ impl AccountUpdateManager {
             let (sink, stream) = futures_util::stream::StreamExt::split(conn);
             let actor_id = actor.actor_id;
             let sink = SinkWrite::new(sink, ctx);
-            let stream_handle = AccountUpdateManager::add_stream(stream, ctx);
+            let stream = AccountUpdateManager::add_stream(stream, ctx);
 
-            let old = std::mem::replace(&mut actor.connection, Some((sink, stream_handle)));
-            if let Some((mut sink, stream)) = old {
-                warn!(message = "old connection not canceled properly", actor_id = %actor_id);
-                sink.close();
-                ctx.cancel_future(stream);
+            let old = std::mem::replace(
+                &mut actor.connection,
+                Connection::Connected { sink, stream },
+            );
+            if old.is_connected() {
+                warn!(actor_id, "was connected, should not have happened");
             }
             metrics().websocket_connected.inc();
             actor.last_received_at = Instant::now();
         });
         ctx.wait(fut);
+        self.update_status();
     }
 
     fn subscribe(
@@ -277,7 +322,7 @@ impl AccountUpdateManager {
             jsonrpc: &'a str,
             id: u64,
             method: &'a str,
-            params: SubscribeParams, // TODO: commitment and other params
+            params: SubscribeParams,
         }
 
         #[derive(Serialize)]
@@ -412,6 +457,18 @@ impl AccountUpdateManager {
         }
     }
 
+    fn update_status(&self) {
+        let is_active = self.id_to_sub.len() == self.subs.len() && self.connection.is_connected();
+        let was_active = self.active.swap(is_active, Ordering::Relaxed);
+        if was_active != is_active {
+            if is_active {
+                metrics().websocket_active.inc();
+            } else {
+                metrics().websocket_active.dec();
+            }
+        }
+    }
+
     fn process_ws_message(&mut self, text: &[u8]) -> Result<(), serde_json::Error> {
         #[derive(Deserialize, Debug)]
         struct AnyMessage<'a> {
@@ -448,6 +505,7 @@ impl AccountUpdateManager {
                         }
                     }
                 }
+                self.update_status();
             }
             // subscription response
             AnyMessage {
@@ -476,9 +534,10 @@ impl AccountUpdateManager {
                                         key = %sub.key(),
                                         sub = %sub,
                                     );
+                                    metrics().subscriptions_active.dec();
                                 } else {
+                                    warn!(sub = %sub, commitment = ?commitment, "unsubscribe for unknown subscription");
                                 }
-                                metrics().subscriptions_active.dec();
                             } else {
                                 warn!(self.actor_id, message = "unsubscribe failed", key = %sub.key());
                             }
@@ -488,6 +547,7 @@ impl AccountUpdateManager {
                         }
                     }
                 }
+                self.update_status();
             }
             // notification
             AnyMessage {
@@ -601,37 +661,42 @@ impl AccountUpdateManager {
         Ok(())
     }
 
-    fn reconnect(&mut self, ctx: &mut Context<Self>) {
-        let actor_id = self.actor_id;
-        let was_connected = self.connected.fetch_and(false, Ordering::Relaxed);
+    fn disconnect(&mut self, ctx: &mut Context<Self>) {
+        info!(self.actor_id, "websocket disconnected");
+        let was_connected = self.connection.is_connected();
+        self.connection.disconnect(ctx);
 
         if was_connected {
-            info!(actor_id, "websocket disconnected");
-
             metrics().websocket_connected.dec();
             metrics()
                 .subscriptions_active
                 .sub(self.id_to_sub.len() as i64);
+        }
+        self.update_status();
 
-            if let Some((mut sink, stream)) = self.connection.take() {
-                sink.close();
-                ctx.cancel_future(stream);
-            }
+        self.buffer.clear();
+        self.inflight.clear();
+        self.id_to_sub.clear();
+        self.sub_to_id.clear();
 
-            self.buffer.clear();
-            self.inflight.clear();
-            self.id_to_sub.clear();
-            self.sub_to_id.clear();
+        info!(self.actor_id, "purging related caches");
+        let to_purge: Vec<_> = self.subs.iter().cloned().collect();
+        for (sub, commitment) in to_purge {
+            self.purge_key(&sub, commitment);
+        }
+    }
 
-            info!(actor_id, "purging related caches");
-            let to_purge: Vec<_> = self.subs.iter().cloned().collect();
-            for (sub, commitment) in to_purge {
-                self.purge_key(&sub, commitment);
-            }
+    fn reconnect(&mut self, ctx: &mut Context<Self>) {
+        let actor_id = self.actor_id;
+
+        if !self.connection.is_connecting() {
+            info!(actor_id, "websocket reconnecting");
+            self.disconnect(ctx);
 
             self.connect(ctx);
+            self.update_status();
         } else {
-            warn!(actor_id, "reconnect while not connected?");
+            warn!(actor_id, "already reconnecting");
         }
     }
 }
@@ -689,7 +754,7 @@ impl StreamHandler<Result<awc::ws::Frame, awc::error::WsProtocolError>> for Acco
             Ok(item) => item,
             Err(err) => {
                 error!(error = %err, "websocket protocol error");
-                self.reconnect(ctx);
+                self.disconnect(ctx);
                 return;
             }
         };
@@ -700,7 +765,7 @@ impl StreamHandler<Result<awc::ws::Frame, awc::error::WsProtocolError>> for Acco
             match item {
                 Frame::Ping(data) => {
                     metrics().bytes_received.inc_by(data.len() as u64);
-                    if let Some((sink, _)) = &mut self.connection {
+                    if let Connection::Connected { sink, .. } = &mut self.connection {
                         sink.write(awc::ws::Message::Pong(data));
                     }
                 }
@@ -716,7 +781,7 @@ impl StreamHandler<Result<awc::ws::Frame, awc::error::WsProtocolError>> for Acco
                 }
                 Frame::Close(reason) => {
                     warn!(reason = ?reason, "websocket closing");
-                    self.reconnect(ctx);
+                    self.disconnect(ctx);
                 }
                 Frame::Binary(msg) => {
                     warn!(msg = ?msg, "unexpected binary message");
@@ -776,7 +841,6 @@ impl StreamHandler<Result<awc::ws::Frame, awc::error::WsProtocolError>> for Acco
             // TODO: it would be nice to retrieve current state for
             // everything we had before
         }
-        self.connected.store(true, Ordering::Relaxed);
     }
 
     fn finished(&mut self, ctx: &mut Context<Self>) {
@@ -804,12 +868,13 @@ impl Actor for AccountUpdateManager {
 impl actix::io::WriteHandler<awc::error::WsProtocolError> for AccountUpdateManager {
     fn error(&mut self, err: awc::error::WsProtocolError, ctx: &mut Self::Context) -> Running {
         error!(message = "websocket write error", error = ?err);
-        self.reconnect(ctx);
+        self.disconnect(ctx);
         Running::Continue
     }
 
-    fn finished(&mut self, _ctx: &mut Self::Context) {
-        info!("writer finished");
+    fn finished(&mut self, ctx: &mut Self::Context) {
+        info!("writer closed");
+        self.reconnect(ctx);
     }
 }
 
