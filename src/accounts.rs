@@ -19,6 +19,7 @@ use tokio::sync::mpsc;
 use tokio::time::{DelayQueue, Instant};
 use tracing::{error, info, warn};
 
+use crate::metrics::db_metrics;
 use crate::metrics::pubsub_metrics as metrics;
 use crate::types::{
     AccountContext, AccountInfo, AccountsDb, Commitment, Encoding, Filter, ProgramAccountsDb,
@@ -314,7 +315,7 @@ impl AccountUpdateManager {
             metrics()
                 .websocket_connected
                 .with_label_values(&[&actor.actor_name])
-                .inc();
+                .set(1);
             actor.last_received_at = Instant::now();
         });
         ctx.wait(fut);
@@ -467,22 +468,20 @@ impl AccountUpdateManager {
                 self.accounts.remove(&key, commitment);
             }
         }
+        db_metrics().account_entries.set(self.accounts.len() as i64);
+        db_metrics()
+            .program_account_entries
+            .set(self.program_accounts.len() as i64);
     }
 
     fn update_status(&self) {
         let is_active = self.id_to_sub.len() == self.subs.len() && self.connection.is_connected();
         self.active.store(is_active, Ordering::Relaxed);
-        if is_active {
-            metrics()
-                .websocket_active
-                .with_label_values(&[&self.actor_name])
-                .inc();
-        } else {
-            metrics()
-                .websocket_active
-                .with_label_values(&[&self.actor_name])
-                .dec();
-        }
+
+        metrics()
+            .websocket_active
+            .with_label_values(&[&self.actor_name])
+            .set(if is_active { 1 } else { 0 });
     }
 
     fn process_ws_message(&mut self, text: &[u8]) -> Result<(), serde_json::Error> {
@@ -591,6 +590,7 @@ impl AccountUpdateManager {
                         if let Some((sub, commitment)) = self.id_to_sub.get(&params.subscription) {
                             //info!(key = %sub.key(), "received account notification");
                             self.accounts.insert(sub.key(), params.result, *commitment);
+                            db_metrics().account_entries.set(self.accounts.len() as i64);
                         } else {
                             warn!(message = "unknown subscription", sub = params.subscription);
                         }
@@ -659,9 +659,13 @@ impl AccountUpdateManager {
                         } else {
                             warn!(message = "unknown subscription", sub = params.subscription);
                         }
+                        db_metrics().account_entries.set(self.accounts.len() as i64);
+                        db_metrics()
+                            .program_account_entries
+                            .set(self.program_accounts.len() as i64);
                         metrics()
                             .notifications_received
-                            .with_label_values(&["programNotification"])
+                            .with_label_values(&[&self.actor_name, "programNotification"])
                             .inc();
                     }
                     "rootNotification" => {
@@ -693,11 +697,11 @@ impl AccountUpdateManager {
         metrics()
             .websocket_connected
             .with_label_values(&[&self.actor_name])
-            .dec();
+            .set(0);
         metrics()
             .subscriptions_active
             .with_label_values(&[&self.actor_name])
-            .sub(self.id_to_sub.len() as i64);
+            .set(0);
         self.update_status();
 
         self.buffer.clear();

@@ -1,8 +1,30 @@
 use once_cell::sync::Lazy;
 use prometheus::{
     register_histogram, register_histogram_vec, register_int_counter, register_int_counter_vec,
-    register_int_gauge_vec, Histogram, HistogramVec, IntCounter, IntCounterVec, IntGaugeVec,
+    register_int_gauge, register_int_gauge_vec, Histogram, HistogramVec, IntCounter, IntCounterVec,
+    IntGauge, IntGaugeVec,
 };
+
+pub struct DbMetrics {
+    pub account_entries: IntGauge,
+    pub program_account_entries: IntGauge,
+}
+
+pub fn db_metrics() -> &'static DbMetrics {
+    static METRICS: Lazy<DbMetrics> = Lazy::new(|| DbMetrics {
+        account_entries: register_int_gauge!(
+            "account_entries",
+            "number of entries in accounts cache"
+        )
+        .unwrap(),
+        program_account_entries: register_int_gauge!(
+            "program_account_entries",
+            "number of entries in program accounts cache"
+        )
+        .unwrap(),
+    });
+    &METRICS
+}
 
 pub struct PubSubMetrics {
     pub subscriptions_active: IntGaugeVec,
