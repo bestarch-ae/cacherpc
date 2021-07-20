@@ -141,6 +141,7 @@ impl Connection {
 pub(crate) struct AccountUpdateManager {
     websocket_url: String,
     actor_id: u32,
+    actor_name: String,
     request_id: u64,
     inflight: HashMap<u64, (InflightRequest, Instant)>,
     subs: HashSet<(Subscription, Commitment)>,
@@ -214,6 +215,7 @@ impl AccountUpdateManager {
             AccountUpdateManager::add_stream(purge_stream, ctx);
             AccountUpdateManager {
                 actor_id,
+                actor_name: format!("pubsub-{}", actor_id),
                 websocket_url: websocket_url.to_owned(),
                 connection: Connection::Disconnected,
                 id_to_sub: HashMap::default(),
@@ -309,7 +311,10 @@ impl AccountUpdateManager {
             if old.is_connected() {
                 warn!(actor_id, "was connected, should not have happened");
             }
-            metrics().websocket_connected.inc();
+            metrics()
+                .websocket_connected
+                .with_label_values(&[&actor.actor_name])
+                .inc();
             actor.last_received_at = Instant::now();
         });
         ctx.wait(fut);
@@ -392,7 +397,10 @@ impl AccountUpdateManager {
         self.subs.insert((sub, commitment));
         self.send(&request)?;
         self.purge_queue.insert((sub, commitment), PURGE_TIMEOUT);
-        metrics().subscribe_requests.inc();
+        metrics()
+            .subscribe_requests
+            .with_label_values(&[&self.actor_name])
+            .inc();
 
         Ok(())
     }
@@ -463,13 +471,17 @@ impl AccountUpdateManager {
 
     fn update_status(&self) {
         let is_active = self.id_to_sub.len() == self.subs.len() && self.connection.is_connected();
-        let was_active = self.active.swap(is_active, Ordering::Relaxed);
-        if was_active != is_active {
-            if is_active {
-                metrics().websocket_active.inc();
-            } else {
-                metrics().websocket_active.dec();
-            }
+        self.active.store(is_active, Ordering::Relaxed);
+        if is_active {
+            metrics()
+                .websocket_active
+                .with_label_values(&[&self.actor_name])
+                .inc();
+        } else {
+            metrics()
+                .websocket_active
+                .with_label_values(&[&self.actor_name])
+                .dec();
         }
     }
 
@@ -498,7 +510,10 @@ impl AccountUpdateManager {
                     match req {
                         InflightRequest::Sub(sub, commitment) => {
                             warn!(self.actor_id, request_id = id, error = ?error, key = %sub.key(), commitment = ?commitment, "subscribe failed");
-                            metrics().subscribe_errors.inc();
+                            metrics()
+                                .subscribe_errors
+                                .with_label_values(&[&self.actor_name])
+                                .inc();
                             self.subs.remove(&(sub, commitment));
                         }
                         InflightRequest::Unsub(sub, commitment) => {
@@ -524,7 +539,10 @@ impl AccountUpdateManager {
                             self.id_to_sub.insert(sub_id, (sub, commitment));
                             self.sub_to_id.insert((sub, commitment), sub_id);
                             info!(self.actor_id, message = "subscribed to stream", sub_id = sub_id, sub = %sub, commitment = ?commitment);
-                            metrics().subscriptions_active.inc();
+                            metrics()
+                                .subscriptions_active
+                                .with_label_values(&[&self.actor_name])
+                                .inc();
                         }
                         InflightRequest::Unsub(sub, commitment) => {
                             let is_ok: bool = serde_json::from_str(result.get())?;
@@ -538,7 +556,10 @@ impl AccountUpdateManager {
                                         key = %sub.key(),
                                         sub = %sub,
                                     );
-                                    metrics().subscriptions_active.dec();
+                                    metrics()
+                                        .subscriptions_active
+                                        .with_label_values(&[&self.actor_name])
+                                        .dec();
                                 } else {
                                     warn!(sub = %sub, commitment = ?commitment, "unsubscribe for unknown subscription");
                                 }
@@ -575,7 +596,7 @@ impl AccountUpdateManager {
                         }
                         metrics()
                             .notifications_received
-                            .with_label_values(&["accountNotification"])
+                            .with_label_values(&[&self.actor_name, "accountNotification"])
                             .inc();
                     }
                     "programNotification" => {
@@ -669,9 +690,13 @@ impl AccountUpdateManager {
         info!(self.actor_id, "websocket disconnected");
         self.connection.disconnect();
 
-        metrics().websocket_connected.dec();
+        metrics()
+            .websocket_connected
+            .with_label_values(&[&self.actor_name])
+            .dec();
         metrics()
             .subscriptions_active
+            .with_label_values(&[&self.actor_name])
             .sub(self.id_to_sub.len() as i64);
         self.update_status();
 
@@ -723,18 +748,27 @@ impl Handler<AccountCommand> for AccountUpdateManager {
             match item {
                 AccountCommand::Subscribe(sub, commitment, filters) => {
                     let key = sub.key();
-                    metrics().commands.with_label_values(&["subscribe"]).inc();
+                    metrics()
+                        .commands
+                        .with_label_values(&[&self.actor_name, "subscribe"])
+                        .inc();
                     self.subscribe(sub, commitment)?;
                     if let Some(filters) = filters {
                         self.additional_keys.entry(key).or_default().insert(filters);
                     }
                 }
                 AccountCommand::Purge(sub, commitment) => {
-                    metrics().commands.with_label_values(&["purge"]).inc();
+                    metrics()
+                        .commands
+                        .with_label_values(&[&self.actor_name, "purge"])
+                        .inc();
                     self.unsubscribe(sub, commitment)?;
                 }
                 AccountCommand::Reset(key, commitment) => {
-                    metrics().commands.with_label_values(&["reset"]).inc();
+                    metrics()
+                        .commands
+                        .with_label_values(&[&self.actor_name, "reset"])
+                        .inc();
                     self.purge_queue.reset((key, commitment), PURGE_TIMEOUT);
                 }
             }
@@ -768,7 +802,7 @@ impl StreamHandler<Result<awc::ws::Frame, awc::error::WsProtocolError>> for Acco
 
             match item {
                 Frame::Ping(data) => {
-                    metrics().bytes_received.inc_by(data.len() as u64);
+                    metrics().bytes_received.with_label_values(&[&self.actor_name]).inc_by(data.len() as u64);
                     if let Connection::Connected { sink, .. } = &mut self.connection {
                         sink.write(awc::ws::Message::Pong(data));
                     }
@@ -777,7 +811,7 @@ impl StreamHandler<Result<awc::ws::Frame, awc::error::WsProtocolError>> for Acco
                     // do nothing
                 }
                 Frame::Text(text) => {
-                    metrics().bytes_received.inc_by(text.len() as u64);
+                    metrics().bytes_received.with_label_values(&[&self.actor_name]).inc_by(text.len() as u64);
                     self.process_ws_message(&text).map_err(|err| {
                             error!(error = %err, bytes = ?text, "error while parsing message");
                             err
@@ -792,15 +826,20 @@ impl StreamHandler<Result<awc::ws::Frame, awc::error::WsProtocolError>> for Acco
                 }
                 Frame::Continuation(msg) => match msg {
                     ws::Item::FirstText(bytes) => {
-                        metrics().bytes_received.inc_by(bytes.len() as u64);
+                        metrics().bytes_received.with_label_values(&[&self.actor_name])
+                            .inc_by(bytes.len() as u64);
                         self.buffer.extend(&bytes);
                     }
                     ws::Item::Continue(bytes) => {
-                        metrics().bytes_received.inc_by(bytes.len() as u64);
+                        metrics().bytes_received
+                            .with_label_values(&[&self.actor_name])
+                            .inc_by(bytes.len() as u64);
                         self.buffer.extend(&bytes);
                     }
                     ws::Item::Last(bytes) => {
-                        metrics().bytes_received.inc_by(bytes.len() as u64);
+                        metrics().bytes_received
+                            .with_label_values(&[&self.actor_name])
+                            .inc_by(bytes.len() as u64);
                         self.buffer.extend(&bytes);
                         let text = std::mem::replace(&mut self.buffer, BytesMut::new());
                         self.process_ws_message(&text).map_err(|err| {
