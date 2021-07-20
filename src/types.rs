@@ -84,23 +84,30 @@ impl ProgramAccountsDb {
         entry.insert(commitment, data);
     }
 
+    // We only add here and do not create new entries because it would be incorrect (incomplete
+    // result).
     pub fn add(
         &self,
         key: &Pubkey,
         data: Pubkey,
         filters: Option<SmallVec<[Filter; 2]>>,
         commitment: Commitment,
-    ) {
+    ) -> bool {
+        let mut added = false;
         // add to global
-        if let Some(mut state) = self.map.get_mut(&(*key, None)) {
-            state.add(commitment, data);
+        if let Some(mut entry) = self.map.get_mut(&(*key, None)) {
+            entry.add(commitment, data);
+            added = true;
         }
+
         // add with filter
         if filters.is_some() {
-            if let Some(mut state) = self.map.get_mut(&(*key, filters)) {
-                state.add(commitment, data);
+            if let Some(mut entry) = self.map.get_mut(&(*key, filters)) {
+                entry.add(commitment, data);
+                added = true;
             }
         }
+        added
     }
 
     pub fn remove_all(
@@ -178,6 +185,10 @@ impl AccountState {
     fn remove(&mut self, commitment: Commitment) {
         (self.0)[commitment.as_idx()] = None;
     }
+
+    fn is_empty(&self) -> bool {
+        self.0.iter().all(Option::is_none)
+    }
 }
 
 impl AccountsDb {
@@ -199,8 +210,13 @@ impl AccountsDb {
     }
 
     pub fn remove(&self, key: &Pubkey, commitment: Commitment) {
-        if let Some(mut entry) = self.map.get_mut(key) {
-            entry.remove(commitment)
+        use dashmap::mapref::entry::Entry;
+        if let Entry::Occupied(mut entry) = self.map.entry(*key) {
+            let account_state = entry.get_mut();
+            account_state.remove(commitment);
+            if account_state.is_empty() {
+                entry.remove();
+            }
         }
     }
 

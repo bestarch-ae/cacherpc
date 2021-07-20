@@ -623,10 +623,11 @@ impl AccountUpdateManager {
                             let key = params.result.value.pubkey;
                             let account_info = &params.result.value.account;
                             let data = &account_info.data;
+                            let mut added = false;
                             if let Some(filters) = self.additional_keys.get(&program_key) {
                                 for filter_group in filters {
                                     if filter_group.iter().all(|f| f.matches(data)) {
-                                        self.program_accounts.add(
+                                        added |= self.program_accounts.add(
                                             &program_key,
                                             params.result.value.pubkey,
                                             Some(filter_group.clone()),
@@ -642,20 +643,25 @@ impl AccountUpdateManager {
                                     }
                                 }
                             }
-                            self.accounts.insert(
-                                key,
-                                AccountContext {
-                                    value: Some(params.result.value.account),
-                                    context: params.result.context,
-                                },
-                                *commitment,
-                            );
-                            self.program_accounts.add(
+                            // add() returns false if we don't have an entry
+                            // which means we haven't received complete result
+                            // from validator by rpc
+                            added |= self.program_accounts.add(
                                 &program_key,
                                 params.result.value.pubkey,
                                 None,
                                 *commitment,
                             );
+                            if added {
+                                self.accounts.insert(
+                                    key,
+                                    AccountContext {
+                                        value: Some(params.result.value.account),
+                                        context: params.result.context,
+                                    },
+                                    *commitment,
+                                );
+                            }
                         } else {
                             warn!(message = "unknown subscription", sub = params.subscription);
                         }
