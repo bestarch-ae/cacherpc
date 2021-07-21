@@ -406,10 +406,24 @@ impl ResponseError for Error<'_> {
     }
 }
 
+#[derive(Deserialize, Debug, Copy, Clone)]
+struct CommitmentConfig {
+    commitment: Commitment,
+}
+
+impl Default for CommitmentConfig {
+    fn default() -> Self {
+        CommitmentConfig {
+            commitment: Commitment::Finalized,
+        }
+    }
+}
+
 #[derive(Deserialize, Debug)]
 struct AccountInfoConfig {
     encoding: Encoding,
-    commitment: Option<Commitment>,
+    #[serde(flatten)]
+    commitment: Option<CommitmentConfig>,
     #[serde(rename = "dataSlice")]
     data_slice: Option<Slice>,
 }
@@ -552,6 +566,8 @@ async fn get_account_info(
         }
     };
 
+    let commitment = config.commitment.unwrap_or_default().commitment;
+
     metrics()
         .request_encodings
         .with_label_values(&["getAccountInfo", config.encoding.as_str()])
@@ -559,17 +575,13 @@ async fn get_account_info(
 
     metrics()
         .request_commitments
-        .with_label_values(&[
-            "getAccountInfo",
-            config.commitment.unwrap_or_default().as_str(),
-        ])
+        .with_label_values(&["getAccountInfo", commitment.as_str()])
         .inc();
 
     let mut cacheable_for_key = Some(pubkey);
 
     // pass through for JsonParsed as we don't support it yet
     if config.encoding != Encoding::JsonParsed && app_state.subscription_active(pubkey) {
-        let commitment = config.commitment.unwrap_or_default();
         match app_state.accounts.get(&pubkey) {
             Some(data) => {
                 let data = data.value();
@@ -621,7 +633,6 @@ async fn get_account_info(
                 if let Some(pubkey) = cacheable_for_key {
                     if let Some(data) = app_state.accounts.get(&pubkey) {
                         let data = data.value();
-                        let commitment = config.commitment.unwrap_or_default();
                         if let Some(account) = data.get(commitment) {
                             app_state.reset(Subscription::Account(pubkey), commitment);
                             metrics().account_cache_hits.inc();
@@ -657,7 +668,6 @@ async fn get_account_info(
         let resp: Wrap<'_> = serde_json::from_slice(&resp)?;
         match resp.inner {
             Response::Result(info) => {
-                let commitment = config.commitment.unwrap_or_default();
                 info!(%pubkey, ?commitment, "cached for key");
                 app_state.insert(pubkey, info, commitment);
                 app_state.map_updated.notify();
@@ -671,7 +681,6 @@ async fn get_account_info(
                 // check cache one more time, maybe another thread was more lucky
                 if let Some(data) = app_state.accounts.get(&pubkey) {
                     let data = data.value();
-                    let commitment = config.commitment.unwrap_or_default();
                     if let Some(account) = data.get(commitment) {
                         app_state.reset(Subscription::Account(pubkey), commitment);
                         metrics().account_cache_hits.inc();
@@ -707,7 +716,8 @@ enum ProgramAccountsResponseError {
 struct ProgramAccountsConfig {
     #[serde(default = "Encoding::default")]
     encoding: Encoding,
-    commitment: Option<Commitment>,
+    #[serde(flatten)]
+    commitment: Option<CommitmentConfig>,
     #[serde(rename = "dataSlice")]
     data_slice: Option<Slice>,
     filters: Option<SmallVec<[Filter; 2]>>,
@@ -763,7 +773,7 @@ fn program_accounts_response<'a>(
         pubkey: Pubkey,
     }
 
-    let commitment = config.commitment.unwrap_or_default();
+    let commitment = config.commitment.unwrap_or_default().commitment;
 
     let filters = &config.filters;
 
@@ -868,6 +878,8 @@ async fn get_program_accounts(
         }
     };
 
+    let commitment = config.commitment.unwrap_or_default().commitment;
+
     metrics()
         .request_encodings
         .with_label_values(&["getProgramAccounts", config.encoding.as_str()])
@@ -875,10 +887,7 @@ async fn get_program_accounts(
 
     metrics()
         .request_commitments
-        .with_label_values(&[
-            "getProgramAccounts",
-            config.commitment.unwrap_or_default().as_str(),
-        ])
+        .with_label_values(&["getProgramAccounts", commitment.as_str()])
         .inc();
 
     let mut cacheable_for_key = Some(pubkey);
@@ -892,7 +901,6 @@ async fn get_program_accounts(
     };
 
     if config.encoding != Encoding::JsonParsed && app_state.subscription_active(pubkey) {
-        let commitment = config.commitment.unwrap_or_default();
         match app_state.program_accounts.get(&pubkey, filters.clone()) {
             Some(data) => {
                 let accounts = data.value();
@@ -952,7 +960,6 @@ async fn get_program_accounts(
                 if let Some(program_pubkey) = cacheable_for_key {
                     if let Some(data) = app_state.program_accounts.get(&program_pubkey, filters.clone()) {
                         let data = data.value();
-                        let commitment = config.commitment.unwrap_or_default();
                         metrics().program_accounts_cache_filled.inc();
                         if let Some(accounts) = data.get(commitment) {
                             app_state.reset(Subscription::Program(pubkey), commitment);
@@ -1002,16 +1009,13 @@ async fn get_program_accounts(
                             value: Some(account),
                             context: SolanaContext { slot: 0 },
                         },
-                        config.commitment.unwrap_or_default(),
+                        commitment,
                     );
                     keys.insert(pubkey);
                 }
-                app_state.program_accounts.insert(
-                    program_pubkey,
-                    keys,
-                    config.commitment.unwrap_or_default(),
-                    filters,
-                );
+                app_state
+                    .program_accounts
+                    .insert(program_pubkey, keys, commitment, filters);
                 app_state.map_updated.notify();
             }
             Response::Error(error) => {
