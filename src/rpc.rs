@@ -16,7 +16,7 @@ use serde_json::value::{to_raw_value, RawValue};
 use smallvec::SmallVec;
 use thiserror::Error;
 use tokio::sync::{Notify, Semaphore};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::accounts::Subscription;
 use crate::metrics::rpc_metrics as metrics;
@@ -798,7 +798,7 @@ fn program_accounts_response<'a>(
                         .unwrap_or(false)
                 });
                 if !matches {
-                    info!(pubkey = ?data.key(), "skipped because of filter");
+                    debug!(pubkey = ?data.key(), "skipped because of filter");
                     continue;
                 }
             }
