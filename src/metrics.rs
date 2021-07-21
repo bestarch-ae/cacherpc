@@ -10,6 +10,7 @@ pub struct PubSubMetrics {
     pub subscribe_requests: IntCounter,
     pub subscribe_errors: IntCounter,
     pub websocket_connected: IntGauge,
+    pub websocket_active: IntGauge,
     pub notifications_received: IntCounterVec,
     pub commands: IntCounterVec,
     pub bytes_received: IntCounter,
@@ -32,7 +33,6 @@ pub fn pubsub_metrics() -> &'static PubSubMetrics {
             "number of bytes received in websocket frames"
         )
         .unwrap(),
-
         subscribe_errors: register_int_counter!("subscribe_errors", "number of subscribe errors")
             .unwrap(),
         websocket_connected: register_int_gauge!(
@@ -40,6 +40,8 @@ pub fn pubsub_metrics() -> &'static PubSubMetrics {
             "websocket connection status"
         )
         .unwrap(),
+        websocket_active: register_int_gauge!("websocket_active", "websocket active status")
+            .unwrap(),
         notifications_received: register_int_counter_vec!(
             "notifications_received",
             "number of notifications received",

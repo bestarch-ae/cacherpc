@@ -180,8 +180,8 @@ impl State {
         self.accounts.insert(key, data, commitment)
     }
 
-    fn is_connected(&self, key: Pubkey) -> bool {
-        self.pubsub.is_connected(key)
+    fn subscription_active(&self, key: Pubkey) -> bool {
+        self.pubsub.subscription_active(key)
     }
 
     async fn subscribe(
@@ -568,7 +568,7 @@ async fn get_account_info(
     let mut cacheable_for_key = Some(pubkey);
 
     // pass through for JsonParsed as we don't support it yet
-    if config.encoding != Encoding::JsonParsed && app_state.is_connected(pubkey) {
+    if config.encoding != Encoding::JsonParsed && app_state.subscription_active(pubkey) {
         let commitment = config.commitment.unwrap_or_default();
         match app_state.accounts.get(&pubkey) {
             Some(data) => {
@@ -891,7 +891,7 @@ async fn get_program_accounts(
         None
     };
 
-    if config.encoding != Encoding::JsonParsed && app_state.is_connected(pubkey) {
+    if config.encoding != Encoding::JsonParsed && app_state.subscription_active(pubkey) {
         let commitment = config.commitment.unwrap_or_default();
         match app_state.program_accounts.get(&pubkey, filters.clone()) {
             Some(data) => {
