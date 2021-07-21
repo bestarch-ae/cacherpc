@@ -122,6 +122,10 @@ impl ProgramAccountsDb {
             accounts.value_mut().remove(commitment, account_key);
         }
     }
+
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
 }
 
 #[derive(Clone)]
@@ -207,6 +211,10 @@ impl AccountsDb {
     #[allow(unused)]
     pub fn get_slot(&self, commitment: Commitment) -> u64 {
         self.slot[commitment.as_idx()].load(Ordering::Acquire)
+    }
+
+    pub fn len(&self) -> usize {
+        self.map.len()
     }
 }
 

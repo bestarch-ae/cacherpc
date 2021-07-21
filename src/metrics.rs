@@ -5,51 +5,88 @@ use prometheus::{
     IntGauge, IntGaugeVec,
 };
 
+pub struct DbMetrics {
+    pub account_entries: IntGauge,
+    pub program_account_entries: IntGauge,
+}
+
+pub fn db_metrics() -> &'static DbMetrics {
+    static METRICS: Lazy<DbMetrics> = Lazy::new(|| DbMetrics {
+        account_entries: register_int_gauge!(
+            "account_entries",
+            "number of entries in accounts cache"
+        )
+        .unwrap(),
+        program_account_entries: register_int_gauge!(
+            "program_account_entries",
+            "number of entries in program accounts cache"
+        )
+        .unwrap(),
+    });
+    &METRICS
+}
+
 pub struct PubSubMetrics {
-    pub subscriptions_active: IntGauge,
-    pub subscribe_requests: IntCounter,
-    pub subscribe_errors: IntCounter,
-    pub websocket_connected: IntGauge,
-    pub websocket_active: IntGauge,
+    pub subscriptions_active: IntGaugeVec,
+    pub subscribe_requests: IntCounterVec,
+    pub subscribe_errors: IntCounterVec,
+    pub websocket_connected: IntGaugeVec,
+    pub websocket_active: IntGaugeVec,
     pub notifications_received: IntCounterVec,
     pub commands: IntCounterVec,
-    pub bytes_received: IntCounter,
+    pub bytes_received: IntCounterVec,
 }
 
 pub fn pubsub_metrics() -> &'static PubSubMetrics {
     static METRICS: Lazy<PubSubMetrics> = Lazy::new(|| PubSubMetrics {
-        subscriptions_active: register_int_gauge!(
+        subscriptions_active: register_int_gauge_vec!(
             "subscriptions_active",
-            "number of active subcriptions"
+            "number of active subcriptions",
+            &["connection_id"]
         )
         .unwrap(),
-        subscribe_requests: register_int_counter!(
+        subscribe_requests: register_int_counter_vec!(
             "subscribe_requests",
-            "number of subcribe requests sent"
+            "number of subcribe requests sent",
+            &["connection_id"]
         )
         .unwrap(),
-        bytes_received: register_int_counter!(
+        bytes_received: register_int_counter_vec!(
             "bytes_received",
-            "number of bytes received in websocket frames"
+            "number of bytes received in websocket frames",
+            &["connection_id"]
         )
         .unwrap(),
-        subscribe_errors: register_int_counter!("subscribe_errors", "number of subscribe errors")
-            .unwrap(),
-        websocket_connected: register_int_gauge!(
+        subscribe_errors: register_int_counter_vec!(
+            "subscribe_errors",
+            "number of subscribe errors",
+            &["connection_id"]
+        )
+        .unwrap(),
+        websocket_connected: register_int_gauge_vec!(
             "websocket_connected",
-            "websocket connection status"
+            "websocket connection status",
+            &["connection_id"]
         )
         .unwrap(),
-        websocket_active: register_int_gauge!("websocket_active", "websocket active status")
-            .unwrap(),
+        websocket_active: register_int_gauge_vec!(
+            "websocket_active",
+            "websocket active status",
+            &["connection_id"]
+        )
+        .unwrap(),
         notifications_received: register_int_counter_vec!(
             "notifications_received",
             "number of notifications received",
-            &["type"]
+            &["connection_id", "type"]
         )
         .unwrap(),
-        commands: register_int_counter_vec!("commands", "number of commands received", &["type"])
-            .unwrap(),
+        commands: register_int_counter_vec!(
+            "commands",
+            "number of commands received",
+            &["connection_id", "type"]
+        )
+        .unwrap(),
     });
     &METRICS
 }
