@@ -173,7 +173,8 @@ impl AccountUpdateManager {
         websocket_url: &str,
     ) -> Addr<Self> {
         AccountUpdateManager::create(|ctx| {
-            let (handle, stream) = delay_queue();
+            let actor_name = format!("pubsub-{}", actor_id);
+            let (handle, stream) = delay_queue(actor_name.clone());
             let purge_stream = stream.map(|(sub, com)| AccountCommand::Purge(sub, com));
 
             ctx.set_mailbox_capacity(MAILBOX_CAPACITY);
@@ -209,14 +210,18 @@ impl AccountUpdateManager {
                                 elapsed = ?elapsed, "request in flight too long, assume dead");
                         }
                         !too_long
-                    })
+                    });
+                    metrics()
+                        .inflight_entries
+                        .with_label_values(&[&actor.actor_name])
+                        .set(actor.inflight.len() as i64);
                 }
             });
 
             AccountUpdateManager::add_stream(purge_stream, ctx);
             AccountUpdateManager {
                 actor_id,
-                actor_name: format!("pubsub-{}", actor_id),
+                actor_name,
                 websocket_url: websocket_url.to_owned(),
                 connection: Connection::Disconnected,
                 id_to_sub: HashMap::default(),
@@ -463,6 +468,10 @@ impl AccountUpdateManager {
                         }
                     }
                 }
+                metrics()
+                    .additional_keys_entries
+                    .with_label_values(&[&self.actor_name])
+                    .set(self.additional_keys.len() as i64);
             }
             Subscription::Account(key) => {
                 self.accounts.remove(&key, commitment);
@@ -523,6 +532,10 @@ impl AccountUpdateManager {
                         }
                     }
                 }
+                metrics()
+                    .inflight_entries
+                    .with_label_values(&[&self.actor_name])
+                    .set(self.inflight.len() as i64);
                 self.update_status();
             }
             // subscription response
@@ -537,6 +550,17 @@ impl AccountUpdateManager {
                             let sub_id: u64 = serde_json::from_str(result.get())?;
                             self.id_to_sub.insert(sub_id, (sub, commitment));
                             self.sub_to_id.insert((sub, commitment), sub_id);
+
+                            metrics()
+                                .id_sub_entries
+                                .with_label_values(&[&self.actor_name])
+                                .set(self.id_to_sub.len() as i64);
+
+                            metrics()
+                                .sub_id_entries
+                                .with_label_values(&[&self.actor_name])
+                                .set(self.sub_to_id.len() as i64);
+
                             info!(self.actor_id, message = "subscribed to stream", sub_id = sub_id, sub = %sub, commitment = ?commitment);
                             metrics()
                                 .subscriptions_active
@@ -562,6 +586,15 @@ impl AccountUpdateManager {
                                 } else {
                                     warn!(sub = %sub, commitment = ?commitment, "unsubscribe for unknown subscription");
                                 }
+                                metrics()
+                                    .id_sub_entries
+                                    .with_label_values(&[&self.actor_name])
+                                    .set(self.id_to_sub.len() as i64);
+
+                                metrics()
+                                    .sub_id_entries
+                                    .with_label_values(&[&self.actor_name])
+                                    .set(self.sub_to_id.len() as i64);
                             } else {
                                 warn!(self.actor_id, message = "unsubscribe failed", key = %sub.key());
                             }
@@ -765,6 +798,10 @@ impl Handler<AccountCommand> for AccountUpdateManager {
                     self.subscribe(sub, commitment)?;
                     if let Some(filters) = filters {
                         self.additional_keys.entry(key).or_default().insert(filters);
+                        metrics()
+                            .additional_keys_entries
+                            .with_label_values(&[&self.actor_name])
+                            .set(self.additional_keys.len() as i64);
                     }
                 }
                 AccountCommand::Purge(sub, commitment) => {
@@ -882,6 +919,11 @@ impl StreamHandler<Result<awc::ws::Frame, awc::error::WsProtocolError>> for Acco
             request_id,
             (InflightRequest::SlotSub(request_id), Instant::now()),
         );
+        metrics()
+            .inflight_entries
+            .with_label_values(&[&self.actor_name])
+            .set(self.inflight.len() as i64);
+
         let _ = self.send(&request);
 
         // restore subscriptions
@@ -987,7 +1029,9 @@ impl<T> DelayQueueHandle<T> {
     }
 }
 
-fn delay_queue<T: Clone + std::hash::Hash + Eq>() -> (DelayQueueHandle<T>, impl Stream<Item = T>) {
+fn delay_queue<T: Clone + std::hash::Hash + Eq>(
+    id: String,
+) -> (DelayQueueHandle<T>, impl Stream<Item = T>) {
     let (sender, incoming) = mpsc::unbounded_channel::<DelayQueueCommand<T>>();
     let mut map: HashMap<T, _> = HashMap::default();
     let stream = stream_generator::generate_stream(|mut stream| async move {
@@ -995,6 +1039,14 @@ fn delay_queue<T: Clone + std::hash::Hash + Eq>() -> (DelayQueueHandle<T>, impl 
         tokio::pin!(incoming);
 
         loop {
+            metrics()
+                .purge_queue_length
+                .with_label_values(&[&id])
+                .set(delay_queue.len() as i64);
+            metrics()
+                .purge_queue_entries
+                .with_label_values(&[&id])
+                .set(map.len() as i64);
             tokio::select! {
                 item = incoming.next() => {
                     if let Some(item) = item {
