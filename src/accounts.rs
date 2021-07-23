@@ -306,7 +306,6 @@ impl AccountUpdateManager {
             let (stream, abort_handle) = futures_util::stream::abortable(stream);
             let actor_id = actor.actor_id;
             let sink = SinkWrite::new(sink, ctx);
-            AccountUpdateManager::add_stream(stream, ctx);
 
             let old = std::mem::replace(
                 &mut actor.connection,
@@ -318,6 +317,7 @@ impl AccountUpdateManager {
             if old.is_connected() {
                 warn!(actor_id, "was connected, should not have happened");
             }
+            AccountUpdateManager::add_stream(stream, ctx);
             metrics()
                 .websocket_connected
                 .with_label_values(&[&actor.actor_name])
