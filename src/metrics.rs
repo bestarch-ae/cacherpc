@@ -147,6 +147,7 @@ pub struct RpcMetrics {
     pub response_size_bytes: HistogramVec,
     pub lru_cache_hits: IntCounter,
     pub lru_cache_filled: IntGaugeVec,
+    pub lru_cache_bytes: IntGauge,
     pub passthrough_total_time: Histogram,
     pub passthrough_request_time: Histogram,
     pub passthrough_forward_response_time: Histogram,
@@ -251,6 +252,8 @@ pub fn rpc_metrics() -> &'static RpcMetrics {
             &["worker"]
         )
         .unwrap(),
+        lru_cache_bytes: register_int_gauge!("lru_cache_bytes", "LRU cache size (in bytes)")
+            .unwrap(),
         account_cache_filled: register_int_counter!(
             "account_cache_filled",
             "Accounts cache filled while waiting for response"
