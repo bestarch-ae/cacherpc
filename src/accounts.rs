@@ -285,6 +285,7 @@ impl AccountUpdateManager {
                     .max_http_version(awc::http::Version::HTTP_11)
                     .finish()
                     .ws(&websocket_url)
+                    .max_frame_size(10 * 1024 * 1024)
                     .connect()
                     .await;
                 match res {
