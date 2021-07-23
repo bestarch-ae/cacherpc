@@ -8,6 +8,7 @@ use prometheus::{
 pub struct DbMetrics {
     pub account_entries: IntGauge,
     pub program_account_entries: IntGauge,
+    pub account_bytes: IntGauge,
 }
 
 pub fn db_metrics() -> &'static DbMetrics {
@@ -22,6 +23,8 @@ pub fn db_metrics() -> &'static DbMetrics {
             "number of entries in program accounts cache"
         )
         .unwrap(),
+        account_bytes: register_int_gauge!("account_bytes", "number of entries in accounts cache")
+            .unwrap(),
     });
     &METRICS
 }
