@@ -147,7 +147,7 @@ pub(crate) struct AccountUpdateManager {
     actor_name: String,
     request_id: u64,
     inflight: HashMap<u64, (InflightRequest, Instant)>,
-    subs: HashSet<(Subscription, Commitment)>,
+    subs: HashMap<(Subscription, Commitment), Instant>,
     id_to_sub: HashMap<u64, (Subscription, Commitment)>,
     sub_to_id: HashMap<(Subscription, Commitment), u64>,
     connection: Connection,
@@ -231,7 +231,7 @@ impl AccountUpdateManager {
                 id_to_sub: HashMap::default(),
                 sub_to_id: HashMap::default(),
                 inflight: HashMap::default(),
-                subs: HashSet::default(),
+                subs: HashMap::default(),
                 request_id: 1,
                 accounts: accounts.clone(),
                 program_accounts: program_accounts.clone(),
@@ -369,7 +369,7 @@ impl AccountUpdateManager {
             }
         }
 
-        if self.subs.contains(&(sub, commitment)) {
+        if self.subs.get(&(sub, commitment)).is_some() {
             info!(message = "already trying to subscribe", pubkey = %sub.key());
             return Ok(());
         }
@@ -405,7 +405,7 @@ impl AccountUpdateManager {
             request_id,
             (InflightRequest::Sub(sub, commitment), Instant::now()),
         );
-        self.subs.insert((sub, commitment));
+        self.subs.insert((sub, commitment), Instant::now());
         self.send(&request)?;
         self.purge_queue
             .insert((sub, commitment), self.time_to_live);
@@ -578,7 +578,7 @@ impl AccountUpdateManager {
                             if is_ok {
                                 if let Some(sub_id) = self.sub_to_id.remove(&(sub, commitment)) {
                                     self.id_to_sub.remove(&sub_id);
-                                    self.subs.remove(&(sub, commitment));
+                                    let created_at = self.subs.remove(&(sub, commitment));
                                     info!(
                                         message = "unsubscribed from stream",
                                         sub_id = sub_id,
@@ -589,6 +589,11 @@ impl AccountUpdateManager {
                                         .subscriptions_active
                                         .with_label_values(&[&self.actor_name])
                                         .dec();
+                                    if let Some(created_at) = created_at {
+                                        metrics()
+                                            .subscription_lifetime
+                                            .observe(created_at.elapsed().as_secs_f64());
+                                    }
                                 } else {
                                     warn!(sub = %sub, commitment = ?commitment, "unsubscribe for unknown subscription");
                                 }
@@ -755,7 +760,7 @@ impl AccountUpdateManager {
         self.sub_to_id.clear();
 
         info!(self.actor_id, "purging related caches");
-        let to_purge: Vec<_> = self.subs.iter().cloned().collect();
+        let to_purge: Vec<_> = self.subs.keys().cloned().collect();
         for (sub, commitment) in to_purge {
             self.purge_key(&sub, commitment);
         }
@@ -935,9 +940,9 @@ impl StreamHandler<Result<awc::ws::Frame, awc::error::WsProtocolError>> for Acco
         // restore subscriptions
         info!(self.actor_id, "adding subscriptions");
         let subs_len = self.subs.len();
-        let subs = std::mem::replace(&mut self.subs, HashSet::with_capacity(subs_len));
+        let subs = std::mem::replace(&mut self.subs, HashMap::with_capacity(subs_len));
 
-        for (sub, commitment) in subs {
+        for ((sub, commitment), _) in subs {
             self.subscribe(sub, commitment).unwrap()
             // TODO: it would be nice to retrieve current state for
             // everything we had before

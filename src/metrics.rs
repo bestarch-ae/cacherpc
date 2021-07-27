@@ -45,6 +45,7 @@ pub struct PubSubMetrics {
     pub id_sub_entries: IntGaugeVec,
     pub inflight_entries: IntGaugeVec,
     pub subs_entries: IntGaugeVec,
+    pub subscription_lifetime: Histogram,
 }
 
 pub fn pubsub_metrics() -> &'static PubSubMetrics {
@@ -124,6 +125,12 @@ pub fn pubsub_metrics() -> &'static PubSubMetrics {
             "commands",
             "number of commands received",
             &["connection_id", "type"]
+        )
+        .unwrap(),
+        subscription_lifetime: register_histogram!(
+            "subscription_lifetime",
+            "time before subscription expires",
+            vec![30.0, 120.0, 300.0, 600.0, 1200.0, 3600.0, 21600.0]
         )
         .unwrap(),
     });
