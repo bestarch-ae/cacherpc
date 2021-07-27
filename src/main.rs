@@ -82,6 +82,14 @@ struct Options {
         default_value = "1"
     )]
     websocket_connections: u32,
+    #[structopt(
+        short = "t",
+        long = "time-to-live",
+        help = "time to live for cached values",
+        default_value = "10m",
+        parse(try_from_str = humantime::parse_duration)
+    )]
+    time_to_live: Duration,
 }
 
 #[derive(Debug)]
@@ -150,6 +158,7 @@ async fn run(options: Options) -> Result<()> {
         accounts.clone(),
         program_accounts.clone(),
         &options.ws_url,
+        options.time_to_live,
     );
 
     let rpc_url = options.rpc_url;
