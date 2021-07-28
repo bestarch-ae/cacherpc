@@ -112,6 +112,7 @@ enum Connection {
     Disconnected,
     Connecting,
     Connected { sink: WsSink, stream: AbortHandle },
+    Closing { stream: AbortHandle },
 }
 
 impl Connection {
@@ -120,15 +121,29 @@ impl Connection {
     }
 
     fn is_connecting(&self) -> bool {
-        matches!(self, Connection::Connecting { .. })
+        matches!(self, Connection::Connecting)
     }
 
-    fn disconnect(&mut self) {
-        let old_connection = std::mem::replace(self, Connection::Disconnected);
+    fn is_closing(&self) -> bool {
+        matches!(self, Connection::Closing { .. })
+    }
 
-        if let Connection::Connected { mut sink, stream } = old_connection {
-            sink.close();
-            stream.abort();
+    fn close(&mut self) {
+        let old = std::mem::replace(self, Connection::Disconnected);
+
+        match old {
+            Connection::Disconnected => {}
+            Connection::Connecting => {
+                *self = Connection::Connecting;
+            }
+            Connection::Connected { mut sink, stream } => {
+                sink.close();
+                *self = Connection::Closing { stream };
+            }
+            Connection::Closing { stream } => {
+                stream.abort();
+                *self = Connection::Disconnected;
+            }
         }
     }
 
@@ -270,7 +285,8 @@ impl AccountUpdateManager {
 
         if self.connection.is_connected() {
             warn!(message = "old connection not canceled properly", actor_id = %actor_id);
-            self.connection.disconnect();
+            self.connection.close();
+            return;
         }
         self.connection = Connection::Connecting;
 
@@ -752,7 +768,7 @@ impl AccountUpdateManager {
 
     fn disconnect(&mut self, _ctx: &mut Context<Self>) {
         info!(self.actor_id, "websocket disconnected");
-        self.connection.disconnect();
+        self.connection.close();
 
         metrics()
             .websocket_connected
@@ -961,6 +977,7 @@ impl StreamHandler<Result<awc::ws::Frame, awc::error::WsProtocolError>> for Acco
 
     fn finished(&mut self, ctx: &mut Context<Self>) {
         info!(self.actor_id, "websocket stream finished");
+        self.disconnect(ctx);
         self.reconnect(ctx);
     }
 }
@@ -991,6 +1008,9 @@ impl actix::io::WriteHandler<awc::error::WsProtocolError> for AccountUpdateManag
 
     fn finished(&mut self, _ctx: &mut Self::Context) {
         info!(self.actor_id, "writer closed");
+        if self.connection.is_closing() {
+            self.connection.close();
+        }
     }
 }
 
