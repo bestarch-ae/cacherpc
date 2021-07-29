@@ -1034,9 +1034,21 @@ async fn get_program_accounts(
                     );
                     keys.insert(pubkey);
                 }
-                app_state
-                    .program_accounts
-                    .insert(program_pubkey, keys, commitment, filters);
+                let new_set = keys.clone();
+                let old_set = app_state.program_accounts.insert(
+                    program_pubkey,
+                    keys,
+                    commitment,
+                    filters.clone(),
+                );
+                if let Some(old_set) = old_set {
+                    info!(
+                        message = "replaced program accounts",
+                        diff = ?old_set.difference(&new_set),
+                        filters = ?filters,
+                        program = %program_pubkey,
+                    );
+                }
                 app_state.map_updated.notify();
             }
             Response::Error(error) => {
