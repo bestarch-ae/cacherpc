@@ -700,14 +700,15 @@ impl AccountUpdateManager {
                                     if filter_group.iter().all(|f| f.matches(data)) {
                                         added |= self.program_accounts.add(
                                             &program_key,
-                                            params.result.value.pubkey,
+                                            key,
                                             Some(filter_group.clone()),
                                             *commitment,
                                         );
                                     } else {
+                                        info!(account = %key, program = %program_key, "account was removed from filtered list");
                                         self.program_accounts.remove(
                                             &program_key,
-                                            &params.result.value.pubkey,
+                                            &key,
                                             filter_group.clone(),
                                             *commitment,
                                         );
@@ -717,12 +718,9 @@ impl AccountUpdateManager {
                             // add() returns false if we don't have an entry
                             // which means we haven't received complete result
                             // from validator by rpc
-                            added |= self.program_accounts.add(
-                                &program_key,
-                                params.result.value.pubkey,
-                                None,
-                                *commitment,
-                            );
+                            added |=
+                                self.program_accounts
+                                    .add(&program_key, key, None, *commitment);
                             if added {
                                 self.accounts.insert(
                                     key,
@@ -732,6 +730,34 @@ impl AccountUpdateManager {
                                     },
                                     *commitment,
                                 );
+                            } else {
+                                let mut account_is_referenced = false;
+
+                                for filters in self
+                                    .additional_keys
+                                    .get(&program_key)
+                                    .iter()
+                                    .flat_map(|set| set.iter())
+                                    .cloned()
+                                    .map(Some)
+                                    .chain(None)
+                                {
+                                    if let Some(accounts) =
+                                        self.program_accounts.get(&program_key, filters)
+                                    {
+                                        account_is_referenced |= accounts
+                                            .get(*commitment)
+                                            .map(|accs| accs.contains(&key))
+                                            .unwrap_or(false);
+                                        if account_is_referenced {
+                                            break;
+                                        }
+                                    }
+                                }
+                                if !account_is_referenced {
+                                    info!(account = %key, "account was not referenced anywhere, removed");
+                                    self.accounts.remove(&key, *commitment);
+                                }
                             }
                         } else {
                             warn!(message = "unknown subscription", sub = params.subscription);
