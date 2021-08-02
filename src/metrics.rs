@@ -35,6 +35,7 @@ pub struct PubSubMetrics {
     pub subscribe_errors: IntCounterVec,
     pub websocket_connected: IntGaugeVec,
     pub websocket_active: IntGaugeVec,
+    pub websocket_errors: IntCounterVec,
     pub notifications_received: IntCounterVec,
     pub commands: IntCounterVec,
     pub bytes_received: IntCounterVec,
@@ -114,6 +115,12 @@ pub fn pubsub_metrics() -> &'static PubSubMetrics {
             "websocket_active",
             "websocket active status",
             &["connection_id"]
+        )
+        .unwrap(),
+        websocket_errors: register_int_counter_vec!(
+            "websocket_errors",
+            "number of websocket errors",
+            &["connection_id", "type"]
         )
         .unwrap(),
         notifications_received: register_int_counter_vec!(

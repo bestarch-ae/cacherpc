@@ -941,6 +941,10 @@ impl StreamHandler<Result<awc::ws::Frame, awc::error::WsProtocolError>> for Acco
             Ok(item) => item,
             Err(err) => {
                 error!(error = %err, "websocket protocol error");
+                metrics()
+                    .websocket_errors
+                    .with_label_values(&[&self.actor_name, "read"])
+                    .inc();
                 self.disconnect(ctx);
                 return;
             }
@@ -1067,6 +1071,10 @@ impl Actor for AccountUpdateManager {
 impl actix::io::WriteHandler<awc::error::WsProtocolError> for AccountUpdateManager {
     fn error(&mut self, err: awc::error::WsProtocolError, ctx: &mut Self::Context) -> Running {
         error!(self.actor_id, message = "websocket write error", error = ?err);
+        metrics()
+            .websocket_errors
+            .with_label_values(&[&self.actor_name, "write"])
+            .inc();
         self.disconnect(ctx);
         Running::Continue
     }
