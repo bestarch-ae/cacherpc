@@ -37,6 +37,31 @@ enum InflightRequest {
     SlotSub(u64),
 }
 
+struct Times {
+    created_at: Instant,
+    updated_at: Instant,
+}
+
+impl Times {
+    fn new() -> Self {
+        let now = Instant::now();
+        Times {
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn update(&mut self) -> Duration {
+        let ret = self.updated_at.elapsed();
+        self.updated_at = Instant::now();
+        ret
+    }
+
+    fn since_creation(&self) -> Duration {
+        self.created_at.elapsed()
+    }
+}
+
 type WsSink = SinkWrite<
     awc::ws::Message,
     futures_util::stream::SplitSink<
@@ -163,7 +188,7 @@ pub(crate) struct AccountUpdateManager {
     actor_name: String,
     request_id: u64,
     inflight: HashMap<u64, (InflightRequest, Instant)>,
-    subs: HashMap<(Subscription, Commitment), Instant>,
+    subs: HashMap<(Subscription, Commitment), Times>,
     id_to_sub: HashMap<u64, (Subscription, Commitment)>,
     sub_to_id: HashMap<(Subscription, Commitment), u64>,
     connection: Connection,
@@ -439,7 +464,7 @@ impl AccountUpdateManager {
             request_id,
             (InflightRequest::Sub(sub, commitment), Instant::now()),
         );
-        self.subs.insert((sub, commitment), Instant::now());
+        self.subs.insert((sub, commitment), Times::new());
         self.send(&request)?;
         self.purge_queue
             .insert((sub, commitment), self.time_to_live);
@@ -623,10 +648,10 @@ impl AccountUpdateManager {
                                         .subscriptions_active
                                         .with_label_values(&[&self.actor_name])
                                         .dec();
-                                    if let Some(created_at) = created_at {
+                                    if let Some(times) = created_at {
                                         metrics()
                                             .subscription_lifetime
-                                            .observe(created_at.elapsed().as_secs_f64());
+                                            .observe(times.since_creation().as_secs_f64());
                                     }
                                 } else {
                                     warn!(sub = %sub, commitment = ?commitment, "unsubscribe for unknown subscription");
@@ -888,6 +913,11 @@ impl Handler<AccountCommand> for AccountUpdateManager {
                         .commands
                         .with_label_values(&[&self.actor_name, "reset"])
                         .inc();
+                    if let Some(time) = self.subs.get_mut(&(key, commitment)) {
+                        metrics()
+                            .time_until_reset
+                            .observe(time.update().as_secs_f64());
+                    }
                     self.purge_queue.reset((key, commitment), self.time_to_live);
                 }
             }
