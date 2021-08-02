@@ -310,7 +310,10 @@ impl AccountUpdateManager {
                     .connect()
                     .await;
                 match res {
-                    Ok((_, conn)) => break conn,
+                    Ok((resp, conn)) => {
+                        info!(actor_id, message = "connection established", resp = ?resp);
+                        break conn;
+                    }
                     Err(err) => {
                         let delay = backoff
                             .next_backoff()
@@ -328,6 +331,7 @@ impl AccountUpdateManager {
             let actor_id = actor.actor_id;
             let mut sink = SinkWrite::new(sink, ctx);
 
+            info!(actor_id, message = "websocket sending ping");
             if sink
                 .write(ws::Message::Ping(b"check connection".as_ref().into()))
                 .is_some()
@@ -336,6 +340,7 @@ impl AccountUpdateManager {
                 actor.disconnect(ctx);
                 return;
             };
+            info!(actor_id, message = "websocket ping sent");
 
             let old = std::mem::replace(
                 &mut actor.connection,
@@ -349,6 +354,7 @@ impl AccountUpdateManager {
             }
 
             AccountUpdateManager::add_stream(stream, ctx);
+            info!(actor_id, message = "websocket stream added");
             metrics()
                 .websocket_connected
                 .with_label_values(&[&actor.actor_name])
@@ -356,6 +362,7 @@ impl AccountUpdateManager {
             actor.last_received_at = Instant::now();
         });
         ctx.wait(fut);
+        info!(self.actor_id, message = "connection future complete");
         self.update_status();
     }
 
@@ -834,6 +841,7 @@ impl AccountUpdateManager {
         } else {
             warn!(actor_id, "already reconnecting");
         }
+        info!(actor_id, "reconnect completed");
     }
 }
 
