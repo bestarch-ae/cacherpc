@@ -128,7 +128,7 @@ impl Connection {
         matches!(self, Connection::Closing { .. })
     }
 
-    fn close(&mut self) {
+    fn close(&mut self, ctx: &mut Context<AccountUpdateManager>) {
         let old = std::mem::replace(self, Connection::Disconnected);
 
         match old {
@@ -138,6 +138,7 @@ impl Connection {
             }
             Connection::Connected { mut sink, stream } => {
                 sink.close();
+                ctx.cancel_future(sink.handle());
                 *self = Connection::Closing { stream };
             }
             Connection::Closing { stream } => {
@@ -285,7 +286,7 @@ impl AccountUpdateManager {
 
         if self.connection.is_connected() {
             warn!(message = "old connection not canceled properly", actor_id = %actor_id);
-            self.connection.close();
+            self.connection.close(ctx);
             return;
         }
         self.connection = Connection::Connecting;
@@ -766,9 +767,9 @@ impl AccountUpdateManager {
         Ok(())
     }
 
-    fn disconnect(&mut self, _ctx: &mut Context<Self>) {
+    fn disconnect(&mut self, ctx: &mut Context<Self>) {
         info!(self.actor_id, "websocket disconnected");
-        self.connection.close();
+        self.connection.close(ctx);
 
         metrics()
             .websocket_connected
@@ -1006,10 +1007,10 @@ impl actix::io::WriteHandler<awc::error::WsProtocolError> for AccountUpdateManag
         Running::Continue
     }
 
-    fn finished(&mut self, _ctx: &mut Self::Context) {
+    fn finished(&mut self, ctx: &mut Self::Context) {
         info!(self.actor_id, "writer closed");
         if self.connection.is_closing() {
-            self.connection.close();
+            self.connection.close(ctx);
         }
     }
 }
