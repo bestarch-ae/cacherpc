@@ -240,7 +240,7 @@ impl State {
             metrics()
                 .available_permits
                 .with_label_values(&[req.method])
-                .set(limit.available_permits() as i64);
+                .observe(limit.available_permits() as f64);
             wait_time.observe_duration();
             let timer = metrics()
                 .backend_response_time

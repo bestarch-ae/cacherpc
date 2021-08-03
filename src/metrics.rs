@@ -45,6 +45,7 @@ pub struct PubSubMetrics {
     pub id_sub_entries: IntGaugeVec,
     pub inflight_entries: IntGaugeVec,
     pub subs_entries: IntGaugeVec,
+    pub subscription_lifetime: Histogram,
 }
 
 pub fn pubsub_metrics() -> &'static PubSubMetrics {
@@ -126,6 +127,12 @@ pub fn pubsub_metrics() -> &'static PubSubMetrics {
             &["connection_id", "type"]
         )
         .unwrap(),
+        subscription_lifetime: register_histogram!(
+            "subscription_lifetime",
+            "time before subscription expires",
+            vec![30.0, 120.0, 300.0, 600.0, 1200.0, 3600.0, 21600.0]
+        )
+        .unwrap(),
     });
     &METRICS
 }
@@ -143,7 +150,7 @@ pub struct RpcMetrics {
     pub backend_errors: IntCounterVec,
     pub handler_time: HistogramVec,
     pub wait_time: HistogramVec,
-    pub available_permits: IntGaugeVec,
+    pub available_permits: HistogramVec,
     pub response_size_bytes: HistogramVec,
     pub lru_cache_hits: IntCounter,
     pub lru_cache_filled: IntGaugeVec,
@@ -299,10 +306,14 @@ pub fn rpc_metrics() -> &'static RpcMetrics {
             &["type"]
         )
         .unwrap(),
-        available_permits: register_int_gauge_vec!(
+        available_permits: register_histogram_vec!(
             "available_permits",
             "Permits available to make backend requests",
-            &["type"]
+            &["type"],
+            vec![
+                0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 20.0, 50.0, 100.0, 200.0,
+                500.0
+            ]
         )
         .unwrap(),
         response_size_bytes: register_histogram_vec!(
