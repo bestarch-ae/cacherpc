@@ -27,7 +27,7 @@ tracing-appender = { version = "0.1" }
 tracing-futures = "0.2"
 structopt = "0.3"
 base64 = "0.13"
-zstd = "0.8"
+zstd = "0.9"
 smallvec = { version = "1.6", features = ["serde", "union"] }
 thiserror = "1.0"
 anyhow = "1.0"
