@@ -17,7 +17,7 @@ use smallvec::SmallVec;
 use tokio::stream::{Stream, StreamExt};
 use tokio::sync::mpsc;
 use tokio::time::{DelayQueue, Instant};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::metrics::db_metrics;
 use crate::metrics::pubsub_metrics as metrics;
@@ -798,7 +798,7 @@ impl AccountUpdateManager {
                                     }
                                 }
                                 if !account_is_referenced {
-                                    info!(self.actor_id, account = %key, "account was not referenced anywhere, removed");
+                                    debug!(self.actor_id, account = %key, "account was not referenced anywhere, removed");
                                     self.accounts.remove(&key, *commitment);
                                 }
                             }
