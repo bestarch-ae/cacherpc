@@ -230,14 +230,17 @@ impl AccountUpdateManager {
                         .send(awc::ws::Message::Ping(b"hello?".as_ref().into()))
                         .is_err()
                     {
+                        warn!(actor_id = actor.actor_id, "failed to send ping");
                         actor.disconnect(ctx);
                     }
 
                     let elapsed = actor.last_received_at.elapsed();
                     if elapsed > WEBSOCKET_PING_TIMEOUT {
                         warn!(
+                            actor_id = actor.actor_id,
                             "no messages received in {:?}, assume connection lost ({:?})",
-                            elapsed, actor.last_received_at
+                            elapsed,
+                            actor.last_received_at
                         );
                         actor.disconnect(ctx);
                     }
@@ -245,12 +248,14 @@ impl AccountUpdateManager {
             });
 
             ctx.run_interval(Duration::from_secs(5), move |actor, _ctx| {
+                let actor_id = actor.actor_id;
                 if actor.connection.is_connected() {
                     actor.inflight.retain(|request_id, (req, time)| {
                         let elapsed = time.elapsed();
                         let too_long = elapsed > IN_FLIGHT_TIMEOUT;
                         if too_long {
-                            warn!(request_id, request = ?req, timeout = ?IN_FLIGHT_TIMEOUT,
+                            warn!(actor_id,
+                                request_id, request = ?req, timeout = ?IN_FLIGHT_TIMEOUT,
                                 elapsed = ?elapsed, "request in flight too long, assume dead");
                         }
                         !too_long
@@ -429,7 +434,7 @@ impl AccountUpdateManager {
         }
 
         if self.subs.get(&(sub, commitment)).is_some() {
-            info!(message = "already trying to subscribe", pubkey = %sub.key());
+            info!(self.actor_id, message = "already trying to subscribe", pubkey = %sub.key());
             return Ok(());
         }
 
@@ -440,6 +445,7 @@ impl AccountUpdateManager {
             Subscription::Program(key) => (key, "programSubscribe"),
         };
         info!(
+            self.actor_id,
             message = "subscribe to",
             pubkey = %key,
             method = method,
@@ -492,7 +498,7 @@ impl AccountUpdateManager {
         }
 
         if let Some(sub_id) = self.sub_to_id.get(&(sub, commitment)) {
-            info!(message = "unsubscribe", key = %sub.key(), commitment = ?commitment, request_id = request_id);
+            info!(self.actor_id, message = "unsubscribe", key = %sub.key(), commitment = ?commitment, request_id = request_id);
 
             let method = match sub {
                 Subscription::Program(_) => "programUnsubscribe",
@@ -639,6 +645,7 @@ impl AccountUpdateManager {
                                     self.id_to_sub.remove(&sub_id);
                                     let created_at = self.subs.remove(&(sub, commitment));
                                     info!(
+                                        self.actor_id,
                                         message = "unsubscribed from stream",
                                         sub_id = sub_id,
                                         key = %sub.key(),
@@ -654,7 +661,7 @@ impl AccountUpdateManager {
                                             .observe(times.since_creation().as_secs_f64());
                                     }
                                 } else {
-                                    warn!(sub = %sub, commitment = ?commitment, "unsubscribe for unknown subscription");
+                                    warn!(self.actor_id, sub = %sub, commitment = ?commitment, "unsubscribe for unknown subscription");
                                 }
                                 metrics()
                                     .id_sub_entries
@@ -695,7 +702,11 @@ impl AccountUpdateManager {
                             self.accounts.insert(sub.key(), params.result, *commitment);
                             db_metrics().account_entries.set(self.accounts.len() as i64);
                         } else {
-                            warn!(message = "unknown subscription", sub = params.subscription);
+                            warn!(
+                                self.actor_id,
+                                message = "unknown subscription",
+                                sub = params.subscription
+                            );
                         }
                         metrics()
                             .notifications_received
@@ -737,7 +748,7 @@ impl AccountUpdateManager {
                                             *commitment,
                                         );
                                     } else {
-                                        info!(account = %key, program = %program_key, "account was removed from filtered list");
+                                        info!(self.actor_id, account = %key, program = %program_key, "account was removed from filtered list");
                                         self.program_accounts.remove(
                                             &program_key,
                                             &key,
@@ -787,12 +798,16 @@ impl AccountUpdateManager {
                                     }
                                 }
                                 if !account_is_referenced {
-                                    info!(account = %key, "account was not referenced anywhere, removed");
+                                    info!(self.actor_id, account = %key, "account was not referenced anywhere, removed");
                                     self.accounts.remove(&key, *commitment);
                                 }
                             }
                         } else {
-                            warn!(message = "unknown subscription", sub = params.subscription);
+                            warn!(
+                                self.actor_id,
+                                message = "unknown subscription",
+                                sub = params.subscription
+                            );
                         }
                         db_metrics().account_entries.set(self.accounts.len() as i64);
                         db_metrics()
@@ -813,12 +828,16 @@ impl AccountUpdateManager {
                         let _slot = params.result; // TODO: figure out which slot validator *actually* reports
                     }
                     _ => {
-                        warn!(message = "unknown notification", method = method);
+                        warn!(
+                            self.actor_id,
+                            message = "unknown notification",
+                            method = method
+                        );
                     }
                 }
             }
             any => {
-                warn!(msg = ?any, text = ?text, "unidentified websocket message");
+                warn!(self.actor_id, msg = ?any, text = ?text, "unidentified websocket message");
             }
         }
 
@@ -852,21 +871,19 @@ impl AccountUpdateManager {
     }
 
     fn reconnect(&mut self, ctx: &mut Context<Self>) {
-        let actor_id = self.actor_id;
-
         if !self.connection.is_connecting() {
-            info!(actor_id, "websocket reconnecting");
+            info!(self.actor_id, "websocket reconnecting");
             if self.connection.is_connected() {
-                error!(actor_id, "was connected, while doing reconnect");
+                error!(self.actor_id, "was connected, while doing reconnect");
                 self.disconnect(ctx);
             }
 
             self.connect(ctx);
             self.update_status();
         } else {
-            warn!(actor_id, "already reconnecting");
+            warn!(self.actor_id, "already reconnecting");
         }
-        info!(actor_id, "reconnect completed");
+        info!(self.actor_id, "reconnect completed");
     }
 }
 
@@ -876,7 +893,7 @@ impl StreamHandler<AccountCommand> for AccountUpdateManager {
     }
 
     fn finished(&mut self, _ctx: &mut Context<Self>) {
-        info!("purge stream finished");
+        info!(self.actor_id, "purge stream finished");
     }
 }
 
@@ -940,7 +957,7 @@ impl StreamHandler<Result<awc::ws::Frame, awc::error::WsProtocolError>> for Acco
         let item = match item {
             Ok(item) => item,
             Err(err) => {
-                error!(error = %err, "websocket protocol error");
+                error!(self.actor_id, error = %err, "websocket protocol error");
                 metrics()
                     .websocket_errors
                     .with_label_values(&[&self.actor_name, "read"])
@@ -971,11 +988,11 @@ impl StreamHandler<Result<awc::ws::Frame, awc::error::WsProtocolError>> for Acco
                         })?
                 }
                 Frame::Close(reason) => {
-                    warn!(reason = ?reason, "websocket closing");
+                    warn!(self.actor_id, reason = ?reason, "websocket closing");
                     self.disconnect(ctx);
                 }
                 Frame::Binary(msg) => {
-                    warn!(msg = ?msg, "unexpected binary message");
+                    warn!(self.actor_id, msg = ?msg, "unexpected binary message");
                 }
                 Frame::Continuation(msg) => match msg {
                     ws::Item::FirstText(bytes) => {
@@ -1001,7 +1018,7 @@ impl StreamHandler<Result<awc::ws::Frame, awc::error::WsProtocolError>> for Acco
                         })?;
                     }
                     ws::Item::FirstBinary(_) => {
-                        warn!(msg = ?msg, "unexpected continuation message");
+                        warn!(self.actor_id, msg = ?msg, "unexpected continuation message");
                     }
                 },
             }
