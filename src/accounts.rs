@@ -27,7 +27,6 @@ use crate::types::{
 };
 
 const MAILBOX_CAPACITY: usize = 512;
-const PURGE_TIMEOUT: Duration = Duration::from_secs(600);
 const IN_FLIGHT_TIMEOUT: Duration = Duration::from_secs(60);
 const WEBSOCKET_PING_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -55,6 +54,7 @@ impl PubSubManager {
         accounts: AccountsDb,
         program_accounts: ProgramAccountsDb,
         websocket_url: &str,
+        time_to_live: Duration,
     ) -> Self {
         let mut addrs = Vec::new();
         for id in 0..connections {
@@ -65,6 +65,7 @@ impl PubSubManager {
                 program_accounts.clone(),
                 Arc::clone(&active),
                 &websocket_url,
+                time_to_live,
             );
             addrs.push((addr, active))
         }
@@ -141,6 +142,7 @@ impl Connection {
 
 pub(crate) struct AccountUpdateManager {
     websocket_url: String,
+    time_to_live: Duration,
     actor_id: u32,
     actor_name: String,
     request_id: u64,
@@ -171,6 +173,7 @@ impl AccountUpdateManager {
         program_accounts: ProgramAccountsDb,
         active: Arc<AtomicBool>,
         websocket_url: &str,
+        time_to_live: Duration,
     ) -> Addr<Self> {
         AccountUpdateManager::create(|ctx| {
             let actor_name = format!("pubsub-{}", actor_id);
@@ -221,6 +224,7 @@ impl AccountUpdateManager {
             AccountUpdateManager::add_stream(purge_stream, ctx);
             AccountUpdateManager {
                 actor_id,
+                time_to_live,
                 actor_name,
                 websocket_url: websocket_url.to_owned(),
                 connection: Connection::Disconnected,
@@ -403,7 +407,8 @@ impl AccountUpdateManager {
         );
         self.subs.insert((sub, commitment));
         self.send(&request)?;
-        self.purge_queue.insert((sub, commitment), PURGE_TIMEOUT);
+        self.purge_queue
+            .insert((sub, commitment), self.time_to_live);
         metrics()
             .subscribe_requests
             .with_label_values(&[&self.actor_name])
@@ -817,7 +822,7 @@ impl Handler<AccountCommand> for AccountUpdateManager {
                         .commands
                         .with_label_values(&[&self.actor_name, "reset"])
                         .inc();
-                    self.purge_queue.reset((key, commitment), PURGE_TIMEOUT);
+                    self.purge_queue.reset((key, commitment), self.time_to_live);
                 }
             }
             Ok(())
