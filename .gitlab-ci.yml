@@ -19,7 +19,7 @@ stages:
   - build
   - build_deb
   - deploy_dev
-  - deploy_sbx
+  - ready_sbx
   - notify
 
 
@@ -39,6 +39,9 @@ include:
   - project: 'shared/tasks'
     ref: 'master'
     file: 'deb/build_rust_app.yml'                          #build_deb
+  - project: 'shared/tasks'
+    ref: 'master'
+    file: 'deploy/ready-sbx.yml'
 
 create_build_image:
   stage: pre_build
@@ -156,16 +159,15 @@ Deploy DEB to Dev:
     - tags
     - web
 
-Deploy DEB to sbx:
-  stage: deploy_sbx
+deploy_dev_not_master:
+  stage: deploy_dev
   tags:
-    - deploy_rpm_sbx
+    - deploy_rpm_dev
   script:
     - find . -mindepth 1 -maxdepth 1 -exec rm -rf {} \;
     - git clone https://git.zubr.dev/shared/ci-scripts.git
     - chmod 0700 ci-scripts/deploy_deb.sh
-    - ci-scripts/deploy_deb.sh SBX
+    - ci-scripts/deploy_deb.sh DEV
   when: manual
-  only:
+  except:
     - master
-    - tags
