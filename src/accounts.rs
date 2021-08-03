@@ -112,6 +112,7 @@ enum Connection {
     Disconnected,
     Connecting,
     Connected { sink: WsSink, stream: AbortHandle },
+    Closing { stream: AbortHandle },
 }
 
 impl Connection {
@@ -120,15 +121,30 @@ impl Connection {
     }
 
     fn is_connecting(&self) -> bool {
-        matches!(self, Connection::Connecting { .. })
+        matches!(self, Connection::Connecting)
     }
 
-    fn disconnect(&mut self) {
-        let old_connection = std::mem::replace(self, Connection::Disconnected);
+    fn is_closing(&self) -> bool {
+        matches!(self, Connection::Closing { .. })
+    }
 
-        if let Connection::Connected { mut sink, stream } = old_connection {
-            sink.close();
-            stream.abort();
+    fn close(&mut self, ctx: &mut Context<AccountUpdateManager>) {
+        let old = std::mem::replace(self, Connection::Disconnected);
+
+        match old {
+            Connection::Disconnected => {}
+            Connection::Connecting => {
+                *self = Connection::Connecting;
+            }
+            Connection::Connected { mut sink, stream } => {
+                sink.close();
+                ctx.cancel_future(sink.handle());
+                *self = Connection::Closing { stream };
+            }
+            Connection::Closing { stream } => {
+                stream.abort();
+                *self = Connection::Disconnected;
+            }
         }
     }
 
@@ -256,7 +272,7 @@ impl AccountUpdateManager {
                 .connection
                 .send(awc::ws::Message::Text(serde_json::to_string(request)?));
         } else {
-            warn!("not connected");
+            warn!(self.actor_id, "not connected");
         }
         Ok(())
     }
@@ -270,9 +286,10 @@ impl AccountUpdateManager {
 
         if self.connection.is_connected() {
             warn!(message = "old connection not canceled properly", actor_id = %actor_id);
-            self.connection.disconnect();
-            self.connection = Connection::Connecting;
+            self.connection.close(ctx);
+            return;
         }
+        self.connection = Connection::Connecting;
 
         self.update_status();
 
@@ -309,7 +326,16 @@ impl AccountUpdateManager {
             let (sink, stream) = futures_util::stream::StreamExt::split(conn);
             let (stream, abort_handle) = futures_util::stream::abortable(stream);
             let actor_id = actor.actor_id;
-            let sink = SinkWrite::new(sink, ctx);
+            let mut sink = SinkWrite::new(sink, ctx);
+
+            if sink
+                .write(ws::Message::Ping(b"check connection".as_ref().into()))
+                .is_some()
+            {
+                error!(actor_id, "failed to send check msg");
+                actor.disconnect(ctx);
+                return;
+            };
 
             let old = std::mem::replace(
                 &mut actor.connection,
@@ -321,6 +347,7 @@ impl AccountUpdateManager {
             if old.is_connected() {
                 warn!(actor_id, "was connected, should not have happened");
             }
+
             AccountUpdateManager::add_stream(stream, ctx);
             metrics()
                 .websocket_connected
@@ -740,9 +767,9 @@ impl AccountUpdateManager {
         Ok(())
     }
 
-    fn disconnect(&mut self, _ctx: &mut Context<Self>) {
+    fn disconnect(&mut self, ctx: &mut Context<Self>) {
         info!(self.actor_id, "websocket disconnected");
-        self.connection.disconnect();
+        self.connection.close(ctx);
 
         metrics()
             .websocket_connected
@@ -951,6 +978,7 @@ impl StreamHandler<Result<awc::ws::Frame, awc::error::WsProtocolError>> for Acco
 
     fn finished(&mut self, ctx: &mut Context<Self>) {
         info!(self.actor_id, "websocket stream finished");
+        self.disconnect(ctx);
         self.reconnect(ctx);
     }
 }
@@ -963,24 +991,27 @@ impl Actor for AccountUpdateManager {
     }
 
     fn stopping(&mut self, _ctx: &mut Context<Self>) -> Running {
-        info!("pubsub actor stopping");
+        info!(self.actor_id, "pubsub actor stopping");
         Running::Stop
     }
 
     fn stopped(&mut self, _ctx: &mut Context<Self>) {
-        info!("pubsub actor stopped");
+        info!(self.actor_id, "pubsub actor stopped");
     }
 }
 
 impl actix::io::WriteHandler<awc::error::WsProtocolError> for AccountUpdateManager {
     fn error(&mut self, err: awc::error::WsProtocolError, ctx: &mut Self::Context) -> Running {
-        error!(message = "websocket write error", error = ?err);
+        error!(self.actor_id, message = "websocket write error", error = ?err);
         self.disconnect(ctx);
         Running::Continue
     }
 
-    fn finished(&mut self, _ctx: &mut Self::Context) {
-        info!("writer closed");
+    fn finished(&mut self, ctx: &mut Self::Context) {
+        info!(self.actor_id, "writer closed");
+        if self.connection.is_closing() {
+            self.connection.close(ctx);
+        }
     }
 }
 
