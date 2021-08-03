@@ -22,8 +22,8 @@ impl ProgramState {
             .flatten()
     }
 
-    fn insert(&mut self, commitment: Commitment, data: HashSet<Pubkey>) {
-        (self.0)[commitment.as_idx()] = Some(data);
+    fn insert(&mut self, commitment: Commitment, data: HashSet<Pubkey>) -> Option<HashSet<Pubkey>> {
+        (self.0)[commitment.as_idx()].replace(data)
     }
 
     fn add(&mut self, commitment: Commitment, data: Pubkey) {
@@ -81,9 +81,9 @@ impl ProgramAccountsDb {
         data: HashSet<Pubkey>,
         commitment: Commitment,
         filters: Option<SmallVec<[Filter; 2]>>,
-    ) {
+    ) -> Option<HashSet<Pubkey>> {
         let mut entry = self.map.entry((key, filters)).or_default();
-        entry.insert(commitment, data);
+        entry.insert(commitment, data)
     }
 
     // We only add here and do not create new entries because it would be incorrect (incomplete

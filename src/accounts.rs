@@ -310,7 +310,10 @@ impl AccountUpdateManager {
                     .connect()
                     .await;
                 match res {
-                    Ok((_, conn)) => break conn,
+                    Ok((resp, conn)) => {
+                        info!(actor_id, message = "connection established", resp = ?resp);
+                        break conn;
+                    }
                     Err(err) => {
                         let delay = backoff
                             .next_backoff()
@@ -328,6 +331,7 @@ impl AccountUpdateManager {
             let actor_id = actor.actor_id;
             let mut sink = SinkWrite::new(sink, ctx);
 
+            info!(actor_id, message = "websocket sending ping");
             if sink
                 .write(ws::Message::Ping(b"check connection".as_ref().into()))
                 .is_some()
@@ -336,6 +340,7 @@ impl AccountUpdateManager {
                 actor.disconnect(ctx);
                 return;
             };
+            info!(actor_id, message = "websocket ping sent");
 
             let old = std::mem::replace(
                 &mut actor.connection,
@@ -349,6 +354,7 @@ impl AccountUpdateManager {
             }
 
             AccountUpdateManager::add_stream(stream, ctx);
+            info!(actor_id, message = "websocket stream added");
             metrics()
                 .websocket_connected
                 .with_label_values(&[&actor.actor_name])
@@ -356,6 +362,7 @@ impl AccountUpdateManager {
             actor.last_received_at = Instant::now();
         });
         ctx.wait(fut);
+        info!(self.actor_id, message = "connection future complete");
         self.update_status();
     }
 
@@ -700,14 +707,15 @@ impl AccountUpdateManager {
                                     if filter_group.iter().all(|f| f.matches(data)) {
                                         added |= self.program_accounts.add(
                                             &program_key,
-                                            params.result.value.pubkey,
+                                            key,
                                             Some(filter_group.clone()),
                                             *commitment,
                                         );
                                     } else {
+                                        info!(account = %key, program = %program_key, "account was removed from filtered list");
                                         self.program_accounts.remove(
                                             &program_key,
-                                            &params.result.value.pubkey,
+                                            &key,
                                             filter_group.clone(),
                                             *commitment,
                                         );
@@ -717,12 +725,9 @@ impl AccountUpdateManager {
                             // add() returns false if we don't have an entry
                             // which means we haven't received complete result
                             // from validator by rpc
-                            added |= self.program_accounts.add(
-                                &program_key,
-                                params.result.value.pubkey,
-                                None,
-                                *commitment,
-                            );
+                            added |=
+                                self.program_accounts
+                                    .add(&program_key, key, None, *commitment);
                             if added {
                                 self.accounts.insert(
                                     key,
@@ -732,6 +737,34 @@ impl AccountUpdateManager {
                                     },
                                     *commitment,
                                 );
+                            } else {
+                                let mut account_is_referenced = false;
+
+                                for filters in self
+                                    .additional_keys
+                                    .get(&program_key)
+                                    .iter()
+                                    .flat_map(|set| set.iter())
+                                    .cloned()
+                                    .map(Some)
+                                    .chain(None)
+                                {
+                                    if let Some(accounts) =
+                                        self.program_accounts.get(&program_key, filters)
+                                    {
+                                        account_is_referenced |= accounts
+                                            .get(*commitment)
+                                            .map(|accs| accs.contains(&key))
+                                            .unwrap_or(false);
+                                        if account_is_referenced {
+                                            break;
+                                        }
+                                    }
+                                }
+                                if !account_is_referenced {
+                                    info!(account = %key, "account was not referenced anywhere, removed");
+                                    self.accounts.remove(&key, *commitment);
+                                }
                             }
                         } else {
                             warn!(message = "unknown subscription", sub = params.subscription);
@@ -808,6 +841,7 @@ impl AccountUpdateManager {
         } else {
             warn!(actor_id, "already reconnecting");
         }
+        info!(actor_id, "reconnect completed");
     }
 }
 
