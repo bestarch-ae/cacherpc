@@ -35,6 +35,7 @@ pub struct PubSubMetrics {
     pub subscribe_errors: IntCounterVec,
     pub websocket_connected: IntGaugeVec,
     pub websocket_active: IntGaugeVec,
+    pub websocket_errors: IntCounterVec,
     pub notifications_received: IntCounterVec,
     pub commands: IntCounterVec,
     pub bytes_received: IntCounterVec,
@@ -46,6 +47,7 @@ pub struct PubSubMetrics {
     pub inflight_entries: IntGaugeVec,
     pub subs_entries: IntGaugeVec,
     pub subscription_lifetime: Histogram,
+    pub time_until_reset: Histogram,
 }
 
 pub fn pubsub_metrics() -> &'static PubSubMetrics {
@@ -115,6 +117,12 @@ pub fn pubsub_metrics() -> &'static PubSubMetrics {
             &["connection_id"]
         )
         .unwrap(),
+        websocket_errors: register_int_counter_vec!(
+            "websocket_errors",
+            "number of websocket errors",
+            &["connection_id", "type"]
+        )
+        .unwrap(),
         notifications_received: register_int_counter_vec!(
             "notifications_received",
             "number of notifications received",
@@ -130,6 +138,12 @@ pub fn pubsub_metrics() -> &'static PubSubMetrics {
         subscription_lifetime: register_histogram!(
             "subscription_lifetime",
             "time before subscription expires",
+            vec![30.0, 120.0, 300.0, 600.0, 1200.0, 3600.0, 21600.0]
+        )
+        .unwrap(),
+        time_until_reset: register_histogram!(
+            "time_until_reset",
+            "time before subscription was extended",
             vec![30.0, 120.0, 300.0, 600.0, 1200.0, 3600.0, 21600.0]
         )
         .unwrap(),
