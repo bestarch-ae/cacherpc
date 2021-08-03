@@ -137,7 +137,6 @@ enum Connection {
     Disconnected,
     Connecting,
     Connected { sink: WsSink, stream: AbortHandle },
-    Closing { stream: AbortHandle },
 }
 
 impl Connection {
@@ -147,10 +146,6 @@ impl Connection {
 
     fn is_connecting(&self) -> bool {
         matches!(self, Connection::Connecting)
-    }
-
-    fn is_closing(&self) -> bool {
-        matches!(self, Connection::Closing { .. })
     }
 
     fn close(&mut self, ctx: &mut Context<AccountUpdateManager>) {
@@ -164,9 +159,6 @@ impl Connection {
             Connection::Connected { mut sink, stream } => {
                 sink.close();
                 ctx.cancel_future(sink.handle());
-                *self = Connection::Closing { stream };
-            }
-            Connection::Closing { stream } => {
                 stream.abort();
                 *self = Connection::Disconnected;
             }
@@ -1100,11 +1092,8 @@ impl actix::io::WriteHandler<awc::error::WsProtocolError> for AccountUpdateManag
         Running::Continue
     }
 
-    fn finished(&mut self, ctx: &mut Self::Context) {
+    fn finished(&mut self, _ctx: &mut Self::Context) {
         info!(self.actor_id, "writer closed");
-        if self.connection.is_closing() {
-            self.connection.close(ctx);
-        }
     }
 }
 
