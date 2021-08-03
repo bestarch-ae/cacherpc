@@ -8,6 +8,7 @@ use prometheus::{
 pub struct DbMetrics {
     pub account_entries: IntGauge,
     pub program_account_entries: IntGauge,
+    pub account_bytes: IntGauge,
 }
 
 pub fn db_metrics() -> &'static DbMetrics {
@@ -22,6 +23,8 @@ pub fn db_metrics() -> &'static DbMetrics {
             "number of entries in program accounts cache"
         )
         .unwrap(),
+        account_bytes: register_int_gauge!("account_bytes", "number of entries in accounts cache")
+            .unwrap(),
     });
     &METRICS
 }
@@ -35,6 +38,13 @@ pub struct PubSubMetrics {
     pub notifications_received: IntCounterVec,
     pub commands: IntCounterVec,
     pub bytes_received: IntCounterVec,
+    pub purge_queue_length: IntGaugeVec,
+    pub purge_queue_entries: IntGaugeVec,
+    pub additional_keys_entries: IntGaugeVec,
+    pub sub_id_entries: IntGaugeVec,
+    pub id_sub_entries: IntGaugeVec,
+    pub inflight_entries: IntGaugeVec,
+    pub subs_entries: IntGaugeVec,
 }
 
 pub fn pubsub_metrics() -> &'static PubSubMetrics {
@@ -57,6 +67,35 @@ pub fn pubsub_metrics() -> &'static PubSubMetrics {
             &["connection_id"]
         )
         .unwrap(),
+        purge_queue_length: register_int_gauge_vec!(
+            "purge_queue_length",
+            "queue len",
+            &["connection_id"]
+        )
+        .unwrap(),
+        purge_queue_entries: register_int_gauge_vec!(
+            "purge_queue_entries",
+            "queue entries",
+            &["connection_id"]
+        )
+        .unwrap(),
+        additional_keys_entries: register_int_gauge_vec!(
+            "additiona_keys_entries",
+            "filter keys",
+            &["connection_id"]
+        )
+        .unwrap(),
+        sub_id_entries: register_int_gauge_vec!("sub_id_entries", "sub to id", &["connection_id"])
+            .unwrap(),
+        id_sub_entries: register_int_gauge_vec!("id_sub_entries", "id to sub", &["connection_id"])
+            .unwrap(),
+        inflight_entries: register_int_gauge_vec!(
+            "inflight_entries",
+            "inflight",
+            &["connection_id"]
+        )
+        .unwrap(),
+        subs_entries: register_int_gauge_vec!("subs_entries", "subs", &["connection_id"]).unwrap(),
         subscribe_errors: register_int_counter_vec!(
             "subscribe_errors",
             "number of subscribe errors",
@@ -108,6 +147,7 @@ pub struct RpcMetrics {
     pub response_size_bytes: HistogramVec,
     pub lru_cache_hits: IntCounter,
     pub lru_cache_filled: IntGaugeVec,
+    pub lru_cache_bytes: IntGauge,
     pub passthrough_total_time: Histogram,
     pub passthrough_request_time: Histogram,
     pub passthrough_forward_response_time: Histogram,
@@ -212,6 +252,8 @@ pub fn rpc_metrics() -> &'static RpcMetrics {
             &["worker"]
         )
         .unwrap(),
+        lru_cache_bytes: register_int_gauge!("lru_cache_bytes", "LRU cache size (in bytes)")
+            .unwrap(),
         account_cache_filled: register_int_counter!(
             "account_cache_filled",
             "Accounts cache filled while waiting for response"

@@ -7,6 +7,8 @@ use dashmap::{mapref::one::Ref, DashMap};
 use serde::{Deserialize, Serialize};
 use smallvec::{smallvec, SmallVec};
 
+use crate::metrics::db_metrics as metrics;
+
 pub(crate) struct ProgramState([Option<HashSet<Pubkey>>; 3]);
 
 impl ProgramState {
@@ -176,14 +178,28 @@ impl AccountState {
     }
 
     fn insert(&mut self, commitment: Commitment, data: AccountContext) {
-        (self.0)[commitment.as_idx()] = Some(Account {
-            data: data.value,
-            slot: data.context.slot,
-        })
+        let new_len = data.value.as_ref().map(|info| info.data.len()).unwrap_or(0);
+        let old = std::mem::replace(
+            &mut (self.0)[commitment.as_idx()],
+            Some(Account {
+                data: data.value,
+                slot: data.context.slot,
+            }),
+        );
+        if let Some(old) = old {
+            metrics()
+                .account_bytes
+                .sub(old.data.map(|info| info.data.len()).unwrap_or(0) as i64);
+        }
+        metrics().account_bytes.add(new_len as i64);
     }
 
     fn remove(&mut self, commitment: Commitment) {
-        (self.0)[commitment.as_idx()] = None;
+        if let Some(old) = (self.0)[commitment.as_idx()].take() {
+            metrics()
+                .account_bytes
+                .sub(old.data.map(|data| data.data.len()).unwrap_or(0) as i64);
+        }
     }
 
     fn is_empty(&self) -> bool {

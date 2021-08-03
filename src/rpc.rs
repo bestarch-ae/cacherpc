@@ -158,6 +158,27 @@ impl<'a> Serialize for EncodedAccountData<'a> {
     }
 }
 
+pub(crate) struct LruEntry(Box<RawValue>);
+
+impl AsRef<RawValue> for LruEntry {
+    fn as_ref(&self) -> &RawValue {
+        self.0.as_ref()
+    }
+}
+
+impl From<Box<RawValue>> for LruEntry {
+    fn from(inner: Box<RawValue>) -> Self {
+        metrics().lru_cache_bytes.add(inner.get().len() as i64);
+        LruEntry(inner)
+    }
+}
+
+impl Drop for LruEntry {
+    fn drop(&mut self) {
+        metrics().lru_cache_bytes.sub(self.0.get().len() as i64);
+    }
+}
+
 pub(crate) struct State {
     pub accounts: AccountsDb,
     pub program_accounts: ProgramAccountsDb,
@@ -167,7 +188,7 @@ pub(crate) struct State {
     pub map_updated: Arc<Notify>,
     pub account_info_request_limit: Arc<Semaphore>,
     pub program_accounts_request_limit: Arc<Semaphore>,
-    pub lru: RefCell<LruCache<u64, Box<RawValue>>>,
+    pub lru: RefCell<LruCache<u64, LruEntry>>,
     pub worker_id: String,
 }
 
@@ -465,7 +486,7 @@ fn account_response<'a, 'b>(
         metrics().lru_cache_hits.inc();
         let resp = Resp {
             jsonrpc: "2.0",
-            result: &result,
+            result: result.as_ref(),
             id: req_id,
         };
 
@@ -508,7 +529,7 @@ fn account_response<'a, 'b>(
     app_state
         .lru
         .borrow_mut()
-        .put(request_and_slot_hash, result);
+        .put(request_and_slot_hash, LruEntry::from(result));
 
     metrics()
         .lru_cache_filled
