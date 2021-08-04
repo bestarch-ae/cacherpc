@@ -1186,10 +1186,7 @@ fn delay_queue<T: Clone + std::hash::Hash + Eq>(
                 item = incoming.next() => {
                     if let Some(item) = item {
                         match item {
-                            DelayQueueCommand::Insert(item, time) => {
-                                map.insert(item.clone(), delay_queue.insert_at(item, time));
-                            },
-                            DelayQueueCommand::Reset(item, time) => {
+                            DelayQueueCommand::Insert(item, time) | DelayQueueCommand::Reset(item, time) => {
                                 if let Some(key) = map.get(&item) {
                                     delay_queue.reset_at(&key, time);
                                 } else {
