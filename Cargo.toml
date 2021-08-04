@@ -40,3 +40,6 @@ file-reopen = { git = "https://github.com/polachok/file-reopen.git", rev = "da89
 either = "1.6"
 actix-http = "2.2"
 humantime = "2.1"
+
+[patch.crates-io]
+actix-http = { git = "https://github.com/polachok/actix-web", rev = "ed1d8c40885b77ab484249eff96ce6f39e9d1230" }
