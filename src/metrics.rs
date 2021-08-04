@@ -48,6 +48,7 @@ pub struct PubSubMetrics {
     pub subs_entries: IntGaugeVec,
     pub subscription_lifetime: Histogram,
     pub time_until_reset: Histogram,
+    pub accounts_filtered_out: IntCounterVec,
 }
 
 pub fn pubsub_metrics() -> &'static PubSubMetrics {
@@ -145,6 +146,12 @@ pub fn pubsub_metrics() -> &'static PubSubMetrics {
             "time_until_reset",
             "time before subscription was extended",
             vec![30.0, 120.0, 300.0, 600.0, 1200.0, 3600.0, 21600.0]
+        )
+        .unwrap(),
+        accounts_filtered_out: register_int_counter_vec!(
+            "accounts_filtered_out",
+            "accounts received by ws not matched by filters",
+            &["connection_id"]
         )
         .unwrap(),
     });

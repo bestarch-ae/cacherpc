@@ -800,6 +800,10 @@ impl AccountUpdateManager {
                                 if !account_is_referenced {
                                     debug!(self.actor_id, account = %key, "account was not referenced anywhere, removed");
                                     self.accounts.remove(&key, *commitment);
+                                    metrics()
+                                        .accounts_filtered_out
+                                        .with_label_values(&[&self.actor_name])
+                                        .inc();
                                 }
                             }
                         } else {
