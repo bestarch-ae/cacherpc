@@ -27,6 +27,7 @@ use crate::types::{
 };
 
 const MAILBOX_CAPACITY: usize = 512;
+const DEAD_REQUEST_LIMIT: usize = 0;
 const IN_FLIGHT_TIMEOUT: Duration = Duration::from_secs(60);
 const WEBSOCKET_PING_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -239,9 +240,11 @@ impl AccountUpdateManager {
                 }
             });
 
-            ctx.run_interval(Duration::from_secs(5), move |actor, _ctx| {
+            ctx.run_interval(Duration::from_secs(5), move |actor, ctx| {
                 let actor_id = actor.actor_id;
+
                 if actor.connection.is_connected() {
+                    let mut dead_requests = 0;
                     actor.inflight.retain(|request_id, (req, time)| {
                         let elapsed = time.elapsed();
                         let too_long = elapsed > IN_FLIGHT_TIMEOUT;
@@ -249,6 +252,7 @@ impl AccountUpdateManager {
                             warn!(actor_id,
                                 request_id, request = ?req, timeout = ?IN_FLIGHT_TIMEOUT,
                                 elapsed = ?elapsed, "request in flight too long, assume dead");
+                            dead_requests += 1;
                         }
                         !too_long
                     });
@@ -256,6 +260,13 @@ impl AccountUpdateManager {
                         .inflight_entries
                         .with_label_values(&[&actor.actor_name])
                         .set(actor.inflight.len() as i64);
+                    if dead_requests > DEAD_REQUEST_LIMIT {
+                        warn!(
+                            message = "too many dead requests, disconnecting",
+                            count = dead_requests
+                        );
+                        actor.disconnect(ctx);
+                    }
                 }
             });
 
