@@ -751,7 +751,7 @@ impl AccountUpdateManager {
                                             *commitment,
                                         );
                                     } else {
-                                        info!(self.actor_id, account = %key, program = %program_key, "account was removed from filtered list");
+                                        debug!(self.actor_id, account = %key, program = %program_key, "account was removed from filtered list");
                                         self.program_accounts.remove(
                                             &program_key,
                                             &key,
@@ -777,6 +777,7 @@ impl AccountUpdateManager {
                                     *commitment,
                                 );
                             } else {
+                                /*
                                 let mut account_is_referenced = false;
 
                                 for filters in self
@@ -808,6 +809,7 @@ impl AccountUpdateManager {
                                         .with_label_values(&[&self.actor_name])
                                         .inc();
                                 }
+                                */
                             }
                         } else {
                             warn!(
