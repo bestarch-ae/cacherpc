@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use awc::Client;
 use either::Either;
 use lru::LruCache;
+use once_cell::sync::Lazy;
 use structopt::StructOpt;
 use tokio::sync::{Notify, Semaphore};
 use tracing::info;
@@ -21,6 +22,24 @@ mod types;
 
 use accounts::PubSubManager;
 use types::{AccountsDb, ProgramAccountsDb};
+
+fn version() -> &'static str {
+    static VERSION: Lazy<String> = Lazy::new(|| {
+        let pkg_version = std::env!("CARGO_PKG_VERSION");
+        option_env!("CI_COMMIT_TAG")
+            .map(ToString::to_string)
+            .unwrap_or_else(|| {
+                format!(
+                    "{}{}",
+                    pkg_version,
+                    option_env!("CI_COMMIT_SHA")
+                        .map(|sha| format!("-{}", sha))
+                        .unwrap_or_else(String::new)
+                )
+            })
+    });
+    &VERSION
+}
 
 #[derive(Debug, structopt::StructOpt)]
 #[structopt(about = "Solana RPC cache server")]
@@ -142,6 +161,9 @@ async fn main() -> Result<()> {
             tracing::subscriber::set_global_default(subscriber).unwrap();
         }
     };
+
+    let span = tracing::span!(tracing::Level::INFO, "global", version = %version());
+    let _enter = span.enter();
 
     info!(?options, "configuration options");
 
