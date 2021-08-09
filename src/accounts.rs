@@ -519,8 +519,6 @@ impl AccountUpdateManager {
             );
             self.send(&request)?;
         }
-        self.purge_key(&sub, commitment);
-
         Ok(())
     }
 
@@ -937,7 +935,13 @@ impl Handler<AccountCommand> for AccountUpdateManager {
                         .commands
                         .with_label_values(&[&self.actor_name, "purge"])
                         .inc();
-                    self.unsubscribe(sub, commitment)?;
+                    self.purge_key(&sub, commitment);
+
+                    if self.connection.is_connected() {
+                        self.unsubscribe(sub, commitment)?;
+                    } else {
+                        self.subs.remove(&(sub, commitment));
+                    }
                 }
                 AccountCommand::Reset(key, commitment) => {
                     metrics()
