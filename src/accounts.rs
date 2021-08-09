@@ -562,6 +562,11 @@ impl AccountUpdateManager {
         self.active.store(is_active, Ordering::Relaxed);
 
         metrics()
+            .websocket_connected
+            .with_label_values(&[&self.actor_name])
+            .set(if self.connection.is_connected() { 1 } else { 0 });
+
+        metrics()
             .websocket_active
             .with_label_values(&[&self.actor_name])
             .set(if is_active { 1 } else { 0 });
