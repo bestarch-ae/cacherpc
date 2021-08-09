@@ -162,6 +162,9 @@ async fn main() -> Result<()> {
         }
     };
 
+    let registry = prometheus::default_registry();
+    let _ = registry.insert_label("version", version());
+
     let span = tracing::span!(tracing::Level::INFO, "global", version = %version());
     let _enter = span.enter();
 
