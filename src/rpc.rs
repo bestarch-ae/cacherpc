@@ -197,7 +197,7 @@ impl State {
         self.pubsub.reset(sub, commitment);
     }
 
-    fn insert(&self, key: Pubkey, data: AccountContext, commitment: Commitment) {
+    fn insert(&self, key: Pubkey, data: AccountContext, commitment: Commitment) -> Arc<Pubkey> {
         self.accounts.insert(key, data, commitment)
     }
 
@@ -623,9 +623,6 @@ async fn get_account_info(
                 }
             }
         }
-        app_state
-            .subscribe(Subscription::Account(pubkey), commitment, None)
-            .await;
     } else {
         cacheable_for_key = None;
         metrics()
@@ -690,6 +687,9 @@ async fn get_account_info(
         match resp.inner {
             Response::Result(info) => {
                 info!(%pubkey, ?commitment, "cached for key");
+                app_state
+                    .subscribe(Subscription::Account(pubkey), commitment, None)
+                    .await;
                 app_state.insert(pubkey, info, commitment);
                 app_state.map_updated.notify();
             }
@@ -757,7 +757,7 @@ impl Default for ProgramAccountsConfig {
 
 fn program_accounts_response<'a>(
     req_id: Id<'a>,
-    accounts: &HashSet<Pubkey>,
+    accounts: &HashSet<Arc<Pubkey>>,
     config: &'_ ProgramAccountsConfig,
     app_state: &web::Data<State>,
 ) -> Result<HttpResponse, ProgramAccountsResponseError> {
@@ -805,8 +805,6 @@ fn program_accounts_response<'a>(
             if data.value().get(commitment).is_none() {
                 warn!("data for key {}/{:?} not found", key, commitment);
                 return Err(ProgramAccountsResponseError::Inconsistency);
-            } else {
-                app_state.reset(Subscription::Account(*key), commitment);
             }
 
             if let Some(filters) = &filters {
@@ -831,7 +829,7 @@ fn program_accounts_response<'a>(
                     slice: config.data_slice,
                     commitment,
                 },
-                pubkey: *key,
+                pubkey: **key,
             })
         }
     }
@@ -1024,7 +1022,7 @@ async fn get_program_accounts(
                 let mut keys = HashSet::with_capacity(result.len());
                 for acc in result {
                     let AccountAndPubkey { account, pubkey } = acc;
-                    app_state.insert(
+                    let key_ref = app_state.insert(
                         pubkey,
                         AccountContext {
                             value: Some(account),
@@ -1032,15 +1030,16 @@ async fn get_program_accounts(
                         },
                         commitment,
                     );
-                    keys.insert(pubkey);
+                    keys.insert(key_ref);
                 }
-                let new_set = keys.clone();
-                let old_set = app_state.program_accounts.insert(
+                //let new_set = keys.clone();
+                app_state.program_accounts.insert(
                     program_pubkey,
                     keys,
                     commitment,
                     filters.clone(),
                 );
+                /*
                 if let Some(old_set) = old_set {
                     info!(
                         message = "replaced program accounts",
@@ -1049,6 +1048,7 @@ async fn get_program_accounts(
                         program = %program_pubkey,
                     );
                 }
+                */
                 app_state.map_updated.notify();
             }
             Response::Error(error) => {
