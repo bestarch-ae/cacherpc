@@ -611,9 +611,18 @@ impl AccountUpdateManager {
                                 .with_label_values(&[&self.actor_name])
                                 .inc();
                             self.subs.remove(&(sub, commitment));
+                            self.purge_key(&sub, commitment);
                         }
                         InflightRequest::Unsub(sub, commitment) => {
                             warn!(self.actor_id, request_id = id, error = ?error, key = %sub.key(), commitment = ?commitment, "unsubscribe failed");
+                            metrics()
+                                .unsubscribe_errors
+                                .with_label_values(&[&self.actor_name])
+                                .inc();
+                            // it's unclear if we're subscribed now or not, so remove subscription
+                            // *and* key to resubscribe later
+                            self.subs.remove(&(sub, commitment));
+                            self.purge_key(&sub, commitment);
                         }
                         InflightRequest::SlotSub(_) => {
                             warn!(self.actor_id, request_id = id, error = ?error, "slot subscribe failed");
