@@ -364,6 +364,10 @@ impl Encoding {
             Encoding::JsonParsed => "json_parsed",
         }
     }
+
+    pub fn is_base58(&self) -> bool {
+        matches!(self, Encoding::Default | Encoding::Base58)
+    }
 }
 
 impl Default for Encoding {
