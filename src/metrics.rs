@@ -33,6 +33,7 @@ pub struct PubSubMetrics {
     pub subscriptions_active: IntGaugeVec,
     pub subscribe_requests: IntCounterVec,
     pub subscribe_errors: IntCounterVec,
+    pub unsubscribe_errors: IntCounterVec,
     pub websocket_connected: IntGaugeVec,
     pub websocket_active: IntGaugeVec,
     pub websocket_errors: IntCounterVec,
@@ -103,6 +104,12 @@ pub fn pubsub_metrics() -> &'static PubSubMetrics {
         subscribe_errors: register_int_counter_vec!(
             "subscribe_errors",
             "number of subscribe errors",
+            &["connection_id"]
+        )
+        .unwrap(),
+        unsubscribe_errors: register_int_counter_vec!(
+            "unsubscribe_errors",
+            "number of unsubscribe errors",
             &["connection_id"]
         )
         .unwrap(),
