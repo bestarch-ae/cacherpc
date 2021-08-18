@@ -1,4 +1,5 @@
 use once_cell::sync::Lazy;
+use prometheus::core::Opts;
 use prometheus::{
     register_histogram, register_histogram_vec, register_int_counter, register_int_counter_vec,
     register_int_gauge, register_int_gauge_vec, Histogram, HistogramVec, IntCounter, IntCounterVec,
@@ -166,6 +167,7 @@ pub fn pubsub_metrics() -> &'static PubSubMetrics {
 }
 
 pub struct RpcMetrics {
+    pub app_version: IntGauge,
     request_types: IntCounterVec,
     pub request_encodings: IntCounterVec,
     pub request_commitments: IntCounterVec,
@@ -260,6 +262,9 @@ impl RpcMetrics {
 
 pub fn rpc_metrics() -> &'static RpcMetrics {
     static METRICS: Lazy<RpcMetrics> = Lazy::new(|| RpcMetrics {
+        app_version: register_int_gauge!(Opts::new("app_version", "Dumb metric, see label")
+            .const_label("version", crate::version()))
+        .unwrap(),
         request_types: register_int_counter_vec!(
             "request_types",
             "Request counts by type",

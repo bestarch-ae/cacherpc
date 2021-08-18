@@ -1186,6 +1186,8 @@ pub(crate) async fn metrics_handler(
     _app_state: web::Data<State>,
 ) -> Result<HttpResponse, Error<'static>> {
     use prometheus::{Encoder, TextEncoder};
+
+    metrics().app_version.set(0);
     let encoder = TextEncoder::new();
     let mut buffer = Vec::new();
     let families = prometheus::gather();

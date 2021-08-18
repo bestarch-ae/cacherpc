@@ -23,7 +23,7 @@ mod types;
 use accounts::PubSubManager;
 use types::{AccountsDb, ProgramAccountsDb};
 
-fn version() -> &'static str {
+pub fn version() -> &'static str {
     static VERSION: Lazy<String> = Lazy::new(|| {
         let pkg_version = std::env!("CARGO_PKG_VERSION");
         option_env!("CI_COMMIT_TAG")
@@ -161,9 +161,6 @@ async fn main() -> Result<()> {
             tracing::subscriber::set_global_default(subscriber).unwrap();
         }
     };
-
-    let registry = prometheus::default_registry();
-    let _ = registry.insert_label("version", version());
 
     let span = tracing::span!(tracing::Level::INFO, "global", version = %version());
     let _enter = span.enter();
