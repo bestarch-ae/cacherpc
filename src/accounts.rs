@@ -519,8 +519,6 @@ impl AccountUpdateManager {
             );
             self.send(&request)?;
         }
-        self.purge_key(&sub, commitment);
-
         Ok(())
     }
 
@@ -560,6 +558,11 @@ impl AccountUpdateManager {
     fn update_status(&self) {
         let is_active = self.id_to_sub.len() == self.subs.len() && self.connection.is_connected();
         self.active.store(is_active, Ordering::Relaxed);
+
+        metrics()
+            .websocket_connected
+            .with_label_values(&[&self.actor_name])
+            .set(if self.connection.is_connected() { 1 } else { 0 });
 
         metrics()
             .websocket_active
@@ -932,7 +935,13 @@ impl Handler<AccountCommand> for AccountUpdateManager {
                         .commands
                         .with_label_values(&[&self.actor_name, "purge"])
                         .inc();
-                    self.unsubscribe(sub, commitment)?;
+                    self.purge_key(&sub, commitment);
+
+                    if self.connection.is_connected() {
+                        self.unsubscribe(sub, commitment)?;
+                    } else {
+                        self.subs.remove(&(sub, commitment));
+                    }
                 }
                 AccountCommand::Reset(key, commitment) => {
                     metrics()
