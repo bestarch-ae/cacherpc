@@ -39,7 +39,7 @@ impl AccountInfo {
         slice: Option<Slice>,
     ) -> Result<EncodedAccountInfo<'_>, Base58Error> {
         // Encoded binary (base 58) data should be less than 128 bytes
-        if self.data.len() > 128 && encoding == Encoding::Base58 {
+        if self.data.len() > 128 && encoding.is_base58() {
             return Err(Base58Error);
         }
         Ok(EncodedAccountInfo {
@@ -731,6 +731,8 @@ enum ProgramAccountsResponseError {
     Serialize(#[from] serde_json::Error),
     #[error("data inconsistency")]
     Inconsistency,
+    #[error("base58")]
+    Base58,
 }
 
 #[derive(Deserialize, Debug)]
@@ -779,7 +781,7 @@ fn program_accounts_response<'a>(
             if let Some((Some(value), _)) = self.inner.value().get(self.commitment) {
                 let encoded = value
                     .encode(self.encoding, self.slice)
-                    .map_err(|_| serde::ser::Error::custom("fuck"))?;
+                    .map_err(serde::ser::Error::custom)?;
                 encoded.serialize(serializer)
             } else {
                 // shouldn't happen
@@ -802,17 +804,27 @@ fn program_accounts_response<'a>(
 
     for key in accounts {
         if let Some(data) = app_state.accounts.get(&key) {
-            if data.value().get(commitment).is_none() {
-                warn!("data for key {}/{:?} not found", key, commitment);
-                return Err(ProgramAccountsResponseError::Inconsistency);
+            let account_info = match data.value().get(commitment) {
+                Some(data) => data.0,
+                None => {
+                    warn!("data for key {}/{:?} not found", key, commitment);
+                    return Err(ProgramAccountsResponseError::Inconsistency);
+                }
+            };
+
+            let account_len = account_info
+                .as_ref()
+                .map(|info| info.data.len())
+                .unwrap_or(0);
+
+            // TODO: kinda hacky, find a better way
+            if account_len > 128 && config.encoding.is_base58() {
+                return Err(ProgramAccountsResponseError::Base58);
             }
 
             if let Some(filters) = &filters {
                 let matches = filters.iter().all(|f| {
-                    let value = data.value().get(commitment).unwrap(); // checked above
-                    value
-                        .0
-                        .as_ref()
+                    account_info
                         .map(|val| f.matches(&val.data))
                         .unwrap_or(false)
                 });
@@ -831,6 +843,9 @@ fn program_accounts_response<'a>(
                 },
                 pubkey: **key,
             })
+        } else {
+            warn!(key = %key, request_id = ?req_id, "data for key not found");
+            return Err(ProgramAccountsResponseError::Inconsistency);
         }
     }
     #[derive(Serialize)]
@@ -926,10 +941,13 @@ async fn get_program_accounts(
                 if let Some(accounts) = accounts.get(commitment) {
                     app_state.reset(Subscription::Program(pubkey), commitment);
                     metrics().program_accounts_cache_hits.inc();
-                    if let Ok(resp) =
-                        program_accounts_response(req.id.clone(), accounts, &config, &app_state)
-                    {
-                        return Ok(resp);
+                    match program_accounts_response(req.id.clone(), accounts, &config, &app_state) {
+                        Ok(resp) => return Ok(resp),
+                        Err(ProgramAccountsResponseError::Base58) => {
+                            return Err(Error::InvalidRequest(Some(req.id.clone()),
+                                Some("Encoded binary (base 58) data should be less than 128 bytes, please use Base64 encoding.")));
+                        }
+                        Err(_) => {}
                     }
                 }
             }
