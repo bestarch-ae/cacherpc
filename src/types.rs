@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use dashmap::{mapref::one::Ref, DashMap};
+use either::Either;
 use serde::{Deserialize, Serialize};
 use smallvec::{smallvec, SmallVec};
 
@@ -14,13 +15,6 @@ pub(crate) struct ProgramState([Option<HashSet<Arc<Pubkey>>>; 3]);
 impl ProgramState {
     pub fn get(&self, commitment: Commitment) -> Option<&HashSet<Arc<Pubkey>>> {
         (self.0)[commitment.as_idx()].as_ref()
-    }
-
-    pub fn into_accounts(self) -> impl Iterator<Item = Pubkey> {
-        std::array::IntoIter::new(self.0)
-            .flat_map(|set| set.into_iter())
-            .flatten()
-            .map(|arc| *arc)
     }
 
     fn insert(
@@ -45,6 +39,18 @@ impl ProgramState {
         if let Some(ref mut keys) = (self.0)[commitment.as_idx()] {
             keys.remove(data);
         }
+    }
+
+    fn remove_commitment(&mut self, commitment: Commitment) -> impl Iterator<Item = Pubkey> {
+        (self.0)[commitment.as_idx()]
+            .take()
+            .into_iter()
+            .flatten()
+            .map(|arc| *arc)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.iter().all(Option::is_none)
     }
 }
 
@@ -120,9 +126,20 @@ impl ProgramAccountsDb {
     pub fn remove_all(
         &self,
         key: &Pubkey,
+        commitment: Commitment,
         filters: Option<SmallVec<[Filter; 2]>>,
-    ) -> Option<ProgramState> {
-        self.map.remove(&(*key, filters)).map(|(_, state)| state)
+    ) -> impl Iterator<Item = Pubkey> {
+        use dashmap::mapref::entry::Entry;
+        if let Entry::Occupied(mut entry) = self.map.entry((*key, filters)) {
+            let state = entry.get_mut();
+            let iter = state.remove_commitment(commitment);
+            if state.is_empty() {
+                entry.remove();
+            }
+            Either::Left(iter)
+        } else {
+            Either::Right(std::iter::empty())
+        }
     }
 
     pub fn remove(
@@ -389,6 +406,13 @@ pub(crate) struct AccountInfo {
 #[derive(Hash, Eq, PartialEq, Copy, Clone, Debug, Ord, PartialOrd)]
 pub(crate) struct Pubkey([u8; 32]);
 
+impl Pubkey {
+    #[cfg(test)]
+    fn zero() -> Self {
+        Pubkey([0; 32])
+    }
+}
+
 impl std::fmt::Display for Pubkey {
     fn fmt(&self, w: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         w.write_str(&bs58::encode(&self.0).into_string())
@@ -605,4 +629,45 @@ fn pooq() {
     let val: serde_json::Value = serde_json::from_str(&dat).unwrap();
     let data: AccountInfo = serde_json::from_value(val).unwrap();
     println!("{:?}", data);
+}
+
+#[test]
+fn db_refs() {
+    let programs = ProgramAccountsDb::new();
+    let accounts = AccountsDb::new();
+
+    let acc_ref = accounts.insert(
+        Pubkey::zero(),
+        AccountContext {
+            context: SolanaContext { slot: 0 },
+            value: Some(AccountInfo {
+                executable: false,
+                lamports: 1,
+                owner: Pubkey::zero(),
+                rent_epoch: 1,
+                data: AccountData { data: Bytes::new() },
+            }),
+        },
+        Commitment::Confirmed,
+    );
+
+    assert_eq!(accounts.len(), 1);
+
+    let mut set = HashSet::new();
+    set.insert(acc_ref);
+    programs.insert(Pubkey::zero(), set, Commitment::Confirmed, None);
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(programs.len(), 1);
+
+    accounts.remove(&Pubkey::zero(), Commitment::Confirmed);
+    assert_eq!(accounts.len(), 1);
+
+    let program_accounts = programs.remove_all(&Pubkey::zero(), Commitment::Confirmed, None);
+    assert_eq!(programs.len(), 0);
+    assert_eq!(accounts.len(), 1);
+
+    for key in program_accounts {
+        accounts.remove(&key, Commitment::Confirmed);
+    }
+    assert_eq!(accounts.len(), 0);
 }

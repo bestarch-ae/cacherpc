@@ -191,7 +191,7 @@ pub(crate) struct AccountUpdateManager {
     accounts: AccountsDb,
     program_accounts: ProgramAccountsDb,
     purge_queue: DelayQueueHandle<(Subscription, Commitment)>,
-    additional_keys: HashMap<Pubkey, HashSet<SmallVec<[Filter; 2]>>>,
+    additional_keys: HashMap<(Pubkey, Commitment), HashSet<SmallVec<[Filter; 2]>>>,
     last_received_at: Instant,
     active: Arc<AtomicBool>,
     buffer: BytesMut,
@@ -536,19 +536,17 @@ impl AccountUpdateManager {
     fn purge_key(&mut self, sub: &Subscription, commitment: Commitment) {
         info!(self.actor_id, message = "purge", key = %sub.key(), commitment = ?commitment);
         match sub {
-            Subscription::Program(key) => {
+            Subscription::Program(program_key) => {
                 let keys = self
                     .additional_keys
-                    .remove(&key)
+                    .remove(&(*program_key, commitment))
                     .into_iter()
                     .flatten()
-                    .map(|filter| (key, Some(filter)))
-                    .chain(Some((key, None)));
+                    .map(|filter| (program_key, Some(filter)))
+                    .chain(Some((program_key, None)));
                 for (key, filter) in keys {
-                    if let Some(program_accounts) = self.program_accounts.remove_all(&key, filter) {
-                        for key in program_accounts.into_accounts() {
-                            self.accounts.remove(&key, commitment)
-                        }
+                    for key in self.program_accounts.remove_all(&key, commitment, filter) {
+                        self.accounts.remove(&key, commitment)
                     }
                 }
                 metrics()
@@ -766,7 +764,9 @@ impl AccountUpdateManager {
                             let data = &account_info.data;
 
                             let mut filter_groups = Vec::new();
-                            if let Some(filters) = self.additional_keys.get(&program_key) {
+                            if let Some(filters) =
+                                self.additional_keys.get(&(program_key, *commitment))
+                            {
                                 for filter_group in filters {
                                     if filter_group.iter().all(|f| f.matches(data)) {
                                         /*
@@ -925,7 +925,10 @@ impl Handler<AccountCommand> for AccountUpdateManager {
                         .inc();
                     self.subscribe(sub, commitment)?;
                     if let Some(filters) = filters {
-                        self.additional_keys.entry(key).or_default().insert(filters);
+                        self.additional_keys
+                            .entry((key, commitment))
+                            .or_default()
+                            .insert(filters);
                         metrics()
                             .additional_keys_entries
                             .with_label_values(&[&self.actor_name])
