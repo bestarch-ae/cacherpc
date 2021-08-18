@@ -1051,12 +1051,9 @@ async fn get_program_accounts(
                     keys.insert(key_ref);
                 }
                 //let new_set = keys.clone();
-                app_state.program_accounts.insert(
-                    program_pubkey,
-                    keys,
-                    commitment,
-                    filters.clone(),
-                );
+                app_state
+                    .program_accounts
+                    .insert(program_pubkey, keys, commitment, filters);
                 /*
                 if let Some(old_set) = old_set {
                     info!(
