@@ -9,10 +9,10 @@ use smallvec::{smallvec, SmallVec};
 
 use crate::metrics::db_metrics as metrics;
 
-pub(crate) struct ProgramState([Option<HashSet<Pubkey>>; 3]);
+pub(crate) struct ProgramState([Option<HashSet<Arc<Pubkey>>>; 3]);
 
 impl ProgramState {
-    pub fn get(&self, commitment: Commitment) -> Option<&HashSet<Pubkey>> {
+    pub fn get(&self, commitment: Commitment) -> Option<&HashSet<Arc<Pubkey>>> {
         (self.0)[commitment.as_idx()].as_ref()
     }
 
@@ -20,13 +20,18 @@ impl ProgramState {
         std::array::IntoIter::new(self.0)
             .flat_map(|set| set.into_iter())
             .flatten()
+            .map(|arc| *arc)
     }
 
-    fn insert(&mut self, commitment: Commitment, data: HashSet<Pubkey>) -> Option<HashSet<Pubkey>> {
+    fn insert(
+        &mut self,
+        commitment: Commitment,
+        data: HashSet<Arc<Pubkey>>,
+    ) -> Option<HashSet<Arc<Pubkey>>> {
         (self.0)[commitment.as_idx()].replace(data)
     }
 
-    fn add(&mut self, commitment: Commitment, data: Pubkey) {
+    fn add(&mut self, commitment: Commitment, data: Arc<Pubkey>) {
         if let Some(ref mut keys) = (self.0)[commitment.as_idx()] {
             keys.insert(data);
         } else {
@@ -78,10 +83,10 @@ impl ProgramAccountsDb {
     pub fn insert(
         &self,
         key: Pubkey,
-        data: HashSet<Pubkey>,
+        data: HashSet<Arc<Pubkey>>,
         commitment: Commitment,
         filters: Option<SmallVec<[Filter; 2]>>,
-    ) -> Option<HashSet<Pubkey>> {
+    ) -> Option<HashSet<Arc<Pubkey>>> {
         let mut entry = self.map.entry((key, filters)).or_default();
         entry.insert(commitment, data)
     }
@@ -91,14 +96,14 @@ impl ProgramAccountsDb {
     pub fn add(
         &self,
         key: &Pubkey,
-        data: Pubkey,
+        data: Arc<Pubkey>,
         filters: Option<SmallVec<[Filter; 2]>>,
         commitment: Commitment,
     ) -> bool {
         let mut added = false;
         // add to global
         if let Some(mut entry) = self.map.get_mut(&(*key, None)) {
-            entry.add(commitment, data);
+            entry.add(commitment, data.clone());
             added = true;
         }
 
@@ -149,24 +154,22 @@ type Slot = u64;
 struct Account {
     data: Option<AccountInfo>,
     slot: Slot,
+    refcount: Arc<Pubkey>,
 }
 
-pub(crate) struct AccountState([Option<Account>; 3]);
-
-impl Default for AccountState {
-    fn default() -> AccountState {
-        AccountState([None, None, None])
-    }
+pub(crate) struct AccountState {
+    data: [Option<Account>; 3],
+    key: Pubkey,
 }
 
 impl AccountState {
     pub fn get(&self, commitment: Commitment) -> Option<(Option<&AccountInfo>, Slot)> {
-        match &(self.0)[commitment.as_idx()] {
+        match &(self.data)[commitment.as_idx()] {
             None => None,
             Some(data) => {
                 let mut result = None;
                 let mut slot = data.slot;
-                for acc in self.0.iter().take(commitment.as_idx() + 1).flatten() {
+                for acc in self.data.iter().take(commitment.as_idx() + 1).flatten() {
                     if acc.slot >= slot {
                         result = Some((acc.data.as_ref(), acc.slot));
                         slot = acc.slot;
@@ -177,33 +180,56 @@ impl AccountState {
         }
     }
 
-    fn insert(&mut self, commitment: Commitment, data: AccountContext) {
+    pub fn get_ref(&self, commitment: Commitment) -> Option<Arc<Pubkey>> {
+        self.data[commitment.as_idx()]
+            .as_ref()
+            .map(|data| data.refcount.clone())
+    }
+
+    fn insert(&mut self, commitment: Commitment, data: AccountContext) -> Arc<Pubkey> {
         let new_len = data.value.as_ref().map(|info| info.data.len()).unwrap_or(0);
-        let old = std::mem::replace(
-            &mut (self.0)[commitment.as_idx()],
-            Some(Account {
-                data: data.value,
-                slot: data.context.slot,
-            }),
-        );
-        if let Some(old) = old {
+        let position = &mut (self.data)[commitment.as_idx()];
+        let rc = if let Some(old) = position {
             metrics()
                 .account_bytes
-                .sub(old.data.map(|info| info.data.len()).unwrap_or(0) as i64);
-        }
+                .sub(old.data.as_ref().map(|info| info.data.len()).unwrap_or(0) as i64);
+            old.data = data.value;
+            old.slot = data.context.slot;
+            old.refcount.clone()
+        } else {
+            let refcount = Arc::new(self.key);
+            *position = Some(Account {
+                data: data.value,
+                slot: data.context.slot,
+                refcount: refcount.clone(),
+            });
+            refcount
+        };
+
         metrics().account_bytes.add(new_len as i64);
+        rc
     }
 
     fn remove(&mut self, commitment: Commitment) {
-        if let Some(old) = (self.0)[commitment.as_idx()].take() {
-            metrics()
-                .account_bytes
-                .sub(old.data.map(|data| data.data.len()).unwrap_or(0) as i64);
+        let position = &mut (self.data)[commitment.as_idx()];
+        if let Some(account) = position {
+            /* only one reference - our own */
+            if Arc::strong_count(&account.refcount) <= 1 {
+                metrics().account_bytes.sub(
+                    account
+                        .data
+                        .as_ref()
+                        .map(|data| data.data.len())
+                        .unwrap_or(0) as i64,
+                );
+                *position = None;
+                tracing::info!(key = %self.key, "removing account");
+            }
         }
     }
 
     fn is_empty(&self) -> bool {
-        self.0.iter().all(Option::is_none)
+        self.data.iter().all(Option::is_none)
     }
 }
 
@@ -219,10 +245,13 @@ impl AccountsDb {
         self.map.get(key)
     }
 
-    pub fn insert(&self, key: Pubkey, data: AccountContext, commitment: Commitment) {
-        let mut entry = self.map.entry(key).or_default();
+    pub fn insert(&self, key: Pubkey, data: AccountContext, commitment: Commitment) -> Arc<Pubkey> {
+        let mut entry = self.map.entry(key).or_insert(AccountState {
+            key,
+            data: [None, None, None],
+        });
         self.update_slot(commitment, data.context.slot);
-        entry.insert(commitment, data);
+        entry.insert(commitment, data)
     }
 
     pub fn remove(&self, key: &Pubkey, commitment: Commitment) {

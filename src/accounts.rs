@@ -38,17 +38,20 @@ enum InflightRequest {
     SlotSub(u64),
 }
 
-struct Times {
+struct Meta {
     created_at: Instant,
     updated_at: Instant,
+    #[allow(dead_code)]
+    account_ref: Option<Arc<Pubkey>>,
 }
 
-impl Times {
-    fn new() -> Self {
+impl Meta {
+    fn new(account_ref: Option<Arc<Pubkey>>) -> Self {
         let now = Instant::now();
-        Times {
+        Meta {
             created_at: now,
             updated_at: now,
+            account_ref,
         }
     }
 
@@ -181,7 +184,7 @@ pub(crate) struct AccountUpdateManager {
     actor_name: String,
     request_id: u64,
     inflight: HashMap<u64, (InflightRequest, Instant)>,
-    subs: HashMap<(Subscription, Commitment), Times>,
+    subs: HashMap<(Subscription, Commitment), Meta>,
     id_to_sub: HashMap<u64, (Subscription, Commitment)>,
     sub_to_id: HashMap<(Subscription, Commitment), u64>,
     connection: Connection,
@@ -474,7 +477,14 @@ impl AccountUpdateManager {
             request_id,
             (InflightRequest::Sub(sub, commitment), Instant::now()),
         );
-        self.subs.insert((sub, commitment), Times::new());
+        let acc_ref = if let Subscription::Account(_) = sub {
+            self.accounts
+                .get(&key)
+                .and_then(|data| data.get_ref(commitment))
+        } else {
+            None
+        };
+        self.subs.insert((sub, commitment), Meta::new(acc_ref));
         self.send(&request)?;
         self.purge_queue
             .insert((sub, commitment), self.time_to_live);
@@ -651,6 +661,7 @@ impl AccountUpdateManager {
                                 if let Some(sub_id) = self.sub_to_id.remove(&(sub, commitment)) {
                                     self.id_to_sub.remove(&sub_id);
                                     let created_at = self.subs.remove(&(sub, commitment));
+                                    self.purge_key(&sub, commitment);
                                     info!(
                                         self.actor_id,
                                         message = "unsubscribed from stream",
@@ -744,16 +755,20 @@ impl AccountUpdateManager {
                             let key = params.result.value.pubkey;
                             let account_info = &params.result.value.account;
                             let data = &account_info.data;
-                            let mut added = false;
+
+                            let mut filter_groups = Vec::new();
                             if let Some(filters) = self.additional_keys.get(&program_key) {
                                 for filter_group in filters {
                                     if filter_group.iter().all(|f| f.matches(data)) {
-                                        added |= self.program_accounts.add(
+                                        /*
+                                        self.program_accounts.add(
                                             &program_key,
-                                            key,
+                                            key_ref,
                                             Some(filter_group.clone()),
                                             *commitment,
                                         );
+                                        */
+                                        filter_groups.push(filter_group.clone());
                                     } else {
                                         debug!(self.actor_id, account = %key, program = %program_key, "account was removed from filtered list");
                                         self.program_accounts.remove(
@@ -765,56 +780,33 @@ impl AccountUpdateManager {
                                     }
                                 }
                             }
+                            let key_ref = self.accounts.insert(
+                                key,
+                                AccountContext {
+                                    value: Some(params.result.value.account),
+                                    context: params.result.context,
+                                },
+                                *commitment,
+                            );
+
                             // add() returns false if we don't have an entry
                             // which means we haven't received complete result
                             // from validator by rpc
-                            added |=
-                                self.program_accounts
-                                    .add(&program_key, key, None, *commitment);
-                            if added {
-                                self.accounts.insert(
-                                    key,
-                                    AccountContext {
-                                        value: Some(params.result.value.account),
-                                        context: params.result.context,
-                                    },
+                            self.program_accounts.add(
+                                &program_key,
+                                key_ref.clone(),
+                                None,
+                                *commitment,
+                            );
+                            for group in filter_groups.into_iter() {
+                                self.program_accounts.add(
+                                    &program_key,
+                                    key_ref.clone(),
+                                    Some(group),
                                     *commitment,
                                 );
-                            } else {
-                                /*
-                                let mut account_is_referenced = false;
-
-                                for filters in self
-                                    .additional_keys
-                                    .get(&program_key)
-                                    .iter()
-                                    .flat_map(|set| set.iter())
-                                    .cloned()
-                                    .map(Some)
-                                    .chain(None)
-                                {
-                                    if let Some(accounts) =
-                                        self.program_accounts.get(&program_key, filters)
-                                    {
-                                        account_is_referenced |= accounts
-                                            .get(*commitment)
-                                            .map(|accs| accs.contains(&key))
-                                            .unwrap_or(false);
-                                        if account_is_referenced {
-                                            break;
-                                        }
-                                    }
-                                }
-                                if !account_is_referenced {
-                                    debug!(self.actor_id, account = %key, "account was not referenced anywhere, removed");
-                                    self.accounts.remove(&key, *commitment);
-                                    metrics()
-                                        .accounts_filtered_out
-                                        .with_label_values(&[&self.actor_name])
-                                        .inc();
-                                }
-                                */
                             }
+                            self.accounts.remove(&key, *commitment);
                         } else {
                             warn!(
                                 self.actor_id,
@@ -936,13 +928,13 @@ impl Handler<AccountCommand> for AccountUpdateManager {
                         .commands
                         .with_label_values(&[&self.actor_name, "purge"])
                         .inc();
-                    self.purge_key(&sub, commitment);
 
                     if self.connection.is_connected() {
                         self.unsubscribe(sub, commitment)?;
                     } else {
                         self.subs.remove(&(sub, commitment));
                     }
+                    self.purge_key(&sub, commitment);
                 }
                 AccountCommand::Reset(key, commitment) => {
                     metrics()
@@ -1120,7 +1112,7 @@ impl actix::io::WriteHandler<awc::error::WsProtocolError> for AccountUpdateManag
     }
 }
 
-#[derive(Debug, Eq, PartialEq, Clone, Hash, Copy)]
+#[derive(Debug, Eq, PartialEq, Copy, Clone, Hash)]
 pub(crate) enum Subscription {
     Account(Pubkey),
     Program(Pubkey),
