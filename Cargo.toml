@@ -43,4 +43,4 @@ actix-http = "2.2"
 humantime = "2.1"
 
 [patch.crates-io]
-actix-http = { git = "https://github.com/polachok/actix-web", rev = "ed1d8c40885b77ab484249eff96ce6f39e9d1230" }
+actix-http = { git = "https://github.com/polachok/actix-web", rev = "19cd7fdbd5b79e9d78c8cb562741d7513d980b18" }
