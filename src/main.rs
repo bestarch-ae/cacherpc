@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use actix_cors::Cors;
-use actix_web::{web, App, HttpServer};
+use actix_web::{guard, web, App, HttpServer};
 use anyhow::{Context, Result};
 use awc::Client;
 use either::Either;
@@ -228,7 +228,15 @@ async fn run(options: Options) -> Result<()> {
         App::new()
             .data(state)
             .wrap(cors)
-            .service(web::resource("/").route(web::post().to(rpc::rpc_handler)))
+            .service(
+                web::resource("/")
+                    .route(
+                        web::post()
+                            .guard(guard::Header("content-type", "application/json"))
+                            .to(rpc::rpc_handler),
+                    )
+                    .route(web::post().to(rpc::bad_content_type_handler)),
+            )
             .service(web::resource("/metrics").route(web::get().to(rpc::metrics_handler)))
     })
     .bind(bind_addr)
