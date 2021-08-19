@@ -122,10 +122,11 @@ impl<'a> Serialize for EncodedAccountData<'a> {
         use serde::ser::{Error, SerializeSeq};
 
         let data = if let Some(slice) = &self.slice {
-            self.data
-                .data
-                .get(slice.offset..slice.offset + slice.length)
-                .ok_or_else(|| Error::custom("bad slice"))?
+            let end = slice
+                .offset
+                .saturating_add(slice.length)
+                .min(self.data.data.len());
+            self.data.data.get(slice.offset..end).unwrap_or(&[])
         } else {
             &self.data.data[..]
         };
