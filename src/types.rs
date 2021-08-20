@@ -17,12 +17,8 @@ impl ProgramState {
         (self.0)[commitment.as_idx()].as_ref()
     }
 
-    fn insert(
-        &mut self,
-        commitment: Commitment,
-        data: HashSet<Arc<Pubkey>>,
-    ) -> Option<HashSet<Arc<Pubkey>>> {
-        (self.0)[commitment.as_idx()].replace(data)
+    fn insert(&mut self, commitment: Commitment, data: HashSet<Arc<Pubkey>>) {
+        (self.0)[commitment.as_idx()] = Some(data)
     }
 
     fn add(&mut self, commitment: Commitment, data: Arc<Pubkey>) {
@@ -46,7 +42,11 @@ impl ProgramState {
             .take()
             .into_iter()
             .flatten()
-            .map(|arc| *arc)
+            .map(|arc| {
+                let pubkey = *arc;
+                drop(arc);
+                pubkey
+            })
     }
 
     fn is_empty(&self) -> bool {
@@ -92,7 +92,7 @@ impl ProgramAccountsDb {
         data: HashSet<Arc<Pubkey>>,
         commitment: Commitment,
         filters: Option<SmallVec<[Filter; 2]>>,
-    ) -> Option<HashSet<Arc<Pubkey>>> {
+    ) {
         let mut entry = self.map.entry((key, filters)).or_default();
         entry.insert(commitment, data)
     }
@@ -174,6 +174,7 @@ struct Account {
     refcount: Arc<Pubkey>,
 }
 
+#[derive(Debug)]
 pub(crate) struct AccountState {
     data: [Option<Account>; 3],
     key: Pubkey,
@@ -240,7 +241,6 @@ impl AccountState {
                         .unwrap_or(0) as i64,
                 );
                 *position = None;
-                tracing::info!(key = %self.key, "removing account");
             }
         }
     }
@@ -669,5 +669,49 @@ fn db_refs() {
     for key in program_accounts {
         accounts.remove(&key, Commitment::Confirmed);
     }
+    assert_eq!(accounts.len(), 0);
+}
+
+#[test]
+fn accounts_insert_remove() {
+    let accounts = AccountsDb::new();
+
+    let acc_ref = accounts.insert(
+        Pubkey::zero(),
+        AccountContext {
+            context: SolanaContext { slot: 0 },
+            value: Some(AccountInfo {
+                executable: false,
+                lamports: 1,
+                owner: Pubkey::zero(),
+                rent_epoch: 1,
+                data: AccountData { data: Bytes::new() },
+            }),
+        },
+        Commitment::Confirmed,
+    );
+
+    assert_eq!(accounts.len(), 1);
+
+    let acc_ref2 = accounts.insert(
+        Pubkey::zero(),
+        AccountContext {
+            context: SolanaContext { slot: 0 },
+            value: Some(AccountInfo {
+                executable: false,
+                lamports: 1,
+                owner: Pubkey::zero(),
+                rent_epoch: 1,
+                data: AccountData { data: Bytes::new() },
+            }),
+        },
+        Commitment::Confirmed,
+    );
+    assert_eq!(accounts.len(), 1);
+    drop(acc_ref);
+    accounts.remove(&Pubkey::zero(), Commitment::Confirmed);
+    assert_eq!(accounts.len(), 1);
+    drop(acc_ref2);
+    accounts.remove(&Pubkey::zero(), Commitment::Confirmed);
     assert_eq!(accounts.len(), 0);
 }

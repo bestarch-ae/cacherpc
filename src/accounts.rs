@@ -545,7 +545,10 @@ impl AccountUpdateManager {
                     .map(|filter| (program_key, Some(filter)))
                     .chain(Some((program_key, None)));
                 for (key, filter) in keys {
-                    for key in self.program_accounts.remove_all(&key, commitment, filter) {
+                    for key in self
+                        .program_accounts
+                        .remove_all(&key, commitment, filter.clone())
+                    {
                         self.accounts.remove(&key, commitment)
                     }
                 }
@@ -815,6 +818,8 @@ impl AccountUpdateManager {
                                     *commitment,
                                 );
                             }
+                            // important for proper removal
+                            drop(key_ref);
                             self.accounts.remove(&key, *commitment);
                         } else {
                             warn!(
