@@ -687,7 +687,7 @@ async fn get_account_info(
         let resp: Wrap<'_> = serde_json::from_slice(&resp)?;
         match resp.inner {
             Response::Result(info) => {
-                info!(%pubkey, ?commitment, "cached for key");
+                debug!(%pubkey, ?commitment, "cached for key");
                 app_state
                     .subscribe(Subscription::Account(pubkey), commitment, None)
                     .await;
@@ -967,9 +967,6 @@ async fn get_program_accounts(
                 }
             }
         }
-        app_state
-            .subscribe(Subscription::Program(pubkey), commitment, filters.clone())
-            .await;
     } else {
         cacheable_for_key = None;
         metrics()
@@ -1038,6 +1035,14 @@ async fn get_program_accounts(
         let resp: Wrap<'_> = serde_json::from_slice(&resp)?;
         match resp.inner {
             Response::Result(result) => {
+                app_state
+                    .subscribe(
+                        Subscription::Program(program_pubkey),
+                        commitment,
+                        filters.clone(),
+                    )
+                    .await;
+
                 let mut keys = HashSet::with_capacity(result.len());
                 for acc in result {
                     let AccountAndPubkey { account, pubkey } = acc;
@@ -1051,20 +1056,9 @@ async fn get_program_accounts(
                     );
                     keys.insert(key_ref);
                 }
-                //let new_set = keys.clone();
                 app_state
                     .program_accounts
                     .insert(program_pubkey, keys, commitment, filters);
-                /*
-                if let Some(old_set) = old_set {
-                    info!(
-                        message = "replaced program accounts",
-                        diff = ?old_set.difference(&new_set),
-                        filters = ?filters,
-                        program = %program_pubkey,
-                    );
-                }
-                */
                 app_state.map_updated.notify();
             }
             Response::Error(error) => {

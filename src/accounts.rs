@@ -622,6 +622,9 @@ impl AccountUpdateManager {
                                 .inc();
                             // it's unclear if we're subscribed now or not, so remove subscription
                             // *and* key to resubscribe later
+                            if let Some(id) = self.sub_to_id.remove(&(sub, commitment)) {
+                                self.id_to_sub.remove(&id);
+                            }
                             self.subs.remove(&(sub, commitment));
                             self.purge_key(&sub, commitment);
                         }
