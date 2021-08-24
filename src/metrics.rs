@@ -38,6 +38,7 @@ pub struct PubSubMetrics {
     pub websocket_connected: IntGaugeVec,
     pub websocket_active: IntGaugeVec,
     pub websocket_errors: IntCounterVec,
+    pub websocket_slot: IntGaugeVec,
     pub notifications_received: IntCounterVec,
     pub commands: IntCounterVec,
     pub bytes_received: IntCounterVec,
@@ -130,6 +131,12 @@ pub fn pubsub_metrics() -> &'static PubSubMetrics {
             "websocket_errors",
             "number of websocket errors",
             &["connection_id", "type"]
+        )
+        .unwrap(),
+        websocket_slot: register_int_gauge_vec!(
+            "websocket_slot",
+            "last received slot for websocket connection",
+            &["connection_id"]
         )
         .unwrap(),
         notifications_received: register_int_counter_vec!(

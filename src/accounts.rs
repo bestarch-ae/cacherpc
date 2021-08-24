@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::convert::TryInto;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -730,8 +731,15 @@ impl AccountUpdateManager {
                         let params: Params = serde_json::from_str(params.get())?;
                         if let Some((sub, commitment)) = self.id_to_sub.get(&params.subscription) {
                             //info!(key = %sub.key(), "received account notification");
+                            let slot = params.result.context.slot;
                             self.accounts.insert(sub.key(), params.result, *commitment);
                             db_metrics().account_entries.set(self.accounts.len() as i64);
+                            if *commitment == Commitment::Processed {
+                                metrics()
+                                    .websocket_slot
+                                    .with_label_values(&[&self.actor_name])
+                                    .set(slot.try_into().unwrap_or(i64::MAX))
+                            }
                         } else {
                             warn!(
                                 self.actor_id,
@@ -768,6 +776,7 @@ impl AccountUpdateManager {
                             let key = params.result.value.pubkey;
                             let account_info = &params.result.value.account;
                             let data = &account_info.data;
+                            let slot = params.result.context.slot;
 
                             let mut filter_groups = Vec::new();
                             if let Some(filters) =
@@ -824,6 +833,12 @@ impl AccountUpdateManager {
                             // important for proper removal
                             drop(key_ref);
                             self.accounts.remove(&key, *commitment);
+                            if *commitment == Commitment::Processed {
+                                metrics()
+                                    .websocket_slot
+                                    .with_label_values(&[&self.actor_name])
+                                    .set(slot.try_into().unwrap_or(i64::MAX))
+                            }
                         } else {
                             warn!(
                                 self.actor_id,
