@@ -194,8 +194,8 @@ async fn run(options: Options) -> Result<()> {
     let worker_id_counter = Arc::new(AtomicUsize::new(0));
     let bind_addr = &options.addr;
 
-    HttpServer::new(move || {
-        let client = Client::builder()
+    let get_client = move || {
+        Client::builder()
             .timeout(Duration::from_secs(60))
             .no_default_headers()
             .connector(
@@ -205,7 +205,17 @@ async fn run(options: Options) -> Result<()> {
                     .limit(total_connection_limit)
                     .finish(),
             )
-            .finish();
+            .finish()
+    };
+
+    actix::spawn(rpc::SlotPoller::run(
+        get_client(),
+        Duration::from_secs(1),
+        rpc_url.clone(),
+    ));
+
+    HttpServer::new(move || {
+        let client = get_client();
         let state = rpc::State {
             accounts: accounts.clone(),
             program_accounts: program_accounts.clone(),

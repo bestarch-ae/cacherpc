@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashSet;
+use std::convert::TryInto;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,12 +11,14 @@ use awc::Client;
 use backoff::backoff::Backoff;
 use bytes::Bytes;
 use dashmap::mapref::one::Ref;
+use futures_util::{future::OptionFuture, TryFutureExt};
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use serde_json::value::{to_raw_value, RawValue};
 use smallvec::SmallVec;
 use thiserror::Error;
 use tokio::sync::{Notify, Semaphore};
+use tokio::time::delay_for;
 use tracing::{debug, error, info, warn};
 
 use crate::accounts::Subscription;
@@ -1185,4 +1188,81 @@ pub(crate) async fn metrics_handler(
     let families = prometheus::gather();
     let _ = encoder.encode(&families, &mut buffer);
     Ok(HttpResponse::Ok().content_type("text/plain").body(buffer))
+}
+
+pub(crate) struct SlotPoller;
+
+impl SlotPoller {
+    pub async fn run(client: Client, interval: Duration, url: impl ToString) {
+        let url = url.to_string();
+
+        let response_fut: OptionFuture<_> = None.into();
+        let delay_fut = delay_for(interval);
+        tokio::pin!(response_fut);
+        tokio::pin!(delay_fut);
+
+        loop {
+            let response = tokio::select! {
+                Some(response) = &mut response_fut => {
+                    response_fut.set(None.into());
+                    response
+                },
+                _ = &mut delay_fut => {
+                    let response = client
+                        .post(&url)
+                        .timeout(REQUEST_TIMEOUT)
+                        .content_type("application/json")
+                        .send_body(r#"{"jsonrpc":"2.0","id":1, "method":"getSlot"}"#)
+                        .map_err(Box::<dyn std::error::Error>::from)
+                        .and_then(|mut resp| resp.body().limit(1024).map_err(Into::into));
+                    response_fut.set(Some(response).into());
+                    delay_fut.set(delay_for(interval));
+                    continue;
+                },
+                else => {
+                    warn!("unexpected break at slot task");
+                    break;
+                }
+            };
+
+            match response {
+                Ok(response) => {
+                    #[derive(Deserialize, Debug)]
+                    struct Wrap<'a> {
+                        #[serde(flatten, borrow)]
+                        inner: Response<'a>,
+                    }
+
+                    #[derive(Deserialize, Debug)]
+                    #[serde(rename_all = "lowercase")]
+                    enum Response<'a> {
+                        Result(u64),
+                        #[serde(borrow)]
+                        Error(RpcError<'a>),
+                    }
+
+                    let response: Wrap<'_> = match serde_json::from_slice(&response) {
+                        Ok(ok) => ok, // ok
+                        Err(err) => {
+                            warn!("could not deserialize slot update: {}", err);
+                            continue;
+                        }
+                    };
+
+                    let slot = match response.inner {
+                        Response::Result(slot) => slot,
+                        Response::Error(err) => {
+                            warn!("slot rpc error: {}", &err.message);
+                            continue;
+                        }
+                    };
+
+                    metrics().rpc_slot.set(slot.try_into().unwrap_or(i64::MAX))
+                }
+                Err(err) => {
+                    warn!("error polling slot: {}", err);
+                }
+            }
+        }
+    }
 }
