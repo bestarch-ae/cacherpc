@@ -17,7 +17,6 @@ stages:
   - build_version
   - build_artifact
   - build
-  - build_deb
   - deploy_dev
   - ready_sbx
   - notify
@@ -38,7 +37,7 @@ include:
     file: 'notify/send-failed.yml'
   - project: 'shared/tasks'
     ref: 'master'
-    file: 'deb/build_rust_app.yml'                          #build_deb
+    file: 'deb/build_rust_app_v2.yml'                          #build deb
   - project: 'shared/tasks'
     ref: 'master'
     file: 'deploy/ready-sbx.yml'
@@ -120,6 +119,22 @@ build_artifact:
       - ./${UPLOAD_ARTIFACT}
     expire_in: 1 day
 
+upload_artifact:
+  stage: build
+  image: ubuntu
+  tags: [docker_nocache]
+  before_script:
+    - apt-get update && apt-get -y install git curl jq openssl sed file
+    - rm -rf ci-scripts
+    - git clone https://git.zubr.dev/shared/ci-scripts.git
+  script:
+    - PIPELINE_ID_VERSION=$(curl --user "$REPO_LOGIN:$REPO_PASS" https://$REPO_SRV/repository/$ARTIFACTS_PATH/$APPNAME_SHORT/pipelin-id/$CI_PIPELINE_ID/$VERSION_FILE)
+    - tar -xzf rpm-source.tar.gz
+    - bash ci-scripts/upload/upload-to-github.sh "$PIPELINE_ID_VERSION" "artifact/usr/sbin/$BIN_NAME"
+    - bash ci-scripts/upload/upload-to-s3.sh "$PIPELINE_ID_VERSION" "artifact/usr/sbin/$BIN_NAME"
+  only:
+    - tags
+
 build_docker:
   stage: build
   tags: [docker_19_cache]
@@ -127,16 +142,16 @@ build_docker:
     - docker login -u $REGISTRY_LOGIN -p $REGISTRY_PASS
     - apk update && apk add git make curl
   script:
-    - PIPLINE_ID_VER=$(curl --user "$REPO_LOGIN:$REPO_PASS" https://$REPO_SRV/repository/$ARTIFACTS_PATH/$APPNAME_SHORT/pipelin-id/$CI_PIPELINE_ID/$VERSION_FILE)
+    - PIPELINE_ID_VERSION=$(curl --user "$REPO_LOGIN:$REPO_PASS" https://$REPO_SRV/repository/$ARTIFACTS_PATH/$APPNAME_SHORT/pipelin-id/$CI_PIPELINE_ID/$VERSION_FILE)
     - tar -xzf rpm-source.tar.gz
     - >
       docker build
       --build-arg BIN_NAME=${BIN_NAME}
-      --tag $REGISTRY_PROJECT:$PIPLINE_ID_VER
+      --tag $REGISTRY_PROJECT:$PIPELINE_ID_VERSION
       --tag $REGISTRY_PROJECT:latest
       -f Dockerfile.dist
       .
-    - docker push $REGISTRY_PROJECT:$PIPLINE_ID_VER
+    - docker push $REGISTRY_PROJECT:$PIPELINE_ID_VERSION
     - docker push $REGISTRY_PROJECT:latest
 #  only:
 #    - tags
