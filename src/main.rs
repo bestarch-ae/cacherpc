@@ -16,6 +16,7 @@ use tracing::info;
 use tracing_subscriber::fmt;
 
 mod accounts;
+mod async_map;
 mod metrics;
 mod rpc;
 mod types;
