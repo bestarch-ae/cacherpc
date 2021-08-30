@@ -42,17 +42,14 @@ enum InflightRequest {
 struct Meta {
     created_at: Instant,
     updated_at: Instant,
-    #[allow(dead_code)]
-    account_ref: Option<Arc<Pubkey>>,
 }
 
 impl Meta {
-    fn new(account_ref: Option<Arc<Pubkey>>) -> Self {
+    fn new() -> Self {
         let now = Instant::now();
         Meta {
             created_at: now,
             updated_at: now,
-            account_ref,
         }
     }
 
@@ -186,6 +183,7 @@ pub(crate) struct AccountUpdateManager {
     request_id: u64,
     inflight: HashMap<u64, (InflightRequest, Instant)>,
     subs: HashMap<(Subscription, Commitment), Meta>,
+    active_accounts: HashSet<Arc<Pubkey>>,
     id_to_sub: HashMap<u64, (Subscription, Commitment)>,
     sub_to_id: HashMap<(Subscription, Commitment), u64>,
     connection: Connection,
@@ -287,6 +285,7 @@ impl AccountUpdateManager {
                 sub_to_id: HashMap::default(),
                 inflight: HashMap::default(),
                 subs: HashMap::default(),
+                active_accounts: HashSet::default(),
                 request_id: 1,
                 accounts: accounts.clone(),
                 program_accounts: program_accounts.clone(),
@@ -480,14 +479,7 @@ impl AccountUpdateManager {
             request_id,
             (InflightRequest::Sub(sub, commitment), Instant::now()),
         );
-        let acc_ref = if let Subscription::Account(_) = sub {
-            self.accounts
-                .get(&key)
-                .and_then(|data| data.get_ref(commitment))
-        } else {
-            None
-        };
-        self.subs.insert((sub, commitment), Meta::new(acc_ref));
+        self.subs.insert((sub, commitment), Meta::new());
         self.send(&request)?;
         self.purge_queue
             .insert((sub, commitment), self.time_to_live);
@@ -615,6 +607,7 @@ impl AccountUpdateManager {
                                 .with_label_values(&[&self.actor_name])
                                 .inc();
                             self.subs.remove(&(sub, commitment));
+                            self.active_accounts.remove(&sub.key());
                             self.purge_key(&sub, commitment);
                         }
                         InflightRequest::Unsub(sub, commitment) => {
@@ -629,6 +622,7 @@ impl AccountUpdateManager {
                                 self.id_to_sub.remove(&id);
                             }
                             self.subs.remove(&(sub, commitment));
+                            self.active_accounts.remove(&sub.key());
                             self.purge_key(&sub, commitment);
                         }
                         InflightRequest::SlotSub(_) => {
@@ -654,6 +648,16 @@ impl AccountUpdateManager {
                             let sub_id: u64 = serde_json::from_str(result.get())?;
                             self.id_to_sub.insert(sub_id, (sub, commitment));
                             self.sub_to_id.insert((sub, commitment), sub_id);
+
+                            if let Subscription::Account(key) = sub {
+                                if let Some(key_ref) = self
+                                    .accounts
+                                    .get(&key)
+                                    .and_then(|data| data.get_ref(commitment))
+                                {
+                                    self.active_accounts.insert(key_ref);
+                                }
+                            }
 
                             metrics()
                                 .id_sub_entries
@@ -889,6 +893,7 @@ impl AccountUpdateManager {
         self.sub_to_id.clear();
 
         info!(self.actor_id, "purging related caches");
+        self.active_accounts.drain();
         let to_purge: Vec<_> = self.subs.keys().cloned().collect();
         for (sub, commitment) in to_purge {
             self.purge_key(&sub, commitment);
