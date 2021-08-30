@@ -677,7 +677,6 @@ impl AccountUpdateManager {
                                 if let Some(sub_id) = self.sub_to_id.remove(&(sub, commitment)) {
                                     self.id_to_sub.remove(&sub_id);
                                     let created_at = self.subs.remove(&(sub, commitment));
-                                    self.purge_key(&sub, commitment);
                                     info!(
                                         self.actor_id,
                                         message = "unsubscribed from stream",
@@ -694,6 +693,7 @@ impl AccountUpdateManager {
                                             .subscription_lifetime
                                             .observe(times.since_creation().as_secs_f64());
                                     }
+                                    self.purge_key(&sub, commitment);
                                 } else {
                                     warn!(self.actor_id, sub = %sub, commitment = ?commitment, "unsubscribe for unknown subscription");
                                 }
