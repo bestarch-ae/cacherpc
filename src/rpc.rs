@@ -1004,89 +1004,84 @@ async fn get_program_accounts(
     }
 
     let lock;
-    let (is_writer, _drop) = match app_state
+    let entry = app_state
         .program_accounts_locks
-        .entry((pubkey, config.clone()))
-    {
-        Entry::Occupied(entry) => {
-            lock = Arc::clone(entry.get());
-            (None, None)
+        .entry((pubkey, config.clone()));
+
+    let resp = match entry {
+        // *There is* an ongoing request in some other thread, so we just wait for the result
+        Entry::Occupied(ref inner_entry) => {
+            lock = Arc::clone(inner_entry.get());
+            drop(entry);
+
+            let guard = lock.read().await;
+            match &*guard {
+                RequestResult::Body(body) => body.clone(),
+                RequestResult::TookFromCache(body) => {
+                    return Ok(bytes_to_http_response(body.clone()));
+                }
+                // TODO: how to handle RequestResult::None??
+                _ => return Err(Error::Timeout(req.id.clone())),
+            }
         }
+        // *There is no* ongoing requests with this data and we must do it ourselves
         Entry::Vacant(entry) => {
             lock = Arc::new(RwLock::new(RequestResult::None));
-            let write_guard = lock.write().await; // This must not yield
-            drop(entry.insert(Arc::clone(&lock)));
-            let drop_guard = DropGuard(Some(|| {
+            // This will not yield since we just created the lock.
+            // Though it is better to replace it with `try_lock` from tokio 1.
+            let mut guard = lock.write().await;
+            drop(entry.insert(Arc::clone(&lock))); // To not hold the lock into DashMap
+
+            // Cleanup so the latter requests won't use the data from this batch
+            let _drop_guard = DropGuard(Some(|| {
                 app_state
                     .program_accounts_locks
                     .remove(&(pubkey, config.clone()));
             }));
-            (Some(write_guard), Some(drop_guard))
-        }
-    };
 
-    let limit = &app_state.program_accounts_request_limit;
-    let app_state = &app_state;
-    let req_ref = &req;
+            let limit = &app_state.program_accounts_request_limit;
+            let wait_for_response = app_state.request(&req, limit);
 
-    // This is Some only if this thread *is not* a writer
-    let wait_for_lock: OptionFuture<_> = match is_writer {
-        Some(..) => None.into(),
-        None => Some(lock.write()).into(),
-    };
-    // This is Some only if this thread *is* a writer
-    let wait_for_response: OptionFuture<_> = is_writer
-        .as_ref()
-        .map(|_| app_state.request(req_ref, limit))
-        .into();
+            tokio::pin!(wait_for_response);
 
-    tokio::pin!(wait_for_response);
-    tokio::pin!(wait_for_lock);
-
-    let resp = loop {
-        let notified = app_state.map_updated.notified();
-        tokio::select! {
-            Some(read_lock) = &mut wait_for_lock => {
-                match &*read_lock {
-                    RequestResult::Body(body) => break body.clone(),
-                    RequestResult::TookFromCache(body) => return Ok(bytes_to_http_response(body.clone())),
-                    // TODO: how to handle RequestResult::None??
-                    _ => return Err(Error::Timeout(req.id.clone())),
-                }
-            }
-            Some(response) = &mut wait_for_response => {
-                let mut guard = is_writer.expect("request only if write guard is not None");
-                if let Ok(body) = response {
-                    *guard = RequestResult::Body(body.clone());
-                    break body.clone();
-                } else {
-                    info!(?req.id, "reporting gateway timeout"); // TODO: return proper error
-                    *guard = RequestResult::TimedOut;
-                    return Err(Error::Timeout(req.id.clone()));
-                }
-            }
-            _ = notified => {
-                if let Some(program_pubkey) = cacheable_for_key {
-                    if let Some(data) = app_state.program_accounts.get(&program_pubkey, filters.clone()) {
-                        let data = data.value();
-                        metrics().program_accounts_cache_filled.inc();
-                        if let Some(accounts) = data.get(commitment) {
-                            app_state.reset(Subscription::Program(pubkey), commitment);
-                            if let Ok(resp) = program_accounts_response(
-                                req.id.clone(),
-                                accounts,
-                                &config,
-                                &app_state,
-                            ) {
-                                if let Some(mut guard) = is_writer {
-                                    *guard = RequestResult::TookFromCache(resp.clone());
-                                }
-                                return Ok(bytes_to_http_response(resp));
-                            }
+            loop {
+                let notified = app_state.map_updated.notified();
+                tokio::select! {
+                    result = &mut wait_for_response => {
+                        if let Ok(body) = result {
+                            *guard = RequestResult::Body(body.clone());
+                            break body.clone();
+                        } else {
+                            // TODO: return proper error
+                            info!(?req.id, "reporting gateway timeout");
+                            *guard = RequestResult::TimedOut;
+                            return Err(Error::Timeout(req.id.clone()));
                         }
                     }
+                    _ = notified => {
+                        if let Some(program_pubkey) = cacheable_for_key {
+                            let maybe_account =
+                                app_state.program_accounts.get(&program_pubkey, filters.clone());
+                            if let Some(data) = maybe_account {
+                                let data = data.value();
+                                metrics().program_accounts_cache_filled.inc();
+                                if let Some(accounts) = data.get(commitment) {
+                                    app_state.reset(Subscription::Program(pubkey), commitment);
+                                    if let Ok(resp) = program_accounts_response(
+                                        req.id.clone(),
+                                        accounts,
+                                        &config,
+                                        &app_state,
+                                    ) {
+                                        *guard = RequestResult::TookFromCache(resp.clone());
+                                        return Ok(bytes_to_http_response(resp));
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
                 }
-                continue;
             }
         }
     };
