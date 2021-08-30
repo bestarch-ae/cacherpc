@@ -469,6 +469,52 @@ fn hash<T: std::hash::Hash>(params: T) -> u64 {
     hasher.finish()
 }
 
+fn parse_params<'a, T: Default + Deserialize<'a>>(
+    req: &Request<'a>,
+) -> Result<(Pubkey, T, u64), Error<'a>> {
+    let (params, request_hash): (SmallVec<[&RawValue; 2]>, u64) = match req.params {
+        Some(params) => (serde_json::from_str(params.get())?, hash(params.get())),
+        None => return Err(Error::NotEnoughArguments(req.id.clone())),
+    };
+
+    if params.is_empty() {
+        return Err(Error::NotEnoughArguments(req.id.clone()));
+    }
+
+    if params.len() > 2 {
+        return Err(Error::InvalidParam {
+            req_id: req.id.clone(),
+            message: "Expected from 1 to 2 parameters".into(),
+            data: Some(format!("Got {}", params.len()).into()),
+        });
+    }
+
+    let pubkey: Pubkey = match serde_json::from_str(params[0].get()) {
+        Ok(pubkey) => pubkey,
+        Err(_) => {
+            return Err(Error::InvalidParam {
+                req_id: req.id.clone(),
+                message: "Invalid param: WrongSize".into(),
+                data: None,
+            })
+        }
+    };
+
+    let config: T = {
+        if let Some(param) = params.get(1) {
+            serde_json::from_str(param.get()).map_err(|err| Error::InvalidParam {
+                req_id: req.id.clone(),
+                message: format!("Invalid params: {}", err).into(),
+                data: None,
+            })?
+        } else {
+            T::default()
+        }
+    };
+
+    Ok((pubkey, config, request_hash))
+}
+
 fn account_response<'a, 'b>(
     req_id: Id<'a>,
     request_hash: u64,
@@ -553,40 +599,7 @@ async fn get_account_info(
     req: Request<'_>,
     app_state: web::Data<State>,
 ) -> Result<HttpResponse, Error<'_>> {
-    let (params, request_hash): (SmallVec<[&RawValue; 2]>, _) = match req.params {
-        Some(params) => (serde_json::from_str(params.get())?, hash(params.get())),
-        None => return Err(Error::NotEnoughArguments(req.id)),
-    };
-
-    if params.len() > 2 {
-        return Err(Error::InvalidParam {
-            req_id: req.id.clone(),
-            message: "Expected from 1 to 2 parameters".into(),
-            data: Some(format!("Got {}", params.len()).into()),
-        });
-    }
-
-    let pubkey: Pubkey = match serde_json::from_str(params[0].get()) {
-        Err(_) => {
-            return Err(Error::InvalidParam {
-                req_id: req.id,
-                message: "Invalid param: WrongSize".into(),
-                data: None,
-            })
-        }
-        Ok(pubkey) => pubkey,
-    };
-    let config: AccountInfoConfig = {
-        if let Some(param) = params.get(1) {
-            serde_json::from_str(param.get()).map_err(|err| Error::InvalidParam {
-                req_id: req.id.clone(),
-                message: format!("Invalid params: {}", err).into(),
-                data: None,
-            })?
-        } else {
-            AccountInfoConfig::default()
-        }
-    };
+    let (pubkey, config, request_hash) = parse_params::<AccountInfoConfig>(&req)?;
 
     let commitment = config.commitment.unwrap_or_default().commitment;
 
@@ -877,42 +890,7 @@ async fn get_program_accounts(
     req: Request<'_>,
     app_state: web::Data<State>,
 ) -> Result<HttpResponse, Error<'_>> {
-    let params: SmallVec<[&RawValue; 2]> = match req.params {
-        Some(params) => serde_json::from_str(params.get())?,
-        None => SmallVec::new(),
-    };
-    if params.is_empty() {
-        return Err(Error::NotEnoughArguments(req.id));
-    }
-    if params.len() > 2 {
-        return Err(Error::InvalidParam {
-            req_id: req.id.clone(),
-            message: "Expected from 1 to 2 parameters".into(),
-            data: Some(format!("Got {}", params.len()).into()),
-        });
-    }
-    let pubkey: Pubkey = match serde_json::from_str(params[0].get()) {
-        Ok(pubkey) => pubkey,
-        Err(_) => {
-            return Err(Error::InvalidParam {
-                req_id: req.id,
-                message: "Invalid param: WrongSize".into(),
-                data: None,
-            })
-        }
-    };
-    let config: ProgramAccountsConfig = {
-        if let Some(param) = params.get(1) {
-            serde_json::from_str(param.get()).map_err(|err| Error::InvalidParam {
-                req_id: req.id.clone(),
-                message: format!("Invalid params: {}", err).into(),
-                data: None,
-            })?
-        } else {
-            ProgramAccountsConfig::default()
-        }
-    };
-
+    let (pubkey, config, _hash) = parse_params::<ProgramAccountsConfig>(&req)?;
     let commitment = config.commitment.unwrap_or_default().commitment;
 
     metrics()
