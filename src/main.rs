@@ -7,6 +7,7 @@ use actix_cors::Cors;
 use actix_web::{web, App, HttpServer};
 use anyhow::{Context, Result};
 use awc::Client;
+use dashmap::DashMap;
 use either::Either;
 use lru::LruCache;
 use once_cell::sync::Lazy;
@@ -188,6 +189,7 @@ async fn run(options: Options) -> Result<()> {
     let account_info_request_limit = Arc::new(Semaphore::new(options.account_info_request_limit));
     let program_accounts_request_limit =
         Arc::new(Semaphore::new(options.program_accounts_request_limit));
+    let program_accounts_locks = Arc::new(DashMap::new());
     let total_connection_limit =
         2 * (options.account_info_request_limit + options.program_accounts_request_limit);
     let body_cache_size = options.body_cache_size;
@@ -215,6 +217,7 @@ async fn run(options: Options) -> Result<()> {
             map_updated: notify.clone(),
             account_info_request_limit: account_info_request_limit.clone(),
             program_accounts_request_limit: program_accounts_request_limit.clone(),
+            program_accounts_locks: program_accounts_locks.clone(),
             lru: RefCell::new(LruCache::new(body_cache_size)),
             worker_id: {
                 let id = worker_id_counter.fetch_add(1, Ordering::SeqCst);

@@ -9,13 +9,17 @@ use actix_web::{web, HttpResponse, ResponseError};
 use awc::Client;
 use backoff::backoff::Backoff;
 use bytes::Bytes;
-use dashmap::mapref::one::Ref;
+use dashmap::{
+    mapref::{entry::Entry, one::Ref},
+    DashMap,
+};
+use futures_util::future::Either;
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use serde_json::value::{to_raw_value, RawValue};
 use smallvec::SmallVec;
 use thiserror::Error;
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::{Notify, RwLock, Semaphore};
 use tracing::{debug, error, info, warn};
 
 use crate::accounts::Subscription;
@@ -50,7 +54,7 @@ impl AccountInfo {
     }
 }
 
-#[derive(Debug, Deserialize, Copy, Clone)]
+#[derive(Debug, Deserialize, Copy, Clone, PartialEq, Eq, Hash)]
 struct Slice {
     offset: usize,
     length: usize,
@@ -180,6 +184,17 @@ impl Drop for LruEntry {
     }
 }
 
+struct DropGuard<F: FnOnce()>(Option<F>);
+impl<F: FnOnce()> Drop for DropGuard<F> {
+    fn drop(&mut self) {
+        if let Some(func) = self.0.take() {
+            func()
+        }
+    }
+}
+
+pub(crate) type RequestLockMap<K, V> = DashMap<K, Arc<RwLock<Option<V>>>>;
+
 pub(crate) struct State {
     pub accounts: AccountsDb,
     pub program_accounts: ProgramAccountsDb,
@@ -191,6 +206,7 @@ pub(crate) struct State {
     pub program_accounts_request_limit: Arc<Semaphore>,
     pub lru: RefCell<LruCache<u64, LruEntry>>,
     pub worker_id: String,
+    pub program_accounts_locks: Arc<RequestLockMap<(Pubkey, ProgramAccountsConfig), Bytes>>,
 }
 
 impl State {
@@ -428,7 +444,7 @@ impl ResponseError for Error<'_> {
     }
 }
 
-#[derive(Deserialize, Debug, Copy, Clone)]
+#[derive(Deserialize, Debug, Copy, Clone, PartialEq, Eq, Hash)]
 struct CommitmentConfig {
     commitment: Commitment,
 }
@@ -441,7 +457,7 @@ impl Default for CommitmentConfig {
     }
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, PartialEq, Eq, Hash)]
 struct AccountInfoConfig {
     encoding: Encoding,
     #[serde(flatten)]
@@ -633,6 +649,7 @@ async fn get_account_info(
     }
 
     let limit = &app_state.account_info_request_limit;
+
     let wait_for_response = app_state.request(&req, limit);
 
     tokio::pin!(wait_for_response);
@@ -736,8 +753,8 @@ enum ProgramAccountsResponseError {
     Base58,
 }
 
-#[derive(Deserialize, Debug)]
-struct ProgramAccountsConfig {
+#[derive(Deserialize, Debug, PartialEq, Eq, Hash, Clone)]
+pub(crate) struct ProgramAccountsConfig {
     #[serde(default = "Encoding::default")]
     encoding: Encoding,
     #[serde(flatten)]
@@ -927,6 +944,7 @@ async fn get_program_accounts(
 
     let mut cacheable_for_key = Some(pubkey);
 
+    // TODO: replace filters in config
     let filters: Option<SmallVec<[Filter; 2]>> = if let Some(filters) = &config.filters {
         let mut filters = filters.clone();
         filters.sort_unstable();
@@ -975,8 +993,43 @@ async fn get_program_accounts(
             .inc();
     }
 
+    let lock;
+    let (is_writer, _drop) = match app_state
+        .program_accounts_locks
+        .entry((pubkey, config.clone()))
+    {
+        Entry::Occupied(entry) => {
+            lock = Arc::clone(entry.get());
+            (None, None)
+        }
+        Entry::Vacant(entry) => {
+            lock = Arc::new(RwLock::new(None));
+            let write_guard = lock.write().await; // This must not yield
+            drop(entry.insert(Arc::clone(&lock)));
+            let drop_guard = DropGuard(Some(|| {
+                app_state
+                    .program_accounts_locks
+                    .remove(&(pubkey, config.clone()));
+            }));
+            (Some(write_guard), Some(drop_guard))
+        }
+    };
+
     let limit = &app_state.program_accounts_request_limit;
-    let wait_for_response = app_state.request(&req, limit);
+    let app_state = &app_state;
+    let wait_for_response = match is_writer {
+        Some(mut guard) => {
+            let fut = async {
+                if let Ok(body) = app_state.request(&req, limit).await {
+                    guard.replace(body);
+                }
+                drop(guard);
+                lock.read().await
+            };
+            Either::Left(fut)
+        }
+        None => Either::Right(lock.read()),
+    };
 
     tokio::pin!(wait_for_response);
 
@@ -984,8 +1037,8 @@ async fn get_program_accounts(
         let notified = app_state.map_updated.notified();
         tokio::select! {
             body = &mut wait_for_response => {
-                if let Ok(body) = body {
-                    break body;
+                if let Some(body) = body.as_ref() {
+                    break body.clone();
                 } else {
                     info!(?req.id, "reporting gateway timeout"); // TODO: return proper error
                     return Err(Error::Timeout(req.id.clone()));
