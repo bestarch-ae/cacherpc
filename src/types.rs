@@ -612,21 +612,21 @@ pub(crate) struct SolanaContext {
 #[test]
 fn data() {
     let dat = r#"["2UzHM","base58"]"#;
-    let data: AccountData = serde_json::from_str(&dat).unwrap();
+    let data: AccountData = serde_json::from_str(dat).unwrap();
     println!("{:?}", data);
 }
 
 #[test]
 fn kek() {
     let dat = r#"{"data":["2UzHM","base58"],"executable":false,"lamports":918720,"owner":"pdRUarXshQQAumQ12xntHo7xppX6Au9NdSskmWpahLJ","rentEpoch":0}"#;
-    let data: AccountInfo = serde_json::from_str(&dat).unwrap();
+    let data: AccountInfo = serde_json::from_str(dat).unwrap();
     println!("{:?}", data);
 }
 
 #[test]
 fn pooq() {
     let dat = r#"{"data":["2UzHM","base58"],"executable":false,"lamports":918720,"owner":"pdRUarXshQQAumQ12xntHo7xppX6Au9NdSskmWpahLJ","rentEpoch":0}"#;
-    let val: serde_json::Value = serde_json::from_str(&dat).unwrap();
+    let val: serde_json::Value = serde_json::from_str(dat).unwrap();
     let data: AccountInfo = serde_json::from_value(val).unwrap();
     println!("{:?}", data);
 }
