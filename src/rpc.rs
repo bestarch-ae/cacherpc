@@ -43,7 +43,7 @@ impl AccountInfo {
             return Err(Base58Error);
         }
         Ok(EncodedAccountInfo {
-            account_info: &self,
+            account_info: self,
             slice,
             encoding,
         })
@@ -817,7 +817,7 @@ fn program_accounts_response<'a>(
     let mut encoded_accounts = Vec::with_capacity(accounts.len());
 
     for key in accounts {
-        if let Some(data) = app_state.accounts.get(&key) {
+        if let Some(data) = app_state.accounts.get(key) {
             let account_info = match data.value().get(commitment) {
                 Some(data) => data.0,
                 None => {

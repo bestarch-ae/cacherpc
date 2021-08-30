@@ -94,7 +94,7 @@ impl PubSubManager {
                 accounts.clone(),
                 program_accounts.clone(),
                 Arc::clone(&active),
-                &websocket_url,
+                websocket_url,
                 time_to_live,
             );
             addrs.push((addr, active))
@@ -550,7 +550,7 @@ impl AccountUpdateManager {
                 for (key, filter) in keys {
                     for key in self
                         .program_accounts
-                        .remove_all(&key, commitment, filter.clone())
+                        .remove_all(key, commitment, filter.clone())
                     {
                         self.accounts.remove(&key, commitment)
                     }
@@ -561,7 +561,7 @@ impl AccountUpdateManager {
                     .set(self.additional_keys.len() as i64);
             }
             Subscription::Account(key) => {
-                self.accounts.remove(&key, commitment);
+                self.accounts.remove(key, commitment);
             }
         }
         db_metrics().account_entries.set(self.accounts.len() as i64);
@@ -598,7 +598,7 @@ impl AccountUpdateManager {
             #[serde(borrow)]
             error: Option<&'a RawValue>,
         }
-        let value: AnyMessage<'_> = serde_json::from_slice(&text)?;
+        let value: AnyMessage<'_> = serde_json::from_slice(text)?;
         match value {
             // subscription error
             AnyMessage {
@@ -1215,7 +1215,7 @@ fn delay_queue<T: Clone + std::hash::Hash + Eq>(
                         match item {
                             DelayQueueCommand::Insert(item, time) | DelayQueueCommand::Reset(item, time) => {
                                 if let Some(key) = map.get(&item) {
-                                    delay_queue.reset_at(&key, time);
+                                    delay_queue.reset_at(key, time);
                                 } else {
                                     map.insert(item.clone(), delay_queue.insert_at(item, time));
                                 }
