@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::hash::Hash;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -359,7 +360,7 @@ impl Default for Commitment {
     }
 }
 
-#[derive(Serialize, Debug, Deserialize, Copy, Clone, Eq, PartialEq)]
+#[derive(Serialize, Debug, Deserialize, Copy, Clone, Eq, PartialEq, Hash)]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum Encoding {
     #[serde(skip)]

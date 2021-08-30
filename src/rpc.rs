@@ -9,13 +9,17 @@ use actix_web::{web, HttpResponse, ResponseError};
 use awc::Client;
 use backoff::backoff::Backoff;
 use bytes::Bytes;
-use dashmap::mapref::one::Ref;
+use dashmap::{
+    mapref::{entry::Entry, one::Ref},
+    DashMap,
+};
+use futures_util::future::OptionFuture;
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use serde_json::value::{to_raw_value, RawValue};
 use smallvec::SmallVec;
 use thiserror::Error;
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::{Notify, RwLock, Semaphore};
 use tracing::{debug, error, info, warn};
 
 use crate::accounts::Subscription;
@@ -50,7 +54,7 @@ impl AccountInfo {
     }
 }
 
-#[derive(Debug, Deserialize, Copy, Clone)]
+#[derive(Debug, Deserialize, Copy, Clone, PartialEq, Eq, Hash)]
 struct Slice {
     offset: usize,
     length: usize,
@@ -180,6 +184,23 @@ impl Drop for LruEntry {
     }
 }
 
+struct DropGuard<F: FnOnce()>(Option<F>);
+impl<F: FnOnce()> Drop for DropGuard<F> {
+    fn drop(&mut self) {
+        if let Some(func) = self.0.take() {
+            func()
+        }
+    }
+}
+
+pub(crate) enum RequestResult {
+    None,
+    Body(Bytes),
+    TookFromCache(Bytes),
+    TimedOut,
+}
+pub(crate) type RequestLockMap<K, V> = DashMap<K, Arc<RwLock<V>>>;
+
 pub(crate) struct State {
     pub accounts: AccountsDb,
     pub program_accounts: ProgramAccountsDb,
@@ -191,6 +212,7 @@ pub(crate) struct State {
     pub program_accounts_request_limit: Arc<Semaphore>,
     pub lru: RefCell<LruCache<u64, LruEntry>>,
     pub worker_id: String,
+    pub program_accounts_locks: Arc<RequestLockMap<(Pubkey, ProgramAccountsConfig), RequestResult>>,
 }
 
 impl State {
@@ -428,7 +450,7 @@ impl ResponseError for Error<'_> {
     }
 }
 
-#[derive(Deserialize, Debug, Copy, Clone)]
+#[derive(Deserialize, Debug, Copy, Clone, PartialEq, Eq, Hash)]
 struct CommitmentConfig {
     commitment: Commitment,
 }
@@ -441,7 +463,7 @@ impl Default for CommitmentConfig {
     }
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, PartialEq, Eq, Hash)]
 struct AccountInfoConfig {
     encoding: Encoding,
     #[serde(flatten)]
@@ -646,6 +668,7 @@ async fn get_account_info(
     }
 
     let limit = &app_state.account_info_request_limit;
+
     let wait_for_response = app_state.request(&req, limit);
 
     tokio::pin!(wait_for_response);
@@ -749,8 +772,8 @@ enum ProgramAccountsResponseError {
     Base58,
 }
 
-#[derive(Deserialize, Debug)]
-struct ProgramAccountsConfig {
+#[derive(Deserialize, Debug, PartialEq, Eq, Hash, Clone)]
+pub(crate) struct ProgramAccountsConfig {
     #[serde(default = "Encoding::default")]
     encoding: Encoding,
     #[serde(flatten)]
@@ -776,7 +799,7 @@ fn program_accounts_response<'a>(
     accounts: &HashSet<Arc<Pubkey>>,
     config: &'_ ProgramAccountsConfig,
     app_state: &web::Data<State>,
-) -> Result<HttpResponse, ProgramAccountsResponseError> {
+) -> Result<Bytes, ProgramAccountsResponseError> {
     struct Encode<'a, K> {
         inner: Ref<'a, K, AccountState>,
         encoding: Encoding,
@@ -879,11 +902,15 @@ fn program_accounts_response<'a>(
         .response_size_bytes
         .with_label_values(&["getProgramAccounts"])
         .observe(body.len() as f64);
-    Ok(HttpResponse::Ok()
+    Ok(body.into())
+}
+
+fn bytes_to_http_response(body: Bytes) -> HttpResponse {
+    HttpResponse::Ok()
         .header("x-cache-status", "hit")
         .header("x-cache-type", "data")
         .content_type("application/json")
-        .body(body))
+        .body(body)
 }
 
 async fn get_program_accounts(
@@ -905,6 +932,7 @@ async fn get_program_accounts(
 
     let mut cacheable_for_key = Some(pubkey);
 
+    // TODO: replace filters in config
     let filters: Option<SmallVec<[Filter; 2]>> = if let Some(filters) = &config.filters {
         let mut filters = filters.clone();
         filters.sort_unstable();
@@ -921,7 +949,7 @@ async fn get_program_accounts(
                     app_state.reset(Subscription::Program(pubkey), commitment);
                     metrics().program_accounts_cache_hits.inc();
                     match program_accounts_response(req.id.clone(), accounts, &config, &app_state) {
-                        Ok(resp) => return Ok(resp),
+                        Ok(resp) => return Ok(bytes_to_http_response(resp)),
                         Err(ProgramAccountsResponseError::Base58) => {
                             return Err(Error::InvalidRequest(Some(req.id.clone()),
                                 Some("Encoded binary (base 58) data should be less than 128 bytes, please use Base64 encoding.")));
@@ -953,41 +981,85 @@ async fn get_program_accounts(
             .inc();
     }
 
-    let limit = &app_state.program_accounts_request_limit;
-    let wait_for_response = app_state.request(&req, limit);
+    let lock;
+    let entry = app_state
+        .program_accounts_locks
+        .entry((pubkey, config.clone()));
 
-    tokio::pin!(wait_for_response);
+    let resp = match entry {
+        // *There is* an ongoing request in some other thread, so we just wait for the result
+        Entry::Occupied(ref inner_entry) => {
+            lock = Arc::clone(inner_entry.get());
+            drop(entry);
 
-    let resp = loop {
-        let notified = app_state.map_updated.notified();
-        tokio::select! {
-            body = &mut wait_for_response => {
-                if let Ok(body) = body {
-                    break body;
-                } else {
-                    info!(?req.id, "reporting gateway timeout"); // TODO: return proper error
-                    return Err(Error::Timeout(req.id.clone()));
+            let guard = lock.read().await;
+            match &*guard {
+                RequestResult::Body(body) => body.clone(),
+                RequestResult::TookFromCache(body) => {
+                    return Ok(bytes_to_http_response(body.clone()));
                 }
+                // TODO: how to handle RequestResult::None??
+                _ => return Err(Error::Timeout(req.id.clone())),
             }
-            _ = notified => {
-                if let Some(program_pubkey) = cacheable_for_key {
-                    if let Some(data) = app_state.program_accounts.get(&program_pubkey, filters.clone()) {
-                        let data = data.value();
-                        metrics().program_accounts_cache_filled.inc();
-                        if let Some(accounts) = data.get(commitment) {
-                            app_state.reset(Subscription::Program(pubkey), commitment);
-                            if let Ok(resp) = program_accounts_response(
-                                req.id.clone(),
-                                accounts,
-                                &config,
-                                &app_state,
-                            ) {
-                                return Ok(resp);
-                            }
+        }
+        // *There is no* ongoing requests with this data and we must do it ourselves
+        Entry::Vacant(entry) => {
+            lock = Arc::new(RwLock::new(RequestResult::None));
+            // This will not yield since we just created the lock.
+            // Though it is better to replace it with `try_lock` from tokio 1.
+            let mut guard = lock.write().await;
+            drop(entry.insert(Arc::clone(&lock))); // To not hold the lock into DashMap
+
+            // Cleanup so the latter requests won't use the data from this batch
+            let _drop_guard = DropGuard(Some(|| {
+                app_state
+                    .program_accounts_locks
+                    .remove(&(pubkey, config.clone()));
+            }));
+
+            let limit = &app_state.program_accounts_request_limit;
+            let wait_for_response = app_state.request(&req, limit);
+
+            tokio::pin!(wait_for_response);
+
+            loop {
+                let notified = app_state.map_updated.notified();
+                tokio::select! {
+                    result = &mut wait_for_response => {
+                        if let Ok(body) = result {
+                            *guard = RequestResult::Body(body.clone());
+                            break body.clone();
+                        } else {
+                            // TODO: return proper error
+                            info!(?req.id, "reporting gateway timeout");
+                            *guard = RequestResult::TimedOut;
+                            return Err(Error::Timeout(req.id.clone()));
                         }
                     }
+                    _ = notified => {
+                        if let Some(program_pubkey) = cacheable_for_key {
+                            let maybe_account =
+                                app_state.program_accounts.get(&program_pubkey, filters.clone());
+                            if let Some(data) = maybe_account {
+                                let data = data.value();
+                                metrics().program_accounts_cache_filled.inc();
+                                if let Some(accounts) = data.get(commitment) {
+                                    app_state.reset(Subscription::Program(pubkey), commitment);
+                                    if let Ok(resp) = program_accounts_response(
+                                        req.id.clone(),
+                                        accounts,
+                                        &config,
+                                        &app_state,
+                                    ) {
+                                        *guard = RequestResult::TookFromCache(resp.clone());
+                                        return Ok(bytes_to_http_response(resp));
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
                 }
-                continue;
             }
         }
     };
