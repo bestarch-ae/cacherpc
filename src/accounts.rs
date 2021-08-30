@@ -8,6 +8,7 @@ use std::time::Duration;
 use actix::io::SinkWrite;
 use actix::prelude::AsyncContext;
 use actix::prelude::{Actor, Addr, Context, Handler, Message, Running, StreamHandler};
+use actix::Arbiter;
 use actix_http::ws;
 use bytes::BytesMut;
 use futures_util::future::AbortHandle;
@@ -212,7 +213,9 @@ impl AccountUpdateManager {
         websocket_url: &str,
         time_to_live: Duration,
     ) -> Addr<Self> {
-        AccountUpdateManager::create(|ctx| {
+        let arbiter = Arbiter::new();
+        let websocket_url = websocket_url.to_owned();
+        AccountUpdateManager::start_in_arbiter(&arbiter, move |ctx| {
             let actor_name = format!("pubsub-{}", actor_id);
             let (handle, stream) = delay_queue(actor_name.clone());
             let purge_stream = stream.map(|(sub, com)| AccountCommand::Purge(sub, com));
@@ -278,7 +281,7 @@ impl AccountUpdateManager {
                 actor_id,
                 time_to_live,
                 actor_name,
-                websocket_url: websocket_url.to_owned(),
+                websocket_url,
                 connection: Connection::Disconnected,
                 id_to_sub: HashMap::default(),
                 sub_to_id: HashMap::default(),
