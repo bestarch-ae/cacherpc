@@ -1151,6 +1151,11 @@ fn backoff_settings() -> backoff::ExponentialBackoff {
     }
 }
 
+pub(crate) fn bad_content_type_handler() -> HttpResponse {
+    HttpResponse::UnsupportedMediaType()
+        .body("Supplied content type is not allowed. Content-Type: application/json is required")
+}
+
 pub(crate) async fn metrics_handler(
     _body: Bytes,
     _app_state: web::Data<State>,
