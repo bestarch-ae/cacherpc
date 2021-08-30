@@ -1070,26 +1070,25 @@ pub(crate) async fn rpc_handler(
         return Ok(Error::InvalidRequest(Some(req.id), None).error_response());
     }
 
+    macro_rules! observe {
+        ($method:expr, $fut:expr) => {{
+            metrics().request_types($method).inc();
+            let timer = metrics()
+                .handler_time
+                .with_label_values(&[$method])
+                .start_timer();
+            let resp = $fut.await;
+            timer.observe_duration();
+            Ok(resp.unwrap_or_else(|err| err.error_response()))
+        }};
+    }
+
     match req.method {
         "getAccountInfo" => {
-            metrics().request_types("getAccountInfo").inc();
-            let timer = metrics()
-                .handler_time
-                .with_label_values(&["getAccountInfo"])
-                .start_timer();
-            let resp = get_account_info(req, app_state).await;
-            timer.observe_duration();
-            return Ok(resp.unwrap_or_else(|err| err.error_response()));
+            return observe!(req.method, get_account_info(req, app_state));
         }
         "getProgramAccounts" => {
-            metrics().request_types("getProgramAccounts").inc();
-            let timer = metrics()
-                .handler_time
-                .with_label_values(&["getProgramAccounts"])
-                .start_timer();
-            let resp = get_program_accounts(req, app_state).await;
-            timer.observe_duration();
-            return Ok(resp.unwrap_or_else(|err| err.error_response()));
+            return observe!(req.method, get_program_accounts(req, app_state));
         }
         method => {
             metrics().request_types(method).inc();
