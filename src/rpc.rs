@@ -13,7 +13,7 @@ use dashmap::{
     mapref::{entry::Entry, one::Ref},
     DashMap,
 };
-use futures_util::future::Either;
+use futures_util::future::OptionFuture;
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use serde_json::value::{to_raw_value, RawValue};
@@ -193,7 +193,13 @@ impl<F: FnOnce()> Drop for DropGuard<F> {
     }
 }
 
-pub(crate) type RequestLockMap<K, V> = DashMap<K, Arc<RwLock<Option<V>>>>;
+pub(crate) enum RequestResult {
+    None,
+    Body(Bytes),
+    TookFromCache(Bytes),
+    TimedOut,
+}
+pub(crate) type RequestLockMap<K, V> = DashMap<K, Arc<RwLock<V>>>;
 
 pub(crate) struct State {
     pub accounts: AccountsDb,
@@ -206,7 +212,7 @@ pub(crate) struct State {
     pub program_accounts_request_limit: Arc<Semaphore>,
     pub lru: RefCell<LruCache<u64, LruEntry>>,
     pub worker_id: String,
-    pub program_accounts_locks: Arc<RequestLockMap<(Pubkey, ProgramAccountsConfig), Bytes>>,
+    pub program_accounts_locks: Arc<RequestLockMap<(Pubkey, ProgramAccountsConfig), RequestResult>>,
 }
 
 impl State {
@@ -780,7 +786,7 @@ fn program_accounts_response<'a>(
     accounts: &HashSet<Arc<Pubkey>>,
     config: &'_ ProgramAccountsConfig,
     app_state: &web::Data<State>,
-) -> Result<HttpResponse, ProgramAccountsResponseError> {
+) -> Result<Bytes, ProgramAccountsResponseError> {
     struct Encode<'a, K> {
         inner: Ref<'a, K, AccountState>,
         encoding: Encoding,
@@ -883,11 +889,15 @@ fn program_accounts_response<'a>(
         .response_size_bytes
         .with_label_values(&["getProgramAccounts"])
         .observe(body.len() as f64);
-    Ok(HttpResponse::Ok()
+    Ok(body.into())
+}
+
+fn bytes_to_http_response(body: Bytes) -> HttpResponse {
+    HttpResponse::Ok()
         .header("x-cache-status", "hit")
         .header("x-cache-type", "data")
         .content_type("application/json")
-        .body(body))
+        .body(body)
 }
 
 async fn get_program_accounts(
@@ -961,7 +971,7 @@ async fn get_program_accounts(
                     app_state.reset(Subscription::Program(pubkey), commitment);
                     metrics().program_accounts_cache_hits.inc();
                     match program_accounts_response(req.id.clone(), accounts, &config, &app_state) {
-                        Ok(resp) => return Ok(resp),
+                        Ok(resp) => return Ok(bytes_to_http_response(resp)),
                         Err(ProgramAccountsResponseError::Base58) => {
                             return Err(Error::InvalidRequest(Some(req.id.clone()),
                                 Some("Encoded binary (base 58) data should be less than 128 bytes, please use Base64 encoding.")));
@@ -1003,7 +1013,7 @@ async fn get_program_accounts(
             (None, None)
         }
         Entry::Vacant(entry) => {
-            lock = Arc::new(RwLock::new(None));
+            lock = Arc::new(RwLock::new(RequestResult::None));
             let write_guard = lock.write().await; // This must not yield
             drop(entry.insert(Arc::clone(&lock)));
             let drop_guard = DropGuard(Some(|| {
@@ -1017,30 +1027,41 @@ async fn get_program_accounts(
 
     let limit = &app_state.program_accounts_request_limit;
     let app_state = &app_state;
-    let wait_for_response = match is_writer {
-        Some(mut guard) => {
-            let fut = async {
-                if let Ok(body) = app_state.request(&req, limit).await {
-                    guard.replace(body);
-                }
-                drop(guard);
-                lock.read().await
-            };
-            Either::Left(fut)
-        }
-        None => Either::Right(lock.read()),
+    let req_ref = &req;
+
+    // This is Some only if this thread *is not* a writer
+    let wait_for_lock: OptionFuture<_> = match is_writer {
+        Some(..) => None.into(),
+        None => Some(lock.write()).into(),
     };
+    // This is Some only if this thread *is* a writer
+    let wait_for_response: OptionFuture<_> = is_writer
+        .as_ref()
+        .map(|_| app_state.request(req_ref, limit))
+        .into();
 
     tokio::pin!(wait_for_response);
+    tokio::pin!(wait_for_lock);
 
     let resp = loop {
         let notified = app_state.map_updated.notified();
         tokio::select! {
-            body = &mut wait_for_response => {
-                if let Some(body) = body.as_ref() {
+            Some(read_lock) = &mut wait_for_lock => {
+                match &*read_lock {
+                    RequestResult::Body(body) => break body.clone(),
+                    RequestResult::TookFromCache(body) => return Ok(bytes_to_http_response(body.clone())),
+                    // TODO: how to handle RequestResult::None??
+                    _ => return Err(Error::Timeout(req.id.clone())),
+                }
+            }
+            Some(response) = &mut wait_for_response => {
+                let mut guard = is_writer.expect("request only if write guard is not None");
+                if let Ok(body) = response {
+                    *guard = RequestResult::Body(body.clone());
                     break body.clone();
                 } else {
                     info!(?req.id, "reporting gateway timeout"); // TODO: return proper error
+                    *guard = RequestResult::TimedOut;
                     return Err(Error::Timeout(req.id.clone()));
                 }
             }
@@ -1057,7 +1078,10 @@ async fn get_program_accounts(
                                 &config,
                                 &app_state,
                             ) {
-                                return Ok(resp);
+                                if let Some(mut guard) = is_writer {
+                                    *guard = RequestResult::TookFromCache(resp.clone());
+                                }
+                                return Ok(bytes_to_http_response(resp));
                             }
                         }
                     }
