@@ -701,11 +701,11 @@ async fn get_account_info(
         match resp.inner {
             Response::Result(info) => {
                 debug!(%pubkey, ?commitment, "cached for key");
+                app_state.insert(pubkey, info, commitment);
+                app_state.map_updated.notify();
                 app_state
                     .subscribe(Subscription::Account(pubkey), commitment, None)
                     .await;
-                app_state.insert(pubkey, info, commitment);
-                app_state.map_updated.notify();
             }
             Response::Error(error) => {
                 metrics()
