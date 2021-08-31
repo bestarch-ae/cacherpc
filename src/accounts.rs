@@ -973,7 +973,7 @@ impl Handler<AccountCommand> for AccountUpdateManager {
                     } else {
                         self.subs.remove(&(sub, commitment));
                     }
-                    if sub.is_account {
+                    if sub.is_account() {
                         self.active_accounts.remove(&(sub.key(), commitment));
                     }
                     self.purge_key(&sub, commitment);
