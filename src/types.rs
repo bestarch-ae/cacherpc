@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
+use dashmap::mapref::entry::Entry;
 use dashmap::{mapref::one::Ref, DashMap};
 use either::Either;
 use serde::{Deserialize, Serialize};
@@ -94,7 +95,9 @@ impl ProgramAccountsDb {
         filters: Option<SmallVec<[Filter; 2]>>,
     ) {
         let mut entry = self.map.entry((key, filters)).or_default();
-        entry.insert(commitment, data)
+        entry.insert(commitment, data);
+        drop(entry);
+        metrics().program_account_entries.set(self.map.len() as i64);
     }
 
     // We only add here and do not create new entries because it would be incorrect (incomplete
@@ -129,17 +132,20 @@ impl ProgramAccountsDb {
         commitment: Commitment,
         filters: Option<SmallVec<[Filter; 2]>>,
     ) -> impl Iterator<Item = Pubkey> {
-        use dashmap::mapref::entry::Entry;
-        if let Entry::Occupied(mut entry) = self.map.entry((*key, filters)) {
+        let iter = if let Entry::Occupied(mut entry) = self.map.entry((*key, filters)) {
             let state = entry.get_mut();
             let iter = state.remove_commitment(commitment);
             if state.is_empty() {
                 entry.remove();
+            } else {
+                drop(entry);
             }
             Either::Left(iter)
         } else {
             Either::Right(std::iter::empty())
-        }
+        };
+        metrics().program_account_entries.set(self.map.len() as i64);
+        iter
     }
 
     pub fn remove(
@@ -149,13 +155,10 @@ impl ProgramAccountsDb {
         filters: SmallVec<[Filter; 2]>,
         commitment: Commitment,
     ) {
-        if let Some(mut accounts) = self.map.get_mut(&(*program_key, Some(filters))) {
-            accounts.value_mut().remove(commitment, account_key);
+        if let Entry::Occupied(mut entry) = self.map.entry((*program_key, Some(filters))) {
+            let state = entry.get_mut();
+            state.remove(commitment, account_key);
         }
-    }
-
-    pub fn len(&self) -> usize {
-        self.map.len()
     }
 }
 
@@ -268,17 +271,22 @@ impl AccountsDb {
             data: [None, None, None],
         });
         self.update_slot(commitment, data.context.slot);
-        entry.insert(commitment, data)
+        let key_ref = entry.insert(commitment, data);
+        drop(entry);
+        metrics().account_entries.set(self.map.len() as i64);
+        key_ref
     }
 
     pub fn remove(&self, key: &Pubkey, commitment: Commitment) {
-        use dashmap::mapref::entry::Entry;
         if let Entry::Occupied(mut entry) = self.map.entry(*key) {
             let account_state = entry.get_mut();
             account_state.remove(commitment);
             if account_state.is_empty() {
                 entry.remove();
+            } else {
+                drop(entry);
             }
+            metrics().account_entries.set(self.map.len() as i64);
         }
     }
 
@@ -289,10 +297,6 @@ impl AccountsDb {
     #[allow(unused)]
     pub fn get_slot(&self, commitment: Commitment) -> u64 {
         self.slot[commitment.as_idx()].load(Ordering::Acquire)
-    }
-
-    pub fn len(&self) -> usize {
-        self.map.len()
     }
 }
 
@@ -651,25 +655,25 @@ fn db_refs() {
         Commitment::Confirmed,
     );
 
-    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts.map.len(), 1);
 
     let mut set = HashSet::new();
     set.insert(acc_ref);
     programs.insert(Pubkey::zero(), set, Commitment::Confirmed, None);
-    assert_eq!(accounts.len(), 1);
-    assert_eq!(programs.len(), 1);
+    assert_eq!(accounts.map.len(), 1);
+    assert_eq!(programs.map.len(), 1);
 
     accounts.remove(&Pubkey::zero(), Commitment::Confirmed);
-    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts.map.len(), 1);
 
     let program_accounts = programs.remove_all(&Pubkey::zero(), Commitment::Confirmed, None);
-    assert_eq!(programs.len(), 0);
-    assert_eq!(accounts.len(), 1);
+    assert_eq!(programs.map.len(), 0);
+    assert_eq!(accounts.map.len(), 1);
 
     for key in program_accounts {
         accounts.remove(&key, Commitment::Confirmed);
     }
-    assert_eq!(accounts.len(), 0);
+    assert_eq!(accounts.map.len(), 0);
 }
 
 #[test]
@@ -691,7 +695,7 @@ fn accounts_insert_remove() {
         Commitment::Confirmed,
     );
 
-    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts.map.len(), 1);
 
     let acc_ref2 = accounts.insert(
         Pubkey::zero(),
@@ -707,11 +711,11 @@ fn accounts_insert_remove() {
         },
         Commitment::Confirmed,
     );
-    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts.map.len(), 1);
     drop(acc_ref);
     accounts.remove(&Pubkey::zero(), Commitment::Confirmed);
-    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts.map.len(), 1);
     drop(acc_ref2);
     accounts.remove(&Pubkey::zero(), Commitment::Confirmed);
-    assert_eq!(accounts.len(), 0);
+    assert_eq!(accounts.map.len(), 0);
 }

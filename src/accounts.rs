@@ -20,7 +20,6 @@ use tokio::sync::mpsc;
 use tokio::time::{DelayQueue, Instant};
 use tracing::{debug, error, info, warn};
 
-use crate::metrics::db_metrics;
 use crate::metrics::pubsub_metrics as metrics;
 use crate::types::{
     AccountContext, AccountInfo, AccountsDb, Commitment, Encoding, Filter, ProgramAccountsDb,
@@ -556,10 +555,6 @@ impl AccountUpdateManager {
                 self.accounts.remove(key, commitment);
             }
         }
-        db_metrics().account_entries.set(self.accounts.len() as i64);
-        db_metrics()
-            .program_account_entries
-            .set(self.program_accounts.len() as i64);
     }
 
     fn update_status(&self) {
@@ -745,7 +740,6 @@ impl AccountUpdateManager {
                         if let Some((sub, commitment)) = self.id_to_sub.get(&params.subscription) {
                             //info!(key = %sub.key(), "received account notification");
                             self.accounts.insert(sub.key(), params.result, *commitment);
-                            db_metrics().account_entries.set(self.accounts.len() as i64);
                         } else {
                             warn!(
                                 self.actor_id,
@@ -845,10 +839,6 @@ impl AccountUpdateManager {
                                 sub = params.subscription
                             );
                         }
-                        db_metrics().account_entries.set(self.accounts.len() as i64);
-                        db_metrics()
-                            .program_account_entries
-                            .set(self.program_accounts.len() as i64);
                         metrics()
                             .notifications_received
                             .with_label_values(&[&self.actor_name, "programNotification"])
