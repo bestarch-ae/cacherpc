@@ -607,7 +607,9 @@ impl AccountUpdateManager {
                                 .with_label_values(&[&self.actor_name])
                                 .inc();
                             self.subs.remove(&(sub, commitment));
-                            self.active_accounts.remove(&(sub.key(), commitment));
+                            if sub.is_account() {
+                                self.active_accounts.remove(&(sub.key(), commitment));
+                            }
                             self.purge_key(&sub, commitment);
                         }
                         InflightRequest::Unsub(sub, commitment) => {
@@ -622,7 +624,9 @@ impl AccountUpdateManager {
                                 self.id_to_sub.remove(&id);
                             }
                             self.subs.remove(&(sub, commitment));
-                            self.active_accounts.remove(&(sub.key(), commitment));
+                            if sub.is_account() {
+                                self.active_accounts.remove(&(sub.key(), commitment));
+                            }
                             self.purge_key(&sub, commitment);
                         }
                         InflightRequest::SlotSub(_) => {
@@ -681,6 +685,9 @@ impl AccountUpdateManager {
                                 if let Some(sub_id) = self.sub_to_id.remove(&(sub, commitment)) {
                                     self.id_to_sub.remove(&sub_id);
                                     let created_at = self.subs.remove(&(sub, commitment));
+                                    if sub.is_account() {
+                                        self.active_accounts.remove(&(sub.key(), commitment));
+                                    }
                                     info!(
                                         self.actor_id,
                                         message = "unsubscribed from stream",
@@ -892,8 +899,12 @@ impl AccountUpdateManager {
         self.id_to_sub.clear();
         self.sub_to_id.clear();
 
-        info!(self.actor_id, "purging related caches");
-        self.active_accounts.drain();
+        let active_accounts = self.active_accounts.drain().count();
+        info!(
+            self.actor_id,
+            accounts = active_accounts,
+            "purging related caches",
+        );
         let to_purge: Vec<_> = self.subs.keys().cloned().collect();
         for (sub, commitment) in to_purge {
             self.purge_key(&sub, commitment);
@@ -961,6 +972,9 @@ impl Handler<AccountCommand> for AccountUpdateManager {
                         self.unsubscribe(sub, commitment)?;
                     } else {
                         self.subs.remove(&(sub, commitment));
+                    }
+                    if sub.is_account {
+                        self.active_accounts.remove(&(sub.key(), commitment));
                     }
                     self.purge_key(&sub, commitment);
                 }
@@ -1152,6 +1166,10 @@ impl Subscription {
             Subscription::Account(key) => key,
             Subscription::Program(key) => key,
         }
+    }
+
+    pub fn is_account(&self) -> bool {
+        matches!(self, Subscription::Account(_))
     }
 }
 
