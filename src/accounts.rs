@@ -183,7 +183,7 @@ pub(crate) struct AccountUpdateManager {
     request_id: u64,
     inflight: HashMap<u64, (InflightRequest, Instant)>,
     subs: HashMap<(Subscription, Commitment), Meta>,
-    active_accounts: HashSet<Arc<Pubkey>>,
+    active_accounts: HashMap<(Pubkey, Commitment), Arc<Pubkey>>,
     id_to_sub: HashMap<u64, (Subscription, Commitment)>,
     sub_to_id: HashMap<(Subscription, Commitment), u64>,
     connection: Connection,
@@ -285,7 +285,7 @@ impl AccountUpdateManager {
                 sub_to_id: HashMap::default(),
                 inflight: HashMap::default(),
                 subs: HashMap::default(),
-                active_accounts: HashSet::default(),
+                active_accounts: HashMap::default(),
                 request_id: 1,
                 accounts: accounts.clone(),
                 program_accounts: program_accounts.clone(),
@@ -607,7 +607,7 @@ impl AccountUpdateManager {
                                 .with_label_values(&[&self.actor_name])
                                 .inc();
                             self.subs.remove(&(sub, commitment));
-                            self.active_accounts.remove(&sub.key());
+                            self.active_accounts.remove(&(sub.key(), commitment));
                             self.purge_key(&sub, commitment);
                         }
                         InflightRequest::Unsub(sub, commitment) => {
@@ -622,7 +622,7 @@ impl AccountUpdateManager {
                                 self.id_to_sub.remove(&id);
                             }
                             self.subs.remove(&(sub, commitment));
-                            self.active_accounts.remove(&sub.key());
+                            self.active_accounts.remove(&(sub.key(), commitment));
                             self.purge_key(&sub, commitment);
                         }
                         InflightRequest::SlotSub(_) => {
@@ -655,7 +655,7 @@ impl AccountUpdateManager {
                                     .get(&key)
                                     .and_then(|data| data.get_ref(commitment))
                                 {
-                                    self.active_accounts.insert(key_ref);
+                                    self.active_accounts.insert((key, commitment), key_ref);
                                 }
                             }
 
