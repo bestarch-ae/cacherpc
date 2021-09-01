@@ -593,7 +593,7 @@ impl AccountUpdateManager {
                 id: Some(id),
                 ..
             } => {
-                if let Some((req, _)) = self.inflight.remove(&id) {
+                if let Some((req, _time)) = self.inflight.remove(&id) {
                     match req {
                         InflightRequest::Sub(sub, commitment) => {
                             warn!(self.actor_id, request_id = id, error = ?error, key = %sub.key(), commitment = ?commitment, "subscribe failed");
@@ -641,7 +641,7 @@ impl AccountUpdateManager {
                 id: Some(id),
                 ..
             } => {
-                if let Some((req, _)) = self.inflight.remove(&id) {
+                if let Some((req, sent_at)) = self.inflight.remove(&id) {
                     match req {
                         InflightRequest::Sub(sub, commitment) => {
                             let sub_id: u64 = serde_json::from_str(result.get())?;
@@ -668,7 +668,12 @@ impl AccountUpdateManager {
                                 .with_label_values(&[&self.actor_name])
                                 .set(self.sub_to_id.len() as i64);
 
-                            info!(self.actor_id, message = "subscribed to stream", sub_id = sub_id, sub = %sub, commitment = ?commitment);
+                            info!(self.actor_id, message = "subscribed to stream",
+                                sub_id = sub_id, sub = %sub, commitment = ?commitment, time = ?sent_at.elapsed());
+                            metrics()
+                                .time_to_subscribe
+                                .with_label_values(&[&self.actor_name])
+                                .observe(sent_at.elapsed().as_secs_f64());
                             metrics()
                                 .subscriptions_active
                                 .with_label_values(&[&self.actor_name])
@@ -689,6 +694,7 @@ impl AccountUpdateManager {
                                         sub_id = sub_id,
                                         key = %sub.key(),
                                         sub = %sub,
+                                        time = ?sent_at.elapsed(),
                                     );
                                     metrics()
                                         .subscriptions_active
