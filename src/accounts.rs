@@ -147,10 +147,6 @@ impl Connection {
         matches!(self, Connection::Connected { .. })
     }
 
-    fn is_connecting(&self) -> bool {
-        matches!(self, Connection::Connecting)
-    }
-
     fn send(&mut self, msg: ws::Message) -> Result<(), ws::Message> {
         if let Connection::Connected { sink, .. } = self {
             sink.write(msg).map_or(Ok(()), Err)?;
@@ -879,29 +875,13 @@ impl AccountUpdateManager {
         for (sub, commitment) in to_purge {
             self.purge_key(&sub, commitment);
         }
-    }
-
-    fn reconnect(&mut self, ctx: &mut Context<Self>) {
-        if !self.connection.is_connecting() {
-            info!(self.actor_id, "websocket reconnecting");
-            if self.connection.is_connected() {
-                error!(self.actor_id, "was connected, while doing reconnect");
-                self.disconnect(ctx);
-            }
-
-            self.connect(ctx);
-            self.update_status();
-        } else {
-            warn!(self.actor_id, "already reconnecting");
-        }
-        info!(self.actor_id, "reconnect completed");
+        self.update_status();
     }
 }
 
 impl Supervised for AccountUpdateManager {
     fn restarting(&mut self, ctx: &mut Context<Self>) {
         info!(self.actor_id, "restarting actor");
-
         self.disconnect(ctx);
     }
 }
@@ -1095,10 +1075,8 @@ impl StreamHandler<Result<awc::ws::Frame, awc::error::WsProtocolError>> for Acco
         }
     }
 
-    fn finished(&mut self, ctx: &mut Context<Self>) {
+    fn finished(&mut self, _ctx: &mut Context<Self>) {
         info!(self.actor_id, "websocket stream finished");
-        self.disconnect(ctx);
-        self.reconnect(ctx);
     }
 }
 
