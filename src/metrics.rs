@@ -52,6 +52,7 @@ pub struct PubSubMetrics {
     pub time_until_reset: Histogram,
     pub time_to_subscribe: HistogramVec,
     pub accounts_filtered_out: IntCounterVec,
+    pub disconnects: IntCounterVec,
 }
 
 pub fn pubsub_metrics() -> &'static PubSubMetrics {
@@ -167,6 +168,12 @@ pub fn pubsub_metrics() -> &'static PubSubMetrics {
         accounts_filtered_out: register_int_counter_vec!(
             "accounts_filtered_out",
             "accounts received by ws not matched by filters",
+            &["connection_id"]
+        )
+        .unwrap(),
+        disconnects: register_int_counter_vec!(
+            "websocket_disconnects",
+            "number of websocket disconnects",
             &["connection_id"]
         )
         .unwrap(),

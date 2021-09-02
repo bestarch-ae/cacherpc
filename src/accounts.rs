@@ -348,7 +348,7 @@ impl AccountUpdateManager {
                 .is_some()
             {
                 error!(actor_id, "failed to send check msg");
-                actor.disconnect(ctx);
+                ctx.stop();
                 return;
             };
             info!(actor_id, message = "websocket ping sent");
@@ -845,11 +845,15 @@ impl AccountUpdateManager {
         Ok(())
     }
 
-    fn disconnect(&mut self, _ctx: &mut Context<Self>) {
+    fn on_disconnect(&mut self) {
         info!(self.actor_id, "websocket disconnected");
 
         self.connection = Connection::Disconnected;
 
+        metrics()
+            .disconnects
+            .with_label_values(&[&self.actor_name])
+            .inc();
         metrics()
             .websocket_connected
             .with_label_values(&[&self.actor_name])
@@ -880,9 +884,9 @@ impl AccountUpdateManager {
 }
 
 impl Supervised for AccountUpdateManager {
-    fn restarting(&mut self, ctx: &mut Context<Self>) {
+    fn restarting(&mut self, _ctx: &mut Context<Self>) {
+        self.on_disconnect();
         info!(self.actor_id, "restarting actor");
-        self.disconnect(ctx);
     }
 }
 
@@ -1003,7 +1007,7 @@ impl StreamHandler<Result<awc::ws::Frame, awc::error::WsProtocolError>> for Acco
                 }
                 Frame::Close(reason) => {
                     warn!(self.actor_id, reason = ?reason, "websocket closing");
-                    self.disconnect(ctx);
+                    ctx.stop();
                 }
                 Frame::Binary(msg) => {
                     warn!(self.actor_id, msg = ?msg, "unexpected binary message");
@@ -1075,8 +1079,9 @@ impl StreamHandler<Result<awc::ws::Frame, awc::error::WsProtocolError>> for Acco
         }
     }
 
-    fn finished(&mut self, _ctx: &mut Context<Self>) {
+    fn finished(&mut self, ctx: &mut Context<Self>) {
         info!(self.actor_id, "websocket stream finished");
+        ctx.stop();
     }
 }
 
