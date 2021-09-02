@@ -7,11 +7,13 @@ use std::time::Duration;
 
 use actix::io::SinkWrite;
 use actix::prelude::AsyncContext;
-use actix::prelude::{Actor, Addr, Context, Handler, Message, Running, StreamHandler};
+use actix::prelude::{
+    Actor, ActorContext, Addr, Context, Handler, Message, Running, StreamHandler, Supervised,
+    Supervisor,
+};
 use actix::Arbiter;
 use actix_http::ws;
 use bytes::BytesMut;
-use futures_util::future::AbortHandle;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use smallvec::SmallVec;
@@ -137,33 +139,12 @@ impl PubSubManager {
 enum Connection {
     Disconnected,
     Connecting,
-    Connected { sink: WsSink, stream: AbortHandle },
+    Connected { sink: WsSink },
 }
 
 impl Connection {
     fn is_connected(&self) -> bool {
         matches!(self, Connection::Connected { .. })
-    }
-
-    fn is_connecting(&self) -> bool {
-        matches!(self, Connection::Connecting)
-    }
-
-    fn close(&mut self, ctx: &mut Context<AccountUpdateManager>) {
-        let old = std::mem::replace(self, Connection::Disconnected);
-
-        match old {
-            Connection::Disconnected => {}
-            Connection::Connecting => {
-                *self = Connection::Connecting;
-            }
-            Connection::Connected { mut sink, stream } => {
-                sink.close();
-                ctx.cancel_future(sink.handle());
-                stream.abort();
-                *self = Connection::Disconnected;
-            }
-        }
     }
 
     fn send(&mut self, msg: ws::Message) -> Result<(), ws::Message> {
@@ -188,7 +169,7 @@ pub(crate) struct AccountUpdateManager {
     connection: Connection,
     accounts: AccountsDb,
     program_accounts: ProgramAccountsDb,
-    purge_queue: DelayQueueHandle<(Subscription, Commitment)>,
+    purge_queue: Option<DelayQueueHandle<(Subscription, Commitment)>>,
     additional_keys: HashMap<(Pubkey, Commitment), HashSet<SmallVec<[Filter; 2]>>>,
     last_received_at: Instant,
     active: Arc<AtomicBool>,
@@ -212,89 +193,83 @@ impl AccountUpdateManager {
     ) -> Addr<Self> {
         let arbiter = Arbiter::new();
         let websocket_url = websocket_url.to_owned();
-        AccountUpdateManager::start_in_arbiter(&arbiter, move |ctx| {
-            let actor_name = format!("pubsub-{}", actor_id);
-            let (handle, stream) = delay_queue(actor_name.clone());
-            let purge_stream = stream.map(|(sub, com)| AccountCommand::Purge(sub, com));
+        let actor_name = format!("pubsub-{}", actor_id);
+        Supervisor::start_in_arbiter(&arbiter, move |_ctx| AccountUpdateManager {
+            actor_id,
+            time_to_live,
+            actor_name,
+            websocket_url,
+            connection: Connection::Disconnected,
+            id_to_sub: HashMap::default(),
+            sub_to_id: HashMap::default(),
+            inflight: HashMap::default(),
+            subs: HashMap::default(),
+            active_accounts: HashMap::default(),
+            request_id: 1,
+            accounts: accounts.clone(),
+            program_accounts: program_accounts.clone(),
+            purge_queue: None,
+            additional_keys: HashMap::default(),
+            active,
+            last_received_at: Instant::now(),
+            buffer: BytesMut::new(),
+        })
+    }
 
-            ctx.set_mailbox_capacity(MAILBOX_CAPACITY);
-
-            ctx.run_interval(Duration::from_secs(5), move |actor, ctx| {
-                if actor.connection.is_connected() {
-                    if actor
-                        .connection
-                        .send(awc::ws::Message::Ping(b"hello?".as_ref().into()))
-                        .is_err()
-                    {
-                        warn!(actor_id = actor.actor_id, "failed to send ping");
-                        actor.disconnect(ctx);
-                    }
-
-                    let elapsed = actor.last_received_at.elapsed();
-                    if elapsed > WEBSOCKET_PING_TIMEOUT {
-                        warn!(
-                            actor_id = actor.actor_id,
-                            "no messages received in {:?}, assume connection lost ({:?})",
-                            elapsed,
-                            actor.last_received_at
-                        );
-                        actor.disconnect(ctx);
-                    }
+    fn start_periodic(ctx: &mut Context<Self>) {
+        ctx.run_interval(Duration::from_secs(5), move |actor, ctx| {
+            if actor.connection.is_connected() {
+                if actor
+                    .connection
+                    .send(awc::ws::Message::Ping(b"hello?".as_ref().into()))
+                    .is_err()
+                {
+                    warn!(actor_id = actor.actor_id, "failed to send ping");
+                    ctx.stop();
                 }
-            });
 
-            ctx.run_interval(Duration::from_secs(5), move |actor, ctx| {
-                let actor_id = actor.actor_id;
+                let elapsed = actor.last_received_at.elapsed();
+                if elapsed > WEBSOCKET_PING_TIMEOUT {
+                    warn!(
+                        actor_id = actor.actor_id,
+                        "no messages received in {:?}, assume connection lost ({:?})",
+                        elapsed,
+                        actor.last_received_at
+                    );
+                    ctx.stop();
+                }
+            }
+        });
 
-                if actor.connection.is_connected() {
-                    let mut dead_requests = 0;
-                    actor.inflight.retain(|request_id, (req, time)| {
-                        let elapsed = time.elapsed();
-                        let too_long = elapsed > IN_FLIGHT_TIMEOUT;
-                        if too_long {
-                            warn!(actor_id,
+        ctx.run_interval(Duration::from_secs(5), move |actor, ctx| {
+            let actor_id = actor.actor_id;
+
+            if actor.connection.is_connected() {
+                let mut dead_requests = 0;
+                actor.inflight.retain(|request_id, (req, time)| {
+                    let elapsed = time.elapsed();
+                    let too_long = elapsed > IN_FLIGHT_TIMEOUT;
+                    if too_long {
+                        warn!(actor_id,
                                 request_id, request = ?req, timeout = ?IN_FLIGHT_TIMEOUT,
                                 elapsed = ?elapsed, "request in flight too long, assume dead");
-                            dead_requests += 1;
-                        }
-                        !too_long
-                    });
-                    metrics()
-                        .inflight_entries
-                        .with_label_values(&[&actor.actor_name])
-                        .set(actor.inflight.len() as i64);
-                    if dead_requests > DEAD_REQUEST_LIMIT {
-                        warn!(
-                            message = "too many dead requests, disconnecting",
-                            count = dead_requests
-                        );
-                        actor.disconnect(ctx);
+                        dead_requests += 1;
                     }
+                    !too_long
+                });
+                metrics()
+                    .inflight_entries
+                    .with_label_values(&[&actor.actor_name])
+                    .set(actor.inflight.len() as i64);
+                if dead_requests > DEAD_REQUEST_LIMIT {
+                    warn!(
+                        message = "too many dead requests, disconnecting",
+                        count = dead_requests
+                    );
+                    ctx.stop();
                 }
-            });
-
-            AccountUpdateManager::add_stream(purge_stream, ctx);
-            AccountUpdateManager {
-                actor_id,
-                time_to_live,
-                actor_name,
-                websocket_url,
-                connection: Connection::Disconnected,
-                id_to_sub: HashMap::default(),
-                sub_to_id: HashMap::default(),
-                inflight: HashMap::default(),
-                subs: HashMap::default(),
-                active_accounts: HashMap::default(),
-                request_id: 1,
-                accounts: accounts.clone(),
-                program_accounts: program_accounts.clone(),
-                purge_queue: handle,
-                additional_keys: HashMap::default(),
-                active,
-                last_received_at: Instant::now(),
-                buffer: BytesMut::new(),
             }
-        })
+        });
     }
 
     fn next_request_id(&mut self) -> u64 {
@@ -323,7 +298,6 @@ impl AccountUpdateManager {
 
         if self.connection.is_connected() {
             warn!(message = "old connection not canceled properly", actor_id = %actor_id);
-            self.connection.close(ctx);
             return;
         }
         self.connection = Connection::Connecting;
@@ -365,7 +339,6 @@ impl AccountUpdateManager {
         };
         let fut = fut.into_actor(self).map(|conn, actor, ctx| {
             let (sink, stream) = futures_util::stream::StreamExt::split(conn);
-            let (stream, abort_handle) = futures_util::stream::abortable(stream);
             let actor_id = actor.actor_id;
             let mut sink = SinkWrite::new(sink, ctx);
 
@@ -380,13 +353,7 @@ impl AccountUpdateManager {
             };
             info!(actor_id, message = "websocket ping sent");
 
-            let old = std::mem::replace(
-                &mut actor.connection,
-                Connection::Connected {
-                    sink,
-                    stream: abort_handle,
-                },
-            );
+            let old = std::mem::replace(&mut actor.connection, Connection::Connected { sink });
             if old.is_connected() {
                 warn!(actor_id, "was connected, should not have happened");
             }
@@ -481,6 +448,8 @@ impl AccountUpdateManager {
         self.subs.insert((sub, commitment), Meta::new());
         self.send(&request)?;
         self.purge_queue
+            .as_ref()
+            .unwrap()
             .insert((sub, commitment), self.time_to_live);
         metrics()
             .subscribe_requests
@@ -876,9 +845,10 @@ impl AccountUpdateManager {
         Ok(())
     }
 
-    fn disconnect(&mut self, ctx: &mut Context<Self>) {
+    fn disconnect(&mut self, _ctx: &mut Context<Self>) {
         info!(self.actor_id, "websocket disconnected");
-        self.connection.close(ctx);
+
+        self.connection = Connection::Disconnected;
 
         metrics()
             .websocket_connected
@@ -905,22 +875,14 @@ impl AccountUpdateManager {
         for (sub, commitment) in to_purge {
             self.purge_key(&sub, commitment);
         }
+        self.update_status();
     }
+}
 
-    fn reconnect(&mut self, ctx: &mut Context<Self>) {
-        if !self.connection.is_connecting() {
-            info!(self.actor_id, "websocket reconnecting");
-            if self.connection.is_connected() {
-                error!(self.actor_id, "was connected, while doing reconnect");
-                self.disconnect(ctx);
-            }
-
-            self.connect(ctx);
-            self.update_status();
-        } else {
-            warn!(self.actor_id, "already reconnecting");
-        }
-        info!(self.actor_id, "reconnect completed");
+impl Supervised for AccountUpdateManager {
+    fn restarting(&mut self, ctx: &mut Context<Self>) {
+        info!(self.actor_id, "restarting actor");
+        self.disconnect(ctx);
     }
 }
 
@@ -984,7 +946,10 @@ impl Handler<AccountCommand> for AccountUpdateManager {
                             .time_until_reset
                             .observe(time.update().as_secs_f64());
                     }
-                    self.purge_queue.reset((key, commitment), self.time_to_live);
+                    self.purge_queue
+                        .as_ref()
+                        .unwrap()
+                        .reset((key, commitment), self.time_to_live);
                 }
             }
             Ok(())
@@ -1006,12 +971,12 @@ impl StreamHandler<Result<awc::ws::Frame, awc::error::WsProtocolError>> for Acco
         let item = match item {
             Ok(item) => item,
             Err(err) => {
-                error!(self.actor_id, error = %err, "websocket protocol error");
+                error!(self.actor_id, error = %err, "websocket read error");
                 metrics()
                     .websocket_errors
                     .with_label_values(&[&self.actor_name, "read"])
                     .inc();
-                self.disconnect(ctx);
+                ctx.stop();
                 return;
             }
         };
@@ -1110,10 +1075,8 @@ impl StreamHandler<Result<awc::ws::Frame, awc::error::WsProtocolError>> for Acco
         }
     }
 
-    fn finished(&mut self, ctx: &mut Context<Self>) {
+    fn finished(&mut self, _ctx: &mut Context<Self>) {
         info!(self.actor_id, "websocket stream finished");
-        self.disconnect(ctx);
-        self.reconnect(ctx);
     }
 }
 
@@ -1121,6 +1084,16 @@ impl Actor for AccountUpdateManager {
     type Context = Context<Self>;
 
     fn started(&mut self, ctx: &mut Context<Self>) {
+        let (handle, stream) = delay_queue(self.actor_name.clone());
+        let purge_stream = stream.map(|(sub, com)| AccountCommand::Purge(sub, com));
+
+        ctx.set_mailbox_capacity(MAILBOX_CAPACITY);
+
+        Self::start_periodic(ctx);
+        self.purge_queue = Some(handle);
+
+        AccountUpdateManager::add_stream(purge_stream, ctx);
+
         self.connect(ctx);
     }
 
@@ -1135,14 +1108,13 @@ impl Actor for AccountUpdateManager {
 }
 
 impl actix::io::WriteHandler<awc::error::WsProtocolError> for AccountUpdateManager {
-    fn error(&mut self, err: awc::error::WsProtocolError, ctx: &mut Self::Context) -> Running {
+    fn error(&mut self, err: awc::error::WsProtocolError, _ctx: &mut Self::Context) -> Running {
         error!(self.actor_id, message = "websocket write error", error = ?err);
         metrics()
             .websocket_errors
             .with_label_values(&[&self.actor_name, "write"])
             .inc();
-        self.disconnect(ctx);
-        Running::Continue
+        Running::Stop
     }
 
     fn finished(&mut self, _ctx: &mut Self::Context) {
