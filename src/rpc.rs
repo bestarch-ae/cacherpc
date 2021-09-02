@@ -28,6 +28,13 @@ use crate::types::{
 const BODY_LIMIT: usize = 1024 * 1024 * 100;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[derive(Serialize)]
+struct JsonRpcResponse<'a, T> {
+    jsonrpc: &'a str,
+    result: T,
+    id: Id<'a>,
+}
+
 #[derive(Error, Debug)]
 #[error("can't encode in base58")]
 struct Base58Error;
@@ -522,16 +529,10 @@ fn account_response<'a, 'b>(
     app_state: &web::Data<State>,
     config: AccountInfoConfig,
 ) -> Result<HttpResponse, Error<'a>> {
-    #[derive(Serialize)]
-    struct Resp<'a> {
-        jsonrpc: &'a str,
-        result: &'a RawValue,
-        id: Id<'a>,
-    }
     let request_and_slot_hash = hash((request_hash, acc.1));
     if let Some(result) = app_state.lru.borrow_mut().get(&request_and_slot_hash) {
         metrics().lru_cache_hits.inc();
-        let resp = Resp {
+        let resp = JsonRpcResponse {
             jsonrpc: "2.0",
             result: result.as_ref(),
             id: req_id,
@@ -567,7 +568,7 @@ fn account_response<'a, 'b>(
                     Some("Encoded binary (base 58) data should be less than 128 bytes, please use Base64 encoding.")))?
             .unwrap_or_else(|| EncodedAccountContext::empty(&ctx));
     let result = serde_json::value::to_raw_value(&result)?;
-    let resp = Resp {
+    let resp = JsonRpcResponse {
         jsonrpc: "2.0",
         result: &result,
         id: req_id,
@@ -862,13 +863,8 @@ fn program_accounts_response<'a>(
             return Err(ProgramAccountsResponseError::Inconsistency);
         }
     }
-    #[derive(Serialize)]
-    struct Resp<'a> {
-        jsonrpc: &'a str,
-        result: Vec<AccountAndPubkey<'a>>,
-        id: Id<'a>,
-    }
-    let resp = Resp {
+
+    let resp = JsonRpcResponse {
         jsonrpc: "2.0",
         result: encoded_accounts,
         id: req_id,
