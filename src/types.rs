@@ -603,6 +603,7 @@ impl Serialize for AccountData {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
+// TODO: Refactor this into WithContext<T>
 pub(crate) struct AccountContext {
     pub context: SolanaContext,
     pub value: Option<AccountInfo>,

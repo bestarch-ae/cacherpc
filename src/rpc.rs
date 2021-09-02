@@ -58,7 +58,7 @@ impl AccountInfo {
     }
 }
 
-#[derive(Debug, Deserialize, Copy, Clone)]
+#[derive(Debug, Deserialize, Serialize, Copy, Clone)]
 struct Slice {
     offset: usize,
     length: usize,
@@ -443,7 +443,7 @@ impl ResponseError for Error<'_> {
     }
 }
 
-#[derive(Deserialize, Debug, Copy, Clone)]
+#[derive(Deserialize, Serialize, Debug, Copy, Clone)]
 struct CommitmentConfig {
     commitment: Commitment,
 }
@@ -758,32 +758,44 @@ enum ProgramAccountsResponseError {
     Base58,
 }
 
-#[derive(Deserialize, Debug)]
-struct ProgramAccountsConfig {
+#[derive(Deserialize, Serialize, Debug)]
+struct ProgramAccountsConfig<'a> {
     #[serde(default = "Encoding::default")]
     encoding: Encoding,
     #[serde(flatten)]
     commitment: Option<CommitmentConfig>,
     #[serde(rename = "dataSlice")]
     data_slice: Option<Slice>,
-    filters: Option<SmallVec<[Filter; 2]>>,
+    #[serde(borrow)]
+    filters: Option<&'a RawValue>,
+    #[serde(rename = "withContext", default = "bool::default")]
+    with_context: bool,
 }
 
-impl Default for ProgramAccountsConfig {
+impl Default for ProgramAccountsConfig<'_> {
     fn default() -> Self {
         ProgramAccountsConfig {
             encoding: Encoding::Default,
             commitment: None,
             data_slice: None,
             filters: None,
+            with_context: false,
         }
     }
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum MaybeContext<T> {
+    With { context: SolanaContext, value: T },
+    Without(T),
 }
 
 fn program_accounts_response<'a>(
     req_id: Id<'a>,
     accounts: &HashSet<Arc<Pubkey>>,
     config: &'_ ProgramAccountsConfig,
+    filters: Option<impl AsRef<[Filter]>>,
     app_state: &web::Data<State>,
 ) -> Result<HttpResponse, ProgramAccountsResponseError> {
     struct Encode<'a, K> {
@@ -821,8 +833,6 @@ fn program_accounts_response<'a>(
 
     let commitment = config.commitment.unwrap_or_default().commitment;
 
-    let filters = &config.filters;
-
     let mut encoded_accounts = Vec::with_capacity(accounts.len());
 
     for key in accounts {
@@ -846,7 +856,7 @@ fn program_accounts_response<'a>(
             }
 
             if let Some(filters) = &filters {
-                let matches = filters.iter().all(|f| {
+                let matches = filters.as_ref().iter().all(|f| {
                     account_info
                         .map(|val| f.matches(&val.data))
                         .unwrap_or(false)
@@ -894,7 +904,9 @@ async fn get_program_accounts(
     req: Request<'_, RawValue>,
     app_state: web::Data<State>,
 ) -> Result<HttpResponse, Error<'_>> {
-    let (pubkey, config, _hash) = parse_params::<ProgramAccountsConfig>(&req)?;
+    let (pubkey, mut config, _hash) = parse_params::<ProgramAccountsConfig<'_>>(&req)?;
+    let return_context = config.with_context;
+
     let commitment = config.commitment.unwrap_or_default().commitment;
 
     metrics()
@@ -908,14 +920,15 @@ async fn get_program_accounts(
         .inc();
 
     let mut cacheable_for_key = Some(pubkey);
-
-    let filters: Option<SmallVec<[Filter; 2]>> = if let Some(filters) = &config.filters {
-        let mut filters = filters.clone();
-        filters.sort_unstable();
-        Some(filters)
-    } else {
-        None
-    };
+    let filters = config
+        .filters
+        .map(RawValue::get)
+        .map(serde_json::from_str)
+        .transpose()?
+        .map(|mut filters: SmallVec<[Filter; 2]>| {
+            filters.sort_unstable();
+            filters
+        });
 
     if config.encoding != Encoding::JsonParsed && app_state.subscription_active(pubkey) {
         match app_state.program_accounts.get(&pubkey, filters.clone()) {
@@ -924,7 +937,13 @@ async fn get_program_accounts(
                 if let Some(accounts) = accounts.get(commitment) {
                     app_state.reset(Subscription::Program(pubkey), commitment);
                     metrics().program_accounts_cache_hits.inc();
-                    match program_accounts_response(req.id.clone(), accounts, &config, &app_state) {
+                    match program_accounts_response(
+                        req.id.clone(),
+                        accounts,
+                        &config,
+                        filters.as_ref(),
+                        &app_state,
+                    ) {
                         Ok(resp) => return Ok(resp),
                         Err(ProgramAccountsResponseError::Base58) => {
                             return Err(Error::InvalidRequest(Some(req.id.clone()),
@@ -958,7 +977,21 @@ async fn get_program_accounts(
     }
 
     let limit = &app_state.program_accounts_request_limit;
-    let wait_for_response = app_state.request(&req, limit);
+    // We only enforce context for cacheable request, since we need slot for correct caching.
+    // For non-cached requests we do not alter the config, so that we don't have to reserialize the response.
+    if cacheable_for_key.is_some() {
+        config.with_context = true;
+    }
+
+    let params = (pubkey, &config);
+    let req_with_context = Request {
+        jsonrpc: req.jsonrpc,
+        id: req.id.clone(),
+        method: req.method,
+        params: Some(&params),
+    };
+
+    let wait_for_response = app_state.request(&req_with_context, limit);
 
     tokio::pin!(wait_for_response);
 
@@ -984,6 +1017,7 @@ async fn get_program_accounts(
                                 req.id.clone(),
                                 accounts,
                                 &config,
+                                filters.as_ref(),
                                 &app_state,
                             ) {
                                 return Ok(resp);
@@ -997,26 +1031,40 @@ async fn get_program_accounts(
     };
 
     if let Some(program_pubkey) = cacheable_for_key {
+        if !config.with_context {
+            // TODO?: consider panicing since this is a logic error
+            error!("requested cacheable program accounts without context");
+        }
+
         #[derive(Deserialize, Debug)]
         struct AccountAndPubkey {
             account: AccountInfo,
             pubkey: Pubkey,
         }
+
         #[derive(Deserialize, Debug)]
-        struct Wrap<'a> {
-            #[serde(flatten, borrow)]
-            inner: Response<'a>,
+        struct RawResponse<'a> {
+            context: SolanaContext,
+            #[serde(borrow)]
+            value: &'a RawValue,
         }
+
+        // We cannot use enum and wrapping struct with #[serde(flatten)]
+        // since there's a bug in RawValue and flatten interaction
+        // Ref: https://github.com/serde-rs/json/issues/599s
         #[derive(Deserialize, Debug)]
         #[serde(rename_all = "lowercase")]
-        enum Response<'a> {
-            Result(Vec<AccountAndPubkey>),
+        struct Response<'a> {
             #[serde(borrow)]
-            Error(RpcError<'a>),
+            result: Option<RawResponse<'a>>,
+            #[serde(borrow)]
+            error: Option<RpcError<'a>>,
         }
-        let resp: Wrap<'_> = serde_json::from_slice(&resp)?;
-        match resp.inner {
-            Response::Result(result) => {
+
+        let resp: Response<'_> = serde_json::from_slice(&resp)?;
+        match (resp.result, resp.error) {
+            (Some(raw_result), None) => {
+                let result: Vec<AccountAndPubkey> = serde_json::from_str(&raw_result.value.get())?;
                 app_state
                     .subscribe(
                         Subscription::Program(program_pubkey),
@@ -1032,7 +1080,9 @@ async fn get_program_accounts(
                         pubkey,
                         AccountContext {
                             value: Some(account),
-                            context: SolanaContext { slot: 0 },
+                            context: SolanaContext {
+                                slot: raw_result.context.slot,
+                            },
                         },
                         commitment,
                     );
@@ -1042,14 +1092,31 @@ async fn get_program_accounts(
                     .program_accounts
                     .insert(program_pubkey, keys, commitment, filters);
                 app_state.map_updated.notify();
+
+                // We have to reserialize if the client did not use withContext toggle,
+                // since we enforce it for every cacheable request.
+                if !return_context {
+                    let resp = JsonRpcResponse {
+                        jsonrpc: "2.0",
+                        id: req.id,
+                        result: MaybeContext::Without(raw_result.value),
+                    };
+
+                    let response = HttpResponse::Ok()
+                        .content_type("application/json")
+                        .header("x-cache-status", "miss")
+                        .json(resp);
+                    return Ok(response);
+                }
             }
-            Response::Error(error) => {
+            (None, Some(error)) => {
                 metrics()
                     .backend_errors
                     .with_label_values(&["getProgramAccounts"])
                     .inc();
                 info!(%pubkey, ?error, "can't cache for key");
             }
+            _ => return Err(Error::Parsing(None)),
         }
     }
 
