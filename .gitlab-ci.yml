@@ -5,6 +5,7 @@ variables:
   RPM_DEB_REPO_PATH: dev-cacherpc-apt
 
   BIN_NAME: cache-rpc
+  BIN_PATH: /usr/sbin
   BUILD_IMAGE: $REGISTRY_PROJECT:build-$CI_COMMIT_REF_SLUG
   CARGO_HOME: /cache/cacherpc/.cargo
   CARGO_TARGET_DIR: "/cache/cacherpc/$CI_COMMIT_REF_SLUG/$CI_JOB_NAME"
@@ -41,6 +42,12 @@ include:
   - project: 'shared/tasks'
     ref: 'master'
     file: 'deploy/ready-sbx.yml'
+  - project: 'shared/tasks'
+    ref: 'master'
+    file: 'upload/s3_binary.yml'
+  - project: 'shared/tasks'
+    ref: 'master'
+    file: 'upload/github_binary.yml'
 
 create_build_image:
   stage: pre_build
@@ -108,32 +115,16 @@ build_artifact:
   script:
     - cargo build --release
     - echo $CARGO_TARGET_DIR
-    - mkdir -p artifact/usr/sbin
+    - mkdir -p artifact${BIN_PATH}
     - ls -la $CARGO_TARGET_DIR
-    - cp $CARGO_TARGET_DIR/release/$BIN_NAME artifact/usr/sbin/
-    - ls -la artifact/usr/sbin/
+    - cp $CARGO_TARGET_DIR/release/$BIN_NAME artifact${BIN_PATH}/
+    - ls -la artifact${BIN_PATH}
     - du artifact
     - tar -czf $UPLOAD_ARTIFACT artifact
   artifacts:
     paths:
       - ./${UPLOAD_ARTIFACT}
     expire_in: 1 day
-
-upload_artifact:
-  stage: build
-  image: ubuntu
-  tags: [docker_nocache]
-  before_script:
-    - apt-get update && apt-get -y install git curl jq openssl sed file
-    - rm -rf ci-scripts
-    - git clone https://git.zubr.dev/shared/ci-scripts.git
-  script:
-    - PIPELINE_ID_VERSION=$(curl --user "$REPO_LOGIN:$REPO_PASS" https://$REPO_SRV/repository/$ARTIFACTS_PATH/$APPNAME_SHORT/pipelin-id/$CI_PIPELINE_ID/$VERSION_FILE)
-    - tar -xzf rpm-source.tar.gz
-    - bash ci-scripts/upload/upload-to-github.sh "$PIPELINE_ID_VERSION" "artifact/usr/sbin/$BIN_NAME"
-    - bash ci-scripts/upload/upload-to-s3.sh "$PIPELINE_ID_VERSION" "artifact/usr/sbin/$BIN_NAME"
-  only:
-    - tags
 
 build_docker:
   stage: build
