@@ -797,6 +797,7 @@ fn program_accounts_response<'a>(
     config: &'_ ProgramAccountsConfig,
     filters: Option<impl AsRef<[Filter]>>,
     app_state: &web::Data<State>,
+    with_context: bool,
 ) -> Result<HttpResponse, ProgramAccountsResponseError> {
     struct Encode<'a, K> {
         inner: Ref<'a, K, AccountState>,
@@ -834,16 +835,18 @@ fn program_accounts_response<'a>(
     let commitment = config.commitment.unwrap_or_default().commitment;
 
     let mut encoded_accounts = Vec::with_capacity(accounts.len());
+    let mut slot = 0;
 
     for key in accounts {
         if let Some(data) = app_state.accounts.get(key) {
-            let account_info = match data.value().get(commitment) {
-                Some(data) => data.0,
+            let (account_info, current_slot) = match data.value().get(commitment) {
+                Some(data) => data,
                 None => {
                     warn!("data for key {}/{:?} not found", key, commitment);
                     return Err(ProgramAccountsResponseError::Inconsistency);
                 }
             };
+            slot = current_slot.max(slot); // TODO: find a better way (store last slot with account set)
 
             let account_len = account_info
                 .as_ref()
@@ -882,9 +885,17 @@ fn program_accounts_response<'a>(
         }
     }
 
+    let value = match with_context {
+        true => MaybeContext::With {
+            context: SolanaContext { slot },
+            value: encoded_accounts,
+        },
+        false => MaybeContext::Without(encoded_accounts),
+    };
+
     let resp = JsonRpcResponse {
         jsonrpc: "2.0",
-        result: encoded_accounts,
+        result: value,
         id: req_id,
     };
 
@@ -943,6 +954,7 @@ async fn get_program_accounts(
                         &config,
                         filters.as_ref(),
                         &app_state,
+                        return_context,
                     ) {
                         Ok(resp) => return Ok(resp),
                         Err(ProgramAccountsResponseError::Base58) => {
@@ -1019,6 +1031,7 @@ async fn get_program_accounts(
                                 &config,
                                 filters.as_ref(),
                                 &app_state,
+                                return_context,
                             ) {
                                 return Ok(resp);
                             }
