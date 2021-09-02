@@ -168,7 +168,7 @@ pub(crate) struct AccountsDb {
     slot: Arc<[AtomicU64; 3]>,
 }
 
-type Slot = u64;
+pub type Slot = u64;
 
 #[derive(Debug)]
 struct Account {
@@ -611,7 +611,7 @@ pub(crate) struct AccountContext {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub(crate) struct SolanaContext {
-    pub slot: u64,
+    pub slot: Slot,
 }
 
 #[test]

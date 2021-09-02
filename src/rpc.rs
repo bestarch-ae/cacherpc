@@ -1078,6 +1078,7 @@ async fn get_program_accounts(
         match (resp.result, resp.error) {
             (Some(raw_result), None) => {
                 let result: Vec<AccountAndPubkey> = serde_json::from_str(&raw_result.value.get())?;
+                info!(%pubkey, slot = %raw_result.context.slot, ?commitment, "caching program");
                 app_state
                     .subscribe(
                         Subscription::Program(program_pubkey),
