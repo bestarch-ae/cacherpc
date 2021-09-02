@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashSet;
+use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -232,11 +233,14 @@ impl State {
         */
     }
 
-    async fn request(
+    async fn request<T>(
         &self,
-        req: &'_ Request<'_>,
+        req: &'_ Request<'_, T>,
         limit: &Semaphore,
-    ) -> Result<Bytes, awc::error::SendRequestError> {
+    ) -> Result<Bytes, awc::error::SendRequestError>
+    where
+        T: Serialize + Debug + ?Sized,
+    {
         let client = &self.client;
         let mut backoff = backoff_settings();
         loop {
@@ -286,12 +290,16 @@ pub enum Id<'a> {
 }
 
 #[derive(Deserialize, Serialize, Debug)]
-struct Request<'a> {
+#[serde(bound(deserialize = "&'a T: Deserialize<'de>"))]
+struct Request<'a, T>
+where
+    T: ?Sized,
+{
     jsonrpc: &'a str,
     id: Id<'a>,
     method: &'a str,
     #[serde(borrow)]
-    params: Option<&'a RawValue>,
+    params: Option<&'a T>,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -477,7 +485,7 @@ fn hash<T: std::hash::Hash>(params: T) -> u64 {
 }
 
 fn parse_params<'a, T: Default + Deserialize<'a>>(
-    req: &Request<'a>,
+    req: &Request<'a, RawValue>,
 ) -> Result<(Pubkey, T, u64), Error<'a>> {
     let (params, request_hash): (SmallVec<[&RawValue; 2]>, u64) = match req.params {
         Some(params) => (serde_json::from_str(params.get())?, hash(params.get())),
@@ -597,7 +605,7 @@ fn account_response<'a, 'b>(
 }
 
 async fn get_account_info(
-    req: Request<'_>,
+    req: Request<'_, RawValue>,
     app_state: web::Data<State>,
 ) -> Result<HttpResponse, Error<'_>> {
     let (pubkey, config, request_hash) = parse_params::<AccountInfoConfig>(&req)?;
@@ -883,7 +891,7 @@ fn program_accounts_response<'a>(
 }
 
 async fn get_program_accounts(
-    req: Request<'_>,
+    req: Request<'_, RawValue>,
     app_state: web::Data<State>,
 ) -> Result<HttpResponse, Error<'_>> {
     let (pubkey, config, _hash) = parse_params::<ProgramAccountsConfig>(&req)?;
@@ -1055,7 +1063,7 @@ pub(crate) async fn rpc_handler(
     body: Bytes,
     app_state: web::Data<State>,
 ) -> Result<HttpResponse, Error<'static>> {
-    let req: Request<'_> = match serde_json::from_slice(&body) {
+    let req: Request<'_, _> = match serde_json::from_slice(&body) {
         Ok(req) => req,
         Err(err) => {
             return Ok(Error::from(err).error_response());
