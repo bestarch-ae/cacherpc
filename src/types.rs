@@ -473,12 +473,12 @@ impl<'de> Deserialize<'de> for Pubkey {
 #[derive(Deserialize, Debug, Hash, Eq, PartialEq, Clone, Ord, PartialOrd)]
 #[serde(rename_all = "camelCase")]
 pub enum Filter {
+    DataSize(u64),
     Memcmp {
         offset: usize,
         #[serde(deserialize_with = "decode_base58")]
         bytes: SmallVec<[u8; 128]>,
     },
-    DataSize(u64),
 }
 
 fn decode_base58<'de, D>(de: D) -> Result<SmallVec<[u8; 128]>, D::Error>
@@ -612,6 +612,16 @@ pub(crate) struct AccountContext {
 #[derive(Serialize, Deserialize, Debug)]
 pub(crate) struct SolanaContext {
     pub slot: Slot,
+}
+
+#[test]
+fn filters_order() {
+    let f1 = Filter::Memcmp {
+        offset: 1,
+        bytes: SmallVec::new(),
+    };
+    let f2 = Filter::DataSize(0);
+    assert!(f2 < f1);
 }
 
 #[test]
