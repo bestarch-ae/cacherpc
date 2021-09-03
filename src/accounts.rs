@@ -756,6 +756,7 @@ impl AccountUpdateManager {
                             if let Some(filters) =
                                 self.additional_keys.get(&(program_key, *commitment))
                             {
+                                let filtration_starts = Instant::now();
                                 for filter_group in filters {
                                     if filter_group.iter().all(|f| f.matches(data)) {
                                         /*
@@ -777,6 +778,10 @@ impl AccountUpdateManager {
                                         );
                                     }
                                 }
+                                metrics()
+                                    .filtration_time
+                                    .with_label_values(&[&self.actor_name])
+                                    .observe(filtration_starts.elapsed().as_micros() as f64);
                             }
                             let key_ref = self.accounts.insert(
                                 key,
@@ -851,7 +856,7 @@ impl AccountUpdateManager {
         self.connection = Connection::Disconnected;
 
         metrics()
-            .disconnects
+            .websocket_disconnects
             .with_label_values(&[&self.actor_name])
             .inc();
         metrics()
