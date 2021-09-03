@@ -25,7 +25,7 @@ use tracing::{debug, error, info, warn};
 use crate::metrics::pubsub_metrics as metrics;
 use crate::types::{
     AccountContext, AccountInfo, AccountsDb, Commitment, Encoding, Filter, ProgramAccountsDb,
-    Pubkey, SolanaContext,
+    Pubkey, Slot, SolanaContext,
 };
 
 const MAILBOX_CAPACITY: usize = 512;
@@ -43,6 +43,7 @@ enum InflightRequest {
 struct Meta {
     created_at: Instant,
     updated_at: Instant,
+    first_slot: Option<Slot>,
 }
 
 impl Meta {
@@ -51,6 +52,7 @@ impl Meta {
         Meta {
             created_at: now,
             updated_at: now,
+            first_slot: None,
         }
     }
 
@@ -747,6 +749,14 @@ impl AccountUpdateManager {
                         if let Some((program_sub, commitment)) =
                             self.id_to_sub.get(&params.subscription)
                         {
+                            if let Some(meta) = self.subs.get_mut(&(*program_sub, *commitment)) {
+                                if meta.first_slot.is_none() {
+                                    let (key, slot) =
+                                        (program_sub.key(), params.result.context.slot);
+                                    info!(program = %key, slot, "first update for program");
+                                    meta.first_slot.replace(slot);
+                                }
+                            }
                             let program_key = program_sub.key();
                             let key = params.result.value.pubkey;
                             let account_info = &params.result.value.account;
