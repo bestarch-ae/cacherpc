@@ -1,3 +1,5 @@
+#![allow(explicit_outlives_requirements)]
+
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -794,7 +796,7 @@ enum MaybeContext<T> {
 fn program_accounts_response<'a>(
     req_id: Id<'a>,
     accounts: &HashSet<Arc<Pubkey>>,
-    config: &'_ ProgramAccountsConfig,
+    config: &'_ ProgramAccountsConfig<'_>,
     filters: Option<impl AsRef<[Filter]>>,
     app_state: &web::Data<State>,
     with_context: bool,
@@ -1077,7 +1079,7 @@ async fn get_program_accounts(
         let resp: Response<'_> = serde_json::from_slice(&resp)?;
         match (resp.result, resp.error) {
             (Some(raw_result), None) => {
-                let result: Vec<AccountAndPubkey> = serde_json::from_str(&raw_result.value.get())?;
+                let result: Vec<AccountAndPubkey> = serde_json::from_str(raw_result.value.get())?;
                 info!(%pubkey, slot = %raw_result.context.slot, ?commitment, "caching program");
                 app_state
                     .subscribe(
