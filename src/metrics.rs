@@ -38,6 +38,7 @@ pub struct PubSubMetrics {
     pub websocket_connected: IntGaugeVec,
     pub websocket_active: IntGaugeVec,
     pub websocket_errors: IntCounterVec,
+    pub websocket_disconnects: IntCounterVec,
     pub notifications_received: IntCounterVec,
     pub commands: IntCounterVec,
     pub bytes_received: IntCounterVec,
@@ -52,7 +53,7 @@ pub struct PubSubMetrics {
     pub time_until_reset: Histogram,
     pub time_to_subscribe: HistogramVec,
     pub accounts_filtered_out: IntCounterVec,
-    pub disconnects: IntCounterVec,
+    pub filtration_time: HistogramVec,
 }
 
 pub fn pubsub_metrics() -> &'static PubSubMetrics {
@@ -162,7 +163,7 @@ pub fn pubsub_metrics() -> &'static PubSubMetrics {
             "time_to_subscribe",
             "time before subscription was extended",
             &["connection_id"],
-            vec![0.0, 0.1, 0.5, 1.0, 5.0, 30.0, 120.0]
+            vec![0.0, 0.1, 0.5, 1.0, 5.0, 10.0, 15.0, 30.0, 120.0]
         )
         .unwrap(),
         accounts_filtered_out: register_int_counter_vec!(
@@ -171,10 +172,29 @@ pub fn pubsub_metrics() -> &'static PubSubMetrics {
             &["connection_id"]
         )
         .unwrap(),
-        disconnects: register_int_counter_vec!(
+        websocket_disconnects: register_int_counter_vec!(
             "websocket_disconnects",
             "number of websocket disconnects",
             &["connection_id"]
+        )
+        .unwrap(),
+        filtration_time: register_histogram_vec!(
+            "filtration_time",
+            "time to process filters for one update (micros)",
+            &["connection_id"],
+            vec![
+                0.0,
+                10.0,
+                50.0,
+                100.0,
+                500.0,
+                1000.0,
+                10_000.0,
+                100_000.0,
+                1_000_000.0,
+                10_000_000.0,
+                100_000_000.0
+            ]
         )
         .unwrap(),
     });
