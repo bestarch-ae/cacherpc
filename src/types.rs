@@ -32,6 +32,7 @@ impl ProgramState {
         }
     }
 
+    #[allow(dead_code)]
     fn remove(&mut self, commitment: Commitment, data: &Pubkey) {
         if let Some(ref mut keys) = (self.0)[commitment.as_idx()] {
             keys.remove(data);
@@ -148,6 +149,7 @@ impl ProgramAccountsDb {
         iter
     }
 
+    #[allow(dead_code)]
     pub fn remove(
         &self,
         program_key: &Pubkey,
@@ -470,13 +472,14 @@ impl<'de> Deserialize<'de> for Pubkey {
     }
 }
 
-#[derive(Deserialize, Debug, Hash, Eq, PartialEq, Clone, Ord, PartialOrd)]
+#[derive(Serialize, Deserialize, Debug, Hash, Eq, PartialEq, Clone, Ord, PartialOrd)]
 #[serde(rename_all = "camelCase")]
 pub enum Filter {
     DataSize(u64),
     Memcmp {
         offset: usize,
         #[serde(deserialize_with = "decode_base58")]
+        #[serde(serialize_with = "encode_base58")]
         bytes: SmallVec<[u8; 128]>,
     },
 }
@@ -510,6 +513,14 @@ where
         }
     }
     de.deserialize_str(Base58Visitor)
+}
+
+fn encode_base58<S>(data: &SmallVec<[u8; 128]>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    let data = bs58::encode(data).into_string();
+    serializer.serialize_str(&data)
 }
 
 impl Filter {

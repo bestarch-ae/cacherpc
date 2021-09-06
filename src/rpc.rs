@@ -216,23 +216,17 @@ impl State {
         self.pubsub.subscription_active(key)
     }
 
-    async fn subscribe(
+    async fn subscribe_account(&self, key: Pubkey, commitment: Commitment) {
+        self.pubsub.subscribe_account(key, commitment);
+    }
+
+    async fn subscribe_program(
         &self,
-        subscription: Subscription,
+        key: Pubkey,
         commitment: Commitment,
         filters: Option<SmallVec<[Filter; 2]>>,
     ) {
-        self.pubsub.subscribe(subscription, commitment, filters);
-        /*
-        let res = self
-            .actor
-            .get()
-            .send(AccountCommand::Subscribe(subscription, commitment, filters))
-            .await;
-        if let Err(err) = res {
-            error!(error = %err, message = "error sending command to actor");
-        }
-        */
+        self.pubsub.subscribe_program(key, commitment, filters);
     }
 
     async fn request<T>(
@@ -714,9 +708,7 @@ async fn get_account_info(
                 debug!(%pubkey, slot = %info.context.slot, ?commitment, "cached for key");
                 app_state.insert(pubkey, info, commitment);
                 app_state.map_updated.notify();
-                app_state
-                    .subscribe(Subscription::Account(pubkey), commitment, None)
-                    .await;
+                app_state.subscribe_account(pubkey, commitment).await;
             }
             Response::Error(error) => {
                 metrics()
@@ -948,7 +940,7 @@ async fn get_program_accounts(
             Some(data) => {
                 let accounts = data.value();
                 if let Some(accounts) = accounts.get(commitment) {
-                    app_state.reset(Subscription::Program(pubkey), commitment);
+                    app_state.reset(Subscription::Program(pubkey, filters.clone()), commitment);
                     metrics().program_accounts_cache_hits.inc();
                     match program_accounts_response(
                         req.id.clone(),
@@ -1026,7 +1018,7 @@ async fn get_program_accounts(
                         let data = data.value();
                         metrics().program_accounts_cache_filled.inc();
                         if let Some(accounts) = data.get(commitment) {
-                            app_state.reset(Subscription::Program(pubkey), commitment);
+                            app_state.reset(Subscription::Program(pubkey, filters.clone()), commitment);
                             if let Ok(resp) = program_accounts_response(
                                 req.id.clone(),
                                 accounts,
@@ -1082,11 +1074,7 @@ async fn get_program_accounts(
                 let result: Vec<AccountAndPubkey> = serde_json::from_str(raw_result.value.get())?;
                 info!(%pubkey, slot = %raw_result.context.slot, ?commitment, "caching program");
                 app_state
-                    .subscribe(
-                        Subscription::Program(program_pubkey),
-                        commitment,
-                        filters.clone(),
-                    )
+                    .subscribe_program(program_pubkey, commitment, filters.clone())
                     .await;
 
                 let mut keys = HashSet::with_capacity(result.len());

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -16,11 +16,12 @@ use actix_http::ws;
 use bytes::BytesMut;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
+use slab::Slab;
 use smallvec::SmallVec;
 use tokio::stream::{Stream, StreamExt};
 use tokio::sync::mpsc;
 use tokio::time::{DelayQueue, Instant};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use crate::metrics::pubsub_metrics as metrics;
 use crate::types::{
@@ -35,24 +36,28 @@ const WEBSOCKET_PING_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug)]
 enum InflightRequest {
-    Sub(Subscription, Commitment),
-    Unsub(Subscription, Commitment),
+    Sub(SlabId),
+    Unsub(SlabId),
     SlotSub(u64),
 }
+
+type SlabId = usize;
 
 struct Meta {
     created_at: Instant,
     updated_at: Instant,
     first_slot: Option<Slot>,
+    slab_id: SlabId,
 }
 
 impl Meta {
-    fn new() -> Self {
+    fn new(slab_id: SlabId) -> Self {
         let now = Instant::now();
         Meta {
             created_at: now,
             updated_at: now,
             first_slot: None,
+            slab_id,
         }
     }
 
@@ -127,15 +132,32 @@ impl PubSubManager {
         addr.do_send(AccountCommand::Reset(sub, commitment))
     }
 
-    pub fn subscribe(
+    pub fn subscribe_account(&self, key: Pubkey, commitment: Commitment) {
+        let addr = self.get_addr_by_key(key);
+        let sub = Subscription::Account(key);
+        addr.do_send(AccountCommand::Subscribe(sub, commitment))
+    }
+
+    pub fn subscribe_program(
         &self,
-        sub: Subscription,
+        key: Pubkey,
         commitment: Commitment,
         filters: Option<smallvec::SmallVec<[Filter; 2]>>,
     ) {
+        let sub = Subscription::Program(key, filters);
         let addr = self.get_addr_by_key(sub.key());
-        addr.do_send(AccountCommand::Subscribe(sub, commitment, filters))
+        addr.do_send(AccountCommand::Subscribe(sub, commitment))
     }
+
+    // pub fn subscribe(
+    //     &self,
+    //     sub: Subscription,
+    //     commitment: Commitment,
+    //     filters: Option<smallvec::SmallVec<[Filter; 2]>>,
+    // ) {
+    //     let addr = self.get_addr_by_key(sub.key());
+    //     addr.do_send(AccountCommand::Subscribe(sub, commitment, filters))
+    // }
 }
 
 enum Connection {
@@ -165,14 +187,14 @@ pub(crate) struct AccountUpdateManager {
     request_id: u64,
     inflight: HashMap<u64, (InflightRequest, Instant)>,
     subs: HashMap<(Subscription, Commitment), Meta>,
+    sub_storage: Slab<(Subscription, Commitment)>,
     active_accounts: HashMap<(Pubkey, Commitment), Arc<Pubkey>>,
-    id_to_sub: HashMap<u64, (Subscription, Commitment)>,
-    sub_to_id: HashMap<(Subscription, Commitment), u64>,
+    id_to_sub: HashMap<u64, SlabId>,
+    sub_to_id: HashMap<SlabId, u64>,
     connection: Connection,
     accounts: AccountsDb,
     program_accounts: ProgramAccountsDb,
-    purge_queue: Option<DelayQueueHandle<(Subscription, Commitment)>>,
-    additional_keys: HashMap<(Pubkey, Commitment), HashSet<SmallVec<[Filter; 2]>>>,
+    purge_queue: Option<DelayQueueHandle<SlabId>>,
     last_received_at: Instant,
     active: Arc<AtomicBool>,
     buffer: BytesMut,
@@ -205,13 +227,13 @@ impl AccountUpdateManager {
             id_to_sub: HashMap::default(),
             sub_to_id: HashMap::default(),
             inflight: HashMap::default(),
+            sub_storage: Slab::new(),
             subs: HashMap::default(),
             active_accounts: HashMap::default(),
             request_id: 1,
             accounts: accounts.clone(),
             program_accounts: program_accounts.clone(),
             purge_queue: None,
-            additional_keys: HashMap::default(),
             active,
             last_received_at: Instant::now(),
             buffer: BytesMut::new(),
@@ -383,21 +405,23 @@ impl AccountUpdateManager {
             jsonrpc: &'a str,
             id: u64,
             method: &'a str,
-            params: SubscribeParams,
+            params: SubscribeParams<'a>,
         }
 
         #[derive(Serialize)]
-        struct Config {
+        struct Config<'a> {
             commitment: Commitment,
             encoding: Encoding,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            filters: Option<&'a SmallVec<[Filter; 2]>>,
         }
 
-        struct SubscribeParams {
+        struct SubscribeParams<'a> {
             key: Pubkey,
-            config: Config,
+            config: Config<'a>,
         }
 
-        impl Serialize for SubscribeParams {
+        impl Serialize for SubscribeParams<'_> {
             fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
             where
                 S: serde::Serializer,
@@ -410,16 +434,18 @@ impl AccountUpdateManager {
             }
         }
 
-        if self.subs.get(&(sub, commitment)).is_some() {
-            info!(self.actor_id, message = "already trying to subscribe", pubkey = %sub.key());
+        let key = (sub, commitment);
+        if self.subs.contains_key(&key) {
+            info!(self.actor_id, message = "already trying to subscribe", pubkey = %key.0.key());
             return Ok(());
         }
+        let (sub, commitment) = key;
 
         let request_id = self.next_request_id();
 
-        let (key, method) = match sub {
-            Subscription::Account(key) => (key, "accountSubscribe"),
-            Subscription::Program(key) => (key, "programSubscribe"),
+        let (key, method, filters) = match &sub {
+            Subscription::Account(key) => (key, "accountSubscribe", None),
+            Subscription::Program(key, ref filters) => (key, "programSubscribe", filters.as_ref()),
         };
         info!(
             self.actor_id,
@@ -435,24 +461,25 @@ impl AccountUpdateManager {
             id: request_id,
             method,
             params: SubscribeParams {
-                key,
+                key: *key,
                 config: Config {
                     commitment,
                     encoding: Encoding::Base64Zstd,
+                    filters,
                 },
             },
         };
 
-        self.inflight.insert(
-            request_id,
-            (InflightRequest::Sub(sub, commitment), Instant::now()),
-        );
-        self.subs.insert((sub, commitment), Meta::new());
+        let slab_id = self.sub_storage.insert((sub.clone(), commitment));
+        self.inflight
+            .insert(request_id, (InflightRequest::Sub(slab_id), Instant::now()));
+        self.subs
+            .insert((sub.clone(), commitment), Meta::new(slab_id));
         self.send(&request)?;
         self.purge_queue
             .as_ref()
             .unwrap()
-            .insert((sub, commitment), self.time_to_live);
+            .insert(slab_id, self.time_to_live);
         metrics()
             .subscribe_requests
             .with_label_values(&[&self.actor_name])
@@ -476,11 +503,25 @@ impl AccountUpdateManager {
             params: [u64; 1],
         }
 
-        if let Some(sub_id) = self.sub_to_id.get(&(sub, commitment)) {
-            info!(self.actor_id, message = "unsubscribe", key = %sub.key(), commitment = ?commitment, request_id = request_id);
+        let subscription = (sub, commitment);
+        let meta = self.subs.get(&subscription);
+        let sub_id = meta
+            .as_ref()
+            .map(|meta| self.sub_to_id.get(&meta.slab_id))
+            .flatten();
+
+        if let Some((meta, sub_id)) = meta.zip(sub_id) {
+            let (sub, commitment) = subscription;
+            info!(
+                self.actor_id,
+                message = "unsubscribe",
+                key = %sub.key(),
+                commitment = ?commitment,
+                request_id = request_id
+            );
 
             let method = match sub {
-                Subscription::Program(_) => "programUnsubscribe",
+                Subscription::Program(..) => "programUnsubscribe",
                 Subscription::Account(_) => "accountUnsubscribe",
             };
             let request = Request {
@@ -491,7 +532,7 @@ impl AccountUpdateManager {
             };
             self.inflight.insert(
                 request_id,
-                (InflightRequest::Unsub(sub, commitment), Instant::now()),
+                (InflightRequest::Unsub(meta.slab_id), Instant::now()),
             );
             self.send(&request)?;
         }
@@ -501,26 +542,13 @@ impl AccountUpdateManager {
     fn purge_key(&mut self, sub: &Subscription, commitment: Commitment) {
         info!(self.actor_id, message = "purge", key = %sub.key(), commitment = ?commitment);
         match sub {
-            Subscription::Program(program_key) => {
-                let keys = self
-                    .additional_keys
-                    .remove(&(*program_key, commitment))
-                    .into_iter()
-                    .flatten()
-                    .map(|filter| (program_key, Some(filter)))
-                    .chain(Some((program_key, None)));
-                for (key, filter) in keys {
-                    for key in self
-                        .program_accounts
-                        .remove_all(key, commitment, filter.clone())
-                    {
-                        self.accounts.remove(&key, commitment)
-                    }
+            Subscription::Program(program_key, filter) => {
+                for key in self
+                    .program_accounts
+                    .remove_all(program_key, commitment, filter.clone())
+                {
+                    self.accounts.remove(&key, commitment)
                 }
-                metrics()
-                    .additional_keys_entries
-                    .with_label_values(&[&self.actor_name])
-                    .set(self.additional_keys.len() as i64);
             }
             Subscription::Account(key) => {
                 self.accounts.remove(key, commitment);
@@ -566,34 +594,61 @@ impl AccountUpdateManager {
             } => {
                 if let Some((req, _time)) = self.inflight.remove(&id) {
                     match req {
-                        InflightRequest::Sub(sub, commitment) => {
-                            warn!(self.actor_id, request_id = id, error = ?error, key = %sub.key(), commitment = ?commitment, "subscribe failed");
-                            metrics()
-                                .subscribe_errors
-                                .with_label_values(&[&self.actor_name])
-                                .inc();
-                            self.subs.remove(&(sub, commitment));
-                            if sub.is_account() {
-                                self.active_accounts.remove(&(sub.key(), commitment));
+                        InflightRequest::Sub(slab_id) => {
+                            if let Some(key) = self.sub_storage.try_remove(slab_id) {
+                                self.subs.remove(&key);
+                                let (sub, commitment) = key;
+
+                                warn!(
+                                    self.actor_id,
+                                    request_id = id,
+                                    error = ?error,
+                                    key = %sub.key(),
+                                    commitment = ?commitment,
+                                    "subscribe failed"
+                                );
+                                metrics()
+                                    .subscribe_errors
+                                    .with_label_values(&[&self.actor_name])
+                                    .inc();
+
+                                if sub.is_account() {
+                                    self.active_accounts.remove(&(sub.key(), commitment));
+                                }
+                                self.purge_key(&sub, commitment);
+                            } else {
+                                error!(slab_id, "subscribe error to unknown slab_id");
                             }
-                            self.purge_key(&sub, commitment);
                         }
-                        InflightRequest::Unsub(sub, commitment) => {
-                            warn!(self.actor_id, request_id = id, error = ?error, key = %sub.key(), commitment = ?commitment, "unsubscribe failed");
-                            metrics()
-                                .unsubscribe_errors
-                                .with_label_values(&[&self.actor_name])
-                                .inc();
-                            // it's unclear if we're subscribed now or not, so remove subscription
-                            // *and* key to resubscribe later
-                            if let Some(id) = self.sub_to_id.remove(&(sub, commitment)) {
-                                self.id_to_sub.remove(&id);
+                        InflightRequest::Unsub(slab_id) => {
+                            if let Some(key) = self.sub_storage.try_remove(slab_id) {
+                                // it's unclear if we're subscribed now or not, so remove subscription
+                                // *and* key to resubscribe later
+                                if let Some(id) = self.sub_to_id.remove(&slab_id) {
+                                    self.id_to_sub.remove(&id);
+                                }
+                                self.subs.remove(&key);
+                                let (sub, commitment) = key;
+                                warn!(
+                                    self.actor_id,
+                                    request_id = id,
+                                    error = ?error,
+                                    key = %sub.key(),
+                                    commitment = ?commitment,
+                                    "unsubscribe failed"
+                                );
+                                metrics()
+                                    .unsubscribe_errors
+                                    .with_label_values(&[&self.actor_name])
+                                    .inc();
+
+                                if sub.is_account() {
+                                    self.active_accounts.remove(&(sub.key(), commitment));
+                                }
+                                self.purge_key(&sub, commitment);
+                            } else {
+                                error!(slab_id, "unsubscribe error to unknown slab_id");
                             }
-                            self.subs.remove(&(sub, commitment));
-                            if sub.is_account() {
-                                self.active_accounts.remove(&(sub.key(), commitment));
-                            }
-                            self.purge_key(&sub, commitment);
                         }
                         InflightRequest::SlotSub(_) => {
                             warn!(self.actor_id, request_id = id, error = ?error, "slot subscribe failed");
@@ -614,72 +669,88 @@ impl AccountUpdateManager {
             } => {
                 if let Some((req, sent_at)) = self.inflight.remove(&id) {
                     match req {
-                        InflightRequest::Sub(sub, commitment) => {
-                            let sub_id: u64 = serde_json::from_str(result.get())?;
-                            self.id_to_sub.insert(sub_id, (sub, commitment));
-                            self.sub_to_id.insert((sub, commitment), sub_id);
+                        InflightRequest::Sub(slab_id) => {
+                            if let Some((sub, commitment)) = self.sub_storage.get(slab_id) {
+                                let sub_id: u64 = serde_json::from_str(result.get())?;
+                                self.id_to_sub.insert(sub_id, slab_id);
+                                self.sub_to_id.insert(slab_id, sub_id);
 
-                            if let Subscription::Account(key) = sub {
-                                if let Some(key_ref) = self
-                                    .accounts
-                                    .get(&key)
-                                    .and_then(|data| data.get_ref(commitment))
-                                {
-                                    self.active_accounts.insert((key, commitment), key_ref);
+                                if let Subscription::Account(key) = sub {
+                                    if let Some(key_ref) = self
+                                        .accounts
+                                        .get(key)
+                                        .and_then(|data| data.get_ref(*commitment))
+                                    {
+                                        self.active_accounts.insert((*key, *commitment), key_ref);
+                                    }
                                 }
+
+                                metrics()
+                                    .id_sub_entries
+                                    .with_label_values(&[&self.actor_name])
+                                    .set(self.id_to_sub.len() as i64);
+
+                                metrics()
+                                    .sub_id_entries
+                                    .with_label_values(&[&self.actor_name])
+                                    .set(self.sub_to_id.len() as i64);
+
+                                info!(self.actor_id, message = "subscribed to stream",
+                                    sub_id = sub_id, sub = %sub, commitment = ?commitment, time = ?sent_at.elapsed());
+                                metrics()
+                                    .time_to_subscribe
+                                    .with_label_values(&[&self.actor_name])
+                                    .observe(sent_at.elapsed().as_secs_f64());
+                                metrics()
+                                    .subscriptions_active
+                                    .with_label_values(&[&self.actor_name])
+                                    .inc();
+                            } else {
+                                error!(slab_id, "subcribe result to unknown slab_id");
                             }
-
-                            metrics()
-                                .id_sub_entries
-                                .with_label_values(&[&self.actor_name])
-                                .set(self.id_to_sub.len() as i64);
-
-                            metrics()
-                                .sub_id_entries
-                                .with_label_values(&[&self.actor_name])
-                                .set(self.sub_to_id.len() as i64);
-
-                            info!(self.actor_id, message = "subscribed to stream",
-                                sub_id = sub_id, sub = %sub, commitment = ?commitment, time = ?sent_at.elapsed());
-                            metrics()
-                                .time_to_subscribe
-                                .with_label_values(&[&self.actor_name])
-                                .observe(sent_at.elapsed().as_secs_f64());
-                            metrics()
-                                .subscriptions_active
-                                .with_label_values(&[&self.actor_name])
-                                .inc();
                         }
-                        InflightRequest::Unsub(sub, commitment) => {
+                        InflightRequest::Unsub(slab_id) => {
                             let is_ok: bool = serde_json::from_str(result.get())?;
                             if is_ok {
-                                if let Some(sub_id) = self.sub_to_id.remove(&(sub, commitment)) {
-                                    self.id_to_sub.remove(&sub_id);
-                                    let created_at = self.subs.remove(&(sub, commitment));
-                                    if sub.is_account() {
-                                        self.active_accounts.remove(&(sub.key(), commitment));
-                                    }
-                                    info!(
-                                        self.actor_id,
-                                        message = "unsubscribed from stream",
-                                        sub_id = sub_id,
-                                        key = %sub.key(),
-                                        sub = %sub,
-                                        time = ?sent_at.elapsed(),
-                                    );
-                                    metrics()
-                                        .subscriptions_active
-                                        .with_label_values(&[&self.actor_name])
-                                        .dec();
-                                    if let Some(times) = created_at {
+                                let key = self.sub_storage.try_remove(slab_id);
+                                let sub_id = self.sub_to_id.remove(&slab_id);
+
+                                match (key, sub_id) {
+                                    (Some(key), Some(sub_id)) => {
+                                        self.id_to_sub.remove(&sub_id);
+                                        let created_at = self.subs.remove(&key);
+                                        let (sub, commitment) = key;
+
+                                        if sub.is_account() {
+                                            self.active_accounts.remove(&(sub.key(), commitment));
+                                        }
+                                        info!(
+                                            self.actor_id,
+                                            message = "unsubscribed from stream",
+                                            sub_id = sub_id,
+                                            key = %sub.key(),
+                                            sub = %sub,
+                                            time = ?sent_at.elapsed(),
+                                        );
                                         metrics()
-                                            .subscription_lifetime
-                                            .observe(times.since_creation().as_secs_f64());
+                                            .subscriptions_active
+                                            .with_label_values(&[&self.actor_name])
+                                            .dec();
+                                        if let Some(times) = created_at {
+                                            metrics()
+                                                .subscription_lifetime
+                                                .observe(times.since_creation().as_secs_f64());
+                                        }
+                                        self.purge_key(&sub, commitment);
                                     }
-                                    self.purge_key(&sub, commitment);
-                                } else {
-                                    warn!(self.actor_id, sub = %sub, commitment = ?commitment, "unsubscribe for unknown subscription");
+                                    (Some((sub, commitment)), None) => {
+                                        warn!(self.actor_id, sub = %sub, commitment = ?commitment, "unsubscribe for unknown subscription");
+                                    }
+                                    _ => {
+                                        warn!(slab_id, "unsubscribe for unknown subscription");
+                                    }
                                 }
+
                                 metrics()
                                     .id_sub_entries
                                     .with_label_values(&[&self.actor_name])
@@ -690,7 +761,7 @@ impl AccountUpdateManager {
                                     .with_label_values(&[&self.actor_name])
                                     .set(self.sub_to_id.len() as i64);
                             } else {
-                                warn!(self.actor_id, message = "unsubscribe failed", key = %sub.key());
+                                warn!(self.actor_id, message = "unsubscribe failed", slab_id = %slab_id);
                             }
                         }
                         InflightRequest::SlotSub(_) => {
@@ -714,7 +785,12 @@ impl AccountUpdateManager {
                             subscription: u64,
                         }
                         let params: Params = serde_json::from_str(params.get())?;
-                        if let Some((sub, commitment)) = self.id_to_sub.get(&params.subscription) {
+                        let subscription = self
+                            .id_to_sub
+                            .get(&params.subscription)
+                            .map(|id| self.sub_storage.get(*id))
+                            .flatten();
+                        if let Some((sub, commitment)) = subscription {
                             //info!(key = %sub.key(), "received account notification");
                             self.accounts.insert(sub.key(), params.result, *commitment);
                         } else {
@@ -746,53 +822,27 @@ impl AccountUpdateManager {
                             subscription: u64,
                         }
                         let params: Params = serde_json::from_str(params.get())?;
-                        if let Some((program_sub, commitment)) =
-                            self.id_to_sub.get(&params.subscription)
-                        {
-                            if let Some(meta) = self.subs.get_mut(&(*program_sub, *commitment)) {
+                        let sub_storage = &self.sub_storage; // So we can borrow mutably self.subs later
+                        let subscription = self
+                            .id_to_sub
+                            .get(&params.subscription)
+                            .map(|id| sub_storage.get(*id))
+                            .flatten();
+
+                        if let Some(key) = subscription {
+                            if let Some(meta) = self.subs.get_mut(key) {
                                 if meta.first_slot.is_none() {
-                                    let (key, slot) =
-                                        (program_sub.key(), params.result.context.slot);
+                                    let (key, slot) = (key.0.key(), params.result.context.slot);
                                     info!(program = %key, slot, "first update for program");
                                     meta.first_slot.replace(slot);
                                 }
                             }
-                            let program_key = program_sub.key();
-                            let key = params.result.value.pubkey;
-                            let account_info = &params.result.value.account;
-                            let data = &account_info.data;
 
-                            let mut filter_groups = Vec::new();
-                            if let Some(filters) =
-                                self.additional_keys.get(&(program_key, *commitment))
-                            {
-                                let filtration_starts = Instant::now();
-                                for filter_group in filters {
-                                    if filter_group.iter().all(|f| f.matches(data)) {
-                                        /*
-                                        self.program_accounts.add(
-                                            &program_key,
-                                            key_ref,
-                                            Some(filter_group.clone()),
-                                            *commitment,
-                                        );
-                                        */
-                                        filter_groups.push(filter_group.clone());
-                                    } else {
-                                        debug!(self.actor_id, account = %key, program = %program_key, "account was removed from filtered list");
-                                        self.program_accounts.remove(
-                                            &program_key,
-                                            &key,
-                                            filter_group.clone(),
-                                            *commitment,
-                                        );
-                                    }
-                                }
-                                metrics()
-                                    .filtration_time
-                                    .with_label_values(&[&self.actor_name])
-                                    .observe(filtration_starts.elapsed().as_micros() as f64);
-                            }
+                            let (program_sub, commitment) = key;
+                            let program_key = program_sub.key();
+                            let filters = program_sub.filters();
+                            let key = params.result.value.pubkey;
+
                             let key_ref = self.accounts.insert(
                                 key,
                                 AccountContext {
@@ -808,17 +858,9 @@ impl AccountUpdateManager {
                             self.program_accounts.add(
                                 &program_key,
                                 key_ref.clone(),
-                                None,
+                                filters.cloned(),
                                 *commitment,
                             );
-                            for group in filter_groups.into_iter() {
-                                self.program_accounts.add(
-                                    &program_key,
-                                    key_ref.clone(),
-                                    Some(group),
-                                    *commitment,
-                                );
-                            }
                             // important for proper removal
                             drop(key_ref);
                             self.accounts.remove(&key, *commitment);
@@ -921,54 +963,49 @@ impl Handler<AccountCommand> for AccountUpdateManager {
     fn handle(&mut self, item: AccountCommand, _ctx: &mut Context<Self>) {
         let _ = (|| -> Result<(), serde_json::Error> {
             match item {
-                AccountCommand::Subscribe(sub, commitment, filters) => {
-                    let key = sub.key();
+                AccountCommand::Subscribe(sub, commitment) => {
                     metrics()
                         .commands
                         .with_label_values(&[&self.actor_name, "subscribe"])
                         .inc();
                     self.subscribe(sub, commitment)?;
-                    if let Some(filters) = filters {
-                        self.additional_keys
-                            .entry((key, commitment))
-                            .or_default()
-                            .insert(filters);
-                        metrics()
-                            .additional_keys_entries
-                            .with_label_values(&[&self.actor_name])
-                            .set(self.additional_keys.len() as i64);
-                    }
                 }
-                AccountCommand::Purge(sub, commitment) => {
+                AccountCommand::Purge(slab_id) => {
                     metrics()
                         .commands
                         .with_label_values(&[&self.actor_name, "purge"])
                         .inc();
 
-                    if self.connection.is_connected() {
-                        self.unsubscribe(sub, commitment)?;
-                    } else {
-                        self.subs.remove(&(sub, commitment));
+                    if let Some(subscription) = self.sub_storage.get(slab_id).cloned() {
+                        if self.connection.is_connected() {
+                            self.unsubscribe(subscription.0.clone(), subscription.1)?;
+                        } else {
+                            self.subs.remove(&subscription);
+                            self.sub_storage.try_remove(slab_id);
+                        }
+
+                        let (sub, commitment) = subscription;
+                        if sub.is_account() {
+                            self.active_accounts.remove(&(sub.key(), commitment));
+                        }
+                        self.purge_key(&sub, commitment);
                     }
-                    if sub.is_account() {
-                        self.active_accounts.remove(&(sub.key(), commitment));
-                    }
-                    self.purge_key(&sub, commitment);
                 }
-                AccountCommand::Reset(key, commitment) => {
+                AccountCommand::Reset(sub, commitment) => {
                     metrics()
                         .commands
                         .with_label_values(&[&self.actor_name, "reset"])
                         .inc();
-                    if let Some(time) = self.subs.get_mut(&(key, commitment)) {
+                    let key = (sub, commitment);
+                    if let Some(meta) = self.subs.get_mut(&key) {
                         metrics()
                             .time_until_reset
-                            .observe(time.update().as_secs_f64());
+                            .observe(meta.update().as_secs_f64());
+                        self.purge_queue
+                            .as_ref()
+                            .unwrap()
+                            .reset(meta.slab_id, self.time_to_live);
                     }
-                    self.purge_queue
-                        .as_ref()
-                        .unwrap()
-                        .reset((key, commitment), self.time_to_live);
                 }
             }
             Ok(())
@@ -1105,7 +1142,7 @@ impl Actor for AccountUpdateManager {
 
     fn started(&mut self, ctx: &mut Context<Self>) {
         let (handle, stream) = delay_queue(self.actor_name.clone());
-        let purge_stream = stream.map(|(sub, com)| AccountCommand::Purge(sub, com));
+        let purge_stream = stream.map(AccountCommand::Purge);
 
         ctx.set_mailbox_capacity(MAILBOX_CAPACITY);
 
@@ -1142,22 +1179,30 @@ impl actix::io::WriteHandler<awc::error::WsProtocolError> for AccountUpdateManag
     }
 }
 
-#[derive(Debug, Eq, PartialEq, Copy, Clone, Hash)]
+#[derive(Debug, Eq, PartialEq, Clone, Hash)]
+#[allow(clippy::large_enum_variant)] // FIXME!!!
 pub(crate) enum Subscription {
     Account(Pubkey),
-    Program(Pubkey),
+    Program(Pubkey, Option<SmallVec<[Filter; 2]>>),
 }
 
 impl Subscription {
     pub fn key(&self) -> Pubkey {
         match *self {
             Subscription::Account(key) => key,
-            Subscription::Program(key) => key,
+            Subscription::Program(key, ..) => key,
         }
     }
 
     pub fn is_account(&self) -> bool {
         matches!(self, Subscription::Account(_))
+    }
+
+    pub fn filters(&self) -> Option<&SmallVec<[Filter; 2]>> {
+        match self {
+            Subscription::Program(_, filters) => filters.as_ref(),
+            _ => None,
+        }
     }
 }
 
@@ -1165,8 +1210,9 @@ impl std::fmt::Display for Subscription {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let (prefix, key) = match self {
             Subscription::Account(key) => ("Account", key),
-            Subscription::Program(key) => ("Program", key),
+            Subscription::Program(key, ..) => ("Program", key),
         };
+        // TODO: add filters
         write!(f, "{}({})", prefix, key)
     }
 }
@@ -1174,9 +1220,9 @@ impl std::fmt::Display for Subscription {
 #[derive(Message, Debug)]
 #[rtype(result = "()")]
 pub(crate) enum AccountCommand {
-    Subscribe(Subscription, Commitment, Option<SmallVec<[Filter; 2]>>),
+    Subscribe(Subscription, Commitment),
     Reset(Subscription, Commitment),
-    Purge(Subscription, Commitment),
+    Purge(SlabId),
 }
 
 enum DelayQueueCommand<T> {
