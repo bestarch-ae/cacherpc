@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::Deserialize;
 use smallvec::{smallvec, SmallVec};
 
@@ -5,15 +7,20 @@ use crate::types::AccountData;
 
 #[cfg_attr(test, macro_use)]
 mod filters;
+mod tree;
 
 pub(crate) use filters::{Filters, NormalizeError};
+pub(crate) use tree::FilterTree;
+
+type Range = (usize, usize);
+type Pattern = SmallVec<[u8; 128]>;
 
 #[derive(Deserialize, Debug, Hash, Eq, PartialEq, Clone, Ord, PartialOrd)]
 #[serde(rename_all = "camelCase")]
 pub struct Memcmp {
     pub offset: usize,
     #[serde(deserialize_with = "decode_base58")]
-    pub bytes: SmallVec<[u8; 128]>,
+    pub bytes: Pattern,
 }
 
 impl Memcmp {
@@ -25,7 +32,7 @@ impl Memcmp {
         }
     }
 
-    fn range(&self) -> (usize, usize) {
+    fn range(&self) -> Range {
         (self.offset, self.offset + self.bytes.len())
     }
 }
@@ -79,6 +86,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
 
     #[test]
