@@ -1,5 +1,6 @@
 use bytes::Bytes;
-use cache_rpc::types::{AccountData, AccountInfo, Filter};
+use cache_rpc::filter::Filter;
+use cache_rpc::types::{AccountData, AccountInfo};
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use rand::prelude::*;
 use smallvec::SmallVec;

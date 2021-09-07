@@ -24,10 +24,11 @@ use tokio::sync::{Notify, Semaphore};
 use tracing::{debug, error, info, warn};
 
 use crate::accounts::Subscription;
+use crate::filter::Filter;
 use crate::metrics::rpc_metrics as metrics;
 use crate::types::{
     AccountContext, AccountData, AccountInfo, AccountState, AccountsDb, BytesChain, Commitment,
-    Encoding, Filter, ProgramAccountsDb, Pubkey, SolanaContext,
+    Encoding, ProgramAccountsDb, Pubkey, SolanaContext,
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);

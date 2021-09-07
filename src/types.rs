@@ -7,8 +7,9 @@ use dashmap::mapref::entry::Entry;
 use dashmap::{mapref::one::Ref, DashMap};
 use either::Either;
 use serde::{Deserialize, Serialize};
-use smallvec::{smallvec, SmallVec};
+use smallvec::SmallVec;
 
+use crate::filter::Filter;
 use crate::metrics::db_metrics as metrics;
 
 pub struct ProgramState([Option<HashSet<Arc<Pubkey>>>; 3]);
@@ -482,63 +483,6 @@ impl<'de> Deserialize<'de> for Pubkey {
     }
 }
 
-#[derive(Deserialize, Debug, Hash, Eq, PartialEq, Clone, Ord, PartialOrd)]
-#[serde(rename_all = "camelCase")]
-pub enum Filter {
-    DataSize(u64),
-    Memcmp {
-        offset: usize,
-        #[serde(deserialize_with = "decode_base58")]
-        bytes: SmallVec<[u8; 128]>,
-    },
-}
-
-fn decode_base58<'de, D>(de: D) -> Result<SmallVec<[u8; 128]>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    struct Base58Visitor;
-    impl<'de> serde::de::Visitor<'de> for Base58Visitor {
-        type Value = SmallVec<[u8; 128]>;
-
-        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("string")
-        }
-
-        fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
-        where
-            E: serde::de::Error,
-        {
-            use serde::de::Error;
-            let mut buf = smallvec![0; 128];
-            let len = bs58::decode(v)
-                .into(&mut buf)
-                .map_err(|_| Error::custom("can't b58decode"))?;
-            if len > 128 {
-                return Err(Error::custom("bad size"));
-            }
-            buf.truncate(len);
-            Ok(buf)
-        }
-    }
-    de.deserialize_str(Base58Visitor)
-}
-
-impl Filter {
-    pub fn matches(&self, data: &AccountData) -> bool {
-        match self {
-            Filter::DataSize(len) => data.data.len() as u64 == *len,
-            Filter::Memcmp { offset, bytes } => {
-                let len = bytes.len();
-                match data.data.get(*offset..*offset + len) {
-                    Some(slice) => slice == &bytes[..len],
-                    None => false,
-                }
-            }
-        }
-    }
-}
-
 #[derive(Debug)]
 pub struct AccountData {
     pub data: Bytes,
@@ -687,16 +631,6 @@ impl std::io::Read for BytesChain {
             }
         }
     }
-}
-
-#[test]
-fn filters_order() {
-    let f1 = Filter::Memcmp {
-        offset: 1,
-        bytes: SmallVec::new(),
-    };
-    let f2 = Filter::DataSize(0);
-    assert!(f2 < f1);
 }
 
 #[test]

@@ -22,10 +22,11 @@ use tokio::sync::mpsc;
 use tokio::time::{DelayQueue, Instant};
 use tracing::{debug, error, info, warn};
 
+use crate::filter::Filter;
 use crate::metrics::pubsub_metrics as metrics;
 use crate::types::{
-    AccountContext, AccountInfo, AccountsDb, Commitment, Encoding, Filter, ProgramAccountsDb,
-    Pubkey, Slot, SolanaContext,
+    AccountContext, AccountInfo, AccountsDb, Commitment, Encoding, ProgramAccountsDb, Pubkey, Slot,
+    SolanaContext,
 };
 
 const MAILBOX_CAPACITY: usize = 512;
