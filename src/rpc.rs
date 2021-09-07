@@ -24,7 +24,7 @@ use tokio::sync::{Notify, Semaphore};
 use tracing::{debug, error, info, warn};
 
 use crate::accounts::Subscription;
-use crate::filter::Filter;
+use crate::filter::{Filter, Filters};
 use crate::metrics::rpc_metrics as metrics;
 use crate::types::{
     AccountContext, AccountData, AccountInfo, AccountState, AccountsDb, BytesChain, Commitment,
@@ -206,12 +206,7 @@ pub struct State {
 }
 
 impl State {
-    fn reset(
-        &self,
-        sub: Subscription,
-        commitment: Commitment,
-        filters: Option<SmallVec<[Filter; 2]>>,
-    ) {
+    fn reset(&self, sub: Subscription, commitment: Commitment, filters: Option<Filters>) {
         self.pubsub.reset(sub, commitment, filters);
     }
 
@@ -227,7 +222,7 @@ impl State {
         &self,
         subscription: Subscription,
         commitment: Commitment,
-        filters: Option<SmallVec<[Filter; 2]>>,
+        filters: Option<Filters>,
     ) {
         self.pubsub.subscribe(subscription, commitment, filters);
         /*
@@ -836,7 +831,7 @@ fn program_accounts_response<'a>(
     req_id: Id<'a>,
     accounts: &HashSet<Arc<Pubkey>>,
     config: &'_ ProgramAccountsConfig<'_>,
-    filters: Option<impl AsRef<[Filter]>>,
+    filters: Option<&'a Filters>,
     app_state: &web::Data<State>,
     with_context: bool,
 ) -> Result<HttpResponse, ProgramAccountsResponseError> {
@@ -900,7 +895,7 @@ fn program_accounts_response<'a>(
             }
 
             if let Some(filters) = &filters {
-                let matches = filters.as_ref().iter().all(|f| {
+                let matches = filters.iter().all(|f| {
                     account_info
                         .map(|val| f.matches(&val.data))
                         .unwrap_or(false)
@@ -979,7 +974,7 @@ async fn get_program_accounts(
         .transpose()?
         .map(|mut filters: SmallVec<[Filter; 2]>| {
             filters.sort_unstable();
-            filters
+            Filters::new(filters)
         });
 
     if config.encoding != Encoding::JsonParsed && app_state.subscription_active(pubkey) {

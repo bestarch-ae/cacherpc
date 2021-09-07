@@ -16,13 +16,12 @@ use actix_http::ws;
 use bytes::BytesMut;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
-use smallvec::SmallVec;
 use tokio::stream::{Stream, StreamExt};
 use tokio::sync::mpsc;
 use tokio::time::{DelayQueue, Instant};
 use tracing::{debug, error, info, warn};
 
-use crate::filter::Filter;
+use crate::filter::Filters;
 use crate::metrics::pubsub_metrics as metrics;
 use crate::types::{
     AccountContext, AccountInfo, AccountsDb, Commitment, Encoding, ProgramAccountsDb, Pubkey, Slot,
@@ -123,22 +122,12 @@ impl PubSubManager {
         self.0[idx].1.load(Ordering::Relaxed)
     }
 
-    pub fn reset(
-        &self,
-        sub: Subscription,
-        commitment: Commitment,
-        filters: Option<smallvec::SmallVec<[Filter; 2]>>,
-    ) {
+    pub fn reset(&self, sub: Subscription, commitment: Commitment, filters: Option<Filters>) {
         let addr = self.get_addr_by_key(sub.key());
         addr.do_send(AccountCommand::Reset(sub, commitment, filters))
     }
 
-    pub fn subscribe(
-        &self,
-        sub: Subscription,
-        commitment: Commitment,
-        filters: Option<smallvec::SmallVec<[Filter; 2]>>,
-    ) {
+    pub fn subscribe(&self, sub: Subscription, commitment: Commitment, filters: Option<Filters>) {
         let addr = self.get_addr_by_key(sub.key());
         addr.do_send(AccountCommand::Subscribe(sub, commitment, filters))
     }
@@ -163,7 +152,7 @@ impl Connection {
     }
 }
 
-type ProgramFilters = HashMap<(Pubkey, Commitment), HashMap<SmallVec<[Filter; 2]>, SpawnHandle>>;
+type ProgramFilters = HashMap<(Pubkey, Commitment), HashMap<Filters, SpawnHandle>>;
 
 pub struct AccountUpdateManager {
     websocket_url: String,
@@ -511,7 +500,7 @@ impl AccountUpdateManager {
         ctx: &mut Context<Self>,
         sub: Subscription,
         commitment: Commitment,
-        filters: SmallVec<[Filter; 2]>,
+        filters: Filters,
     ) {
         let key = sub.key();
         let handle = self
@@ -551,7 +540,7 @@ impl AccountUpdateManager {
         ctx: &mut Context<Self>,
         sub: Subscription,
         commitment: Commitment,
-        filters: SmallVec<[Filter; 2]>,
+        filters: Filters,
     ) {
         let key = sub.key();
         info!(key = %sub.key(), commitment = ?commitment, filter = ?filters, "purging filters");
@@ -1256,8 +1245,8 @@ impl std::fmt::Display for Subscription {
 #[derive(Message, Debug)]
 #[rtype(result = "()")]
 pub enum AccountCommand {
-    Subscribe(Subscription, Commitment, Option<SmallVec<[Filter; 2]>>),
-    Reset(Subscription, Commitment, Option<SmallVec<[Filter; 2]>>),
+    Subscribe(Subscription, Commitment, Option<Filters>),
+    Reset(Subscription, Commitment, Option<Filters>),
     Purge(Subscription, Commitment),
 }
 

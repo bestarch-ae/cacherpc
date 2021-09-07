@@ -7,9 +7,8 @@ use dashmap::mapref::entry::Entry;
 use dashmap::{mapref::one::Ref, DashMap};
 use either::Either;
 use serde::{Deserialize, Serialize};
-use smallvec::SmallVec;
 
-use crate::filter::Filter;
+use crate::filter::Filters;
 use crate::metrics::db_metrics as metrics;
 
 pub struct ProgramState([Option<HashSet<Arc<Pubkey>>>; 3]);
@@ -62,7 +61,7 @@ impl Default for ProgramState {
     }
 }
 
-type ProgramAccountsKey = (Pubkey, Option<SmallVec<[Filter; 2]>>);
+type ProgramAccountsKey = (Pubkey, Option<Filters>);
 
 #[derive(Clone)]
 pub struct ProgramAccountsDb {
@@ -85,7 +84,7 @@ impl ProgramAccountsDb {
     pub fn get(
         &self,
         key: &Pubkey,
-        filters: Option<SmallVec<[Filter; 2]>>,
+        filters: Option<Filters>,
     ) -> Option<Ref<'_, ProgramAccountsKey, ProgramState>> {
         if let Some(found) = self.map.get(&(*key, filters)) {
             Some(found)
@@ -99,7 +98,7 @@ impl ProgramAccountsDb {
         key: Pubkey,
         data: HashSet<Arc<Pubkey>>,
         commitment: Commitment,
-        filters: Option<SmallVec<[Filter; 2]>>,
+        filters: Option<Filters>,
     ) {
         let mut entry = self.map.entry((key, filters)).or_default();
         entry.insert(commitment, data);
@@ -113,7 +112,7 @@ impl ProgramAccountsDb {
         &self,
         key: &Pubkey,
         data: Arc<Pubkey>,
-        filters: Option<SmallVec<[Filter; 2]>>,
+        filters: Option<Filters>,
         commitment: Commitment,
     ) -> bool {
         let mut added = false;
@@ -137,7 +136,7 @@ impl ProgramAccountsDb {
         &self,
         key: &Pubkey,
         commitment: Commitment,
-        filters: Option<SmallVec<[Filter; 2]>>,
+        filters: Option<Filters>,
     ) -> impl Iterator<Item = Pubkey> {
         let iter = if let Entry::Occupied(mut entry) = self.map.entry((*key, filters)) {
             let state = entry.get_mut();
@@ -159,7 +158,7 @@ impl ProgramAccountsDb {
         &self,
         program_key: &Pubkey,
         account_key: &Pubkey,
-        filters: SmallVec<[Filter; 2]>,
+        filters: Filters,
         commitment: Commitment,
     ) {
         if let Entry::Occupied(mut entry) = self.map.entry((*program_key, Some(filters))) {
