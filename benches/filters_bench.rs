@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use cache_rpc::filter::Filter;
+use cache_rpc::filter::{Filter, Memcmp};
 use cache_rpc::types::{AccountData, AccountInfo};
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use rand::prelude::*;
@@ -39,10 +39,10 @@ fn test_filter_group(bytes: &[u8]) -> SmallVec<[Filter; 2]> {
                 .collect()
         });
 
-    let f1 = Filter::Memcmp {
+    let f1 = Filter::Memcmp(Memcmp {
         offset,
         bytes: slice,
-    };
+    });
     let f2 = Filter::DataSize(rng.gen_range(limit / 2..(limit * 2)) as u64);
     SmallVec::from([f2, f1])
 }

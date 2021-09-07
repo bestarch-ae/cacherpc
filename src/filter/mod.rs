@@ -5,26 +5,34 @@ use crate::types::AccountData;
 
 #[derive(Deserialize, Debug, Hash, Eq, PartialEq, Clone, Ord, PartialOrd)]
 #[serde(rename_all = "camelCase")]
+pub struct Memcmp {
+    pub offset: usize,
+    #[serde(deserialize_with = "decode_base58")]
+    pub bytes: SmallVec<[u8; 128]>,
+}
+
+impl Memcmp {
+    pub(crate) fn matches(&self, data: &AccountData) -> bool {
+        let len = self.bytes.len();
+        match data.data.get(self.offset..self.offset + len) {
+            Some(slice) => slice == &self.bytes[..len],
+            None => false,
+        }
+    }
+}
+
+#[derive(Deserialize, Debug, Hash, Eq, PartialEq, Clone, Ord, PartialOrd)]
+#[serde(rename_all = "camelCase")]
 pub enum Filter {
     DataSize(u64),
-    Memcmp {
-        offset: usize,
-        #[serde(deserialize_with = "decode_base58")]
-        bytes: SmallVec<[u8; 128]>,
-    },
+    Memcmp(Memcmp),
 }
 
 impl Filter {
     pub fn matches(&self, data: &AccountData) -> bool {
         match self {
             Filter::DataSize(len) => data.data.len() as u64 == *len,
-            Filter::Memcmp { offset, bytes } => {
-                let len = bytes.len();
-                match data.data.get(*offset..*offset + len) {
-                    Some(slice) => slice == &bytes[..len],
-                    None => false,
-                }
-            }
+            Filter::Memcmp(memcmp) => memcmp.matches(data),
         }
     }
 }
@@ -66,10 +74,10 @@ mod tests {
 
     #[test]
     fn filters_order() {
-        let f1 = Filter::Memcmp {
+        let f1 = Filter::Memcmp(Memcmp {
             offset: 1,
             bytes: SmallVec::new(),
-        };
+        });
         let f2 = Filter::DataSize(0);
         assert!(f2 < f1);
     }
@@ -80,13 +88,13 @@ mod tests {
             r#"{"memcmp":{"offset":13,"bytes":"HWHvQhFmJB3NUcu1aihKmrKegfVxBEHzwVX6yZCKEsi1"}}"#,
         )
         .unwrap();
-        let expected = Filter::Memcmp {
+        let expected = Filter::Memcmp(Memcmp {
             offset: 13,
             bytes: smallvec::smallvec![
                 245, 59, 247, 123, 252, 249, 77, 70, 227, 252, 215, 248, 153, 192, 98, 123, 28,
                 232, 159, 173, 44, 138, 177, 107, 137, 62, 126, 139, 186, 244, 124, 90
             ],
-        };
+        });
         assert_eq!(filter, expected);
 
         let filter: Filter = serde_json::from_str(r#"{"dataSize":42069}"#).unwrap();
