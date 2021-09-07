@@ -3,18 +3,10 @@ use smallvec::{smallvec, SmallVec};
 
 use crate::types::AccountData;
 
-#[derive(Deserialize, Debug, Hash, Eq, PartialEq, Clone, Ord, PartialOrd)]
-pub struct Filters(SmallVec<[Filter; 2]>);
+#[cfg_attr(test, macro_use)]
+mod filters;
 
-impl Filters {
-    pub fn new(filters: SmallVec<[Filter; 2]>) -> Self {
-        Self(filters)
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = &'_ Filter> {
-        self.0.iter()
-    }
-}
+pub(crate) use filters::{Filters, NormalizeError};
 
 #[derive(Deserialize, Debug, Hash, Eq, PartialEq, Clone, Ord, PartialOrd)]
 #[serde(rename_all = "camelCase")]
@@ -31,6 +23,10 @@ impl Memcmp {
             Some(slice) => slice == &self.bytes[..len],
             None => false,
         }
+    }
+
+    fn range(&self) -> (usize, usize) {
+        (self.offset, self.offset + self.bytes.len())
     }
 }
 

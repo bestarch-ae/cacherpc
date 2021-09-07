@@ -24,7 +24,7 @@ use tokio::sync::{Notify, Semaphore};
 use tracing::{debug, error, info, warn};
 
 use crate::accounts::Subscription;
-use crate::filter::{Filter, Filters};
+use crate::filter::{Filters, NormalizeError};
 use crate::metrics::rpc_metrics as metrics;
 use crate::types::{
     AccountContext, AccountData, AccountInfo, AccountState, AccountsDb, BytesChain, Commitment,
@@ -895,11 +895,8 @@ fn program_accounts_response<'a>(
             }
 
             if let Some(filters) = &filters {
-                let matches = filters.iter().all(|f| {
-                    account_info
-                        .map(|val| f.matches(&val.data))
-                        .unwrap_or(false)
-                });
+                let matches = account_info.map_or(false, |acc| filters.matches(&acc.data));
+
                 if !matches {
                     debug!(pubkey = ?data.key(), "skipped because of filter");
                     continue;
@@ -970,12 +967,27 @@ async fn get_program_accounts(
     let filters = config
         .filters
         .map(RawValue::get)
-        .map(serde_json::from_str)
+        .map(serde_json::from_str::<SmallVec<[_; 3]>>)
         .transpose()?
-        .map(|mut filters: SmallVec<[Filter; 2]>| {
-            filters.sort_unstable();
-            Filters::new(filters)
-        });
+        .map(Filters::new_normalized);
+
+    let filters = match filters {
+        Some(Ok(filters)) => Some(filters),
+        Some(Err(NormalizeError::Empty)) | None => None,
+        Some(Err(err)) => {
+            warn!(%err, "received bad filters. empty response");
+            // TODO: consider just opting-out from caching this request
+            return program_accounts_response(
+                req.id.clone(),
+                &HashSet::new(), // This does not allocate
+                &config,
+                None,
+                &app_state,
+                return_context,
+            )
+            .map_err(|_| Error::InvalidRequest(None, None));
+        }
+    };
 
     if config.encoding != Encoding::JsonParsed && app_state.subscription_active(pubkey) {
         match app_state.program_accounts.get(&pubkey, filters.clone()) {

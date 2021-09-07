@@ -844,7 +844,7 @@ impl AccountUpdateManager {
                             {
                                 let filtration_starts = Instant::now();
                                 for filter_group in filters.keys() {
-                                    if filter_group.iter().all(|f| f.matches(data)) {
+                                    if filter_group.matches(data) {
                                         /*
                                         self.program_accounts.add(
                                             &program_key,
