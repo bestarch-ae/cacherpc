@@ -510,6 +510,10 @@ impl AccountUpdateManager {
                     .map(|filter| (program_key, Some(filter)))
                     .chain(Some((program_key, None)));
                 for (key, filter) in keys {
+                    metrics()
+                        .filters
+                        .with_label_values(&[&self.actor_name])
+                        .dec();
                     for key in self
                         .program_accounts
                         .remove_all(key, commitment, filter.clone())
@@ -929,7 +933,8 @@ impl Handler<AccountCommand> for AccountUpdateManager {
                         .inc();
                     self.subscribe(sub, commitment)?;
                     if let Some(filters) = filters {
-                        self.additional_keys
+                        let added = self
+                            .additional_keys
                             .entry((key, commitment))
                             .or_default()
                             .insert(filters);
@@ -937,6 +942,13 @@ impl Handler<AccountCommand> for AccountUpdateManager {
                             .additional_keys_entries
                             .with_label_values(&[&self.actor_name])
                             .set(self.additional_keys.len() as i64);
+                        if added {
+                            metrics()
+                                .filters
+                                .with_label_values(&[&self.actor_name])
+                                .inc();
+                            debug!(key = %sub.key(), "filter added");
+                        }
                     }
                 }
                 AccountCommand::Purge(sub, commitment) => {
@@ -1088,7 +1100,7 @@ impl StreamHandler<Result<awc::ws::Frame, awc::error::WsProtocolError>> for Acco
         let subs = std::mem::replace(&mut self.subs, HashMap::with_capacity(subs_len));
 
         for ((sub, commitment), _) in subs {
-            self.subscribe(sub, commitment).unwrap()
+            self.subscribe(sub, commitment).unwrap();
             // TODO: it would be nice to retrieve current state for
             // everything we had before
         }
