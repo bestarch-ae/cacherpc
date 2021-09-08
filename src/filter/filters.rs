@@ -25,22 +25,18 @@ pub enum NormalizeError {
 }
 
 impl Filters {
-    pub fn new_normalized<T, I>(filters: T) -> Result<Self, NormalizeError>
+    pub fn new_normalized<T>(filters: T) -> Result<Self, NormalizeError>
     where
-        T: IntoIterator<IntoIter = I>,
-        I: ExactSizeIterator<Item = Filter>,
+        T: IntoIterator<Item = Filter>,
     {
         use NormalizeError::*;
-        let filters = filters.into_iter();
 
-        if filters.len() == 0 {
-            return Err(NormalizeError::Empty);
-        }
-
+        let mut amount = 0;
         let mut data_size = None;
         let mut memcmp_vec = SmallVec::<[Memcmp; 2]>::new();
 
         for filter in filters {
+            amount += 1;
             match filter {
                 Filter::DataSize(size) => {
                     // There is no point filtering for two different sizes
@@ -60,6 +56,10 @@ impl Filters {
                     }
                 }
             }
+        }
+
+        if amount == 0 {
+            return Err(NormalizeError::Empty);
         }
 
         memcmp_vec.sort_unstable();

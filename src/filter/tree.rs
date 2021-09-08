@@ -1,17 +1,19 @@
+use std::collections::hash_map::IntoIter as HashMapIntoIter;
 use std::collections::HashMap;
 
-use serde::Deserialize;
-use smallvec::{smallvec, SmallVec};
+use smallvec::SmallVec;
 
 use crate::types::AccountData;
 
 use super::{Filter, Filters, Memcmp, Pattern, Range};
 
+use node::MemcmpNode;
+
 type Registered = bool;
 
 pub(crate) struct FilterTree {
     // None is for filter groups that do not contain datasize filter
-    data_size: HashMap<Option<u64>, node::MemcmpNode>,
+    data_size: HashMap<Option<u64>, MemcmpNode>,
 }
 
 impl FilterTree {
@@ -80,11 +82,72 @@ impl FilterTree {
     }
 }
 
+impl IntoIterator for FilterTree {
+    type Item = Filters;
+    type IntoIter = IntoIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        IntoIter {
+            roots_iter: self.data_size.into_iter(),
+            node_stack: Vec::new(),
+        }
+    }
+}
+
+pub struct IntoIter {
+    roots_iter: HashMapIntoIter<Option<u64>, MemcmpNode>,
+    node_stack: Vec<(Option<Filter>, node::IntoIter)>,
+}
+
+impl IntoIter {
+    fn collect_current_filter(&self) -> Filters {
+        let filters = self
+            .node_stack
+            .iter()
+            .filter_map(|(filter, _)| filter.as_ref())
+            .cloned();
+        Filters::new_normalized(filters).unwrap()
+    }
+}
+
+impl Iterator for IntoIter {
+    type Item = Filters;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some((_current_filter, current_node)) = self.node_stack.last_mut() {
+                match current_node.next() {
+                    Some((new_memcmp, new_node)) => {
+                        let is_leaf = new_node.registered;
+                        self.node_stack
+                            .push((Some(Filter::Memcmp(new_memcmp)), new_node.into_iter()));
+                        if is_leaf {
+                            return Some(self.collect_current_filter());
+                        }
+                    }
+                    None => {
+                        self.node_stack.pop();
+                    }
+                }
+            } else {
+                let (data_size, node) = self.roots_iter.next()?;
+                // Though Filters implementation guarantees empty group is invalid.
+                let is_leaf = data_size.is_some() && node.registered;
+                self.node_stack
+                    .push((data_size.map(Filter::DataSize), node.into_iter()));
+                if is_leaf {
+                    return Some(self.collect_current_filter());
+                }
+            }
+        }
+    }
+}
+
 mod node {
     use super::*;
 
     #[derive(Default)]
-    pub(super) struct MemcmpNode {
+    pub struct MemcmpNode {
         pub(super) registered: Registered,
         pub(super) children: HashMap<Range, HashMap<Pattern, MemcmpNode>>,
     }
@@ -110,6 +173,48 @@ mod node {
                 new_base.memcmp.sort_unstable();
 
                 node.map_matches(&new_base, data, f);
+            }
+        }
+    }
+
+    impl IntoIterator for MemcmpNode {
+        type Item = (Memcmp, MemcmpNode);
+        type IntoIter = IntoIter;
+
+        fn into_iter(self) -> Self::IntoIter {
+            IntoIter {
+                ranges_iter: self.children.into_iter(),
+                pattern_iter: None,
+            }
+        }
+    }
+
+    pub struct IntoIter {
+        ranges_iter: HashMapIntoIter<Range, HashMap<Pattern, MemcmpNode>>,
+        pattern_iter: Option<(Range, HashMapIntoIter<Pattern, MemcmpNode>)>,
+    }
+
+    impl Iterator for IntoIter {
+        type Item = (Memcmp, MemcmpNode);
+
+        fn next(&mut self) -> Option<Self::Item> {
+            loop {
+                if self.pattern_iter.is_none() {
+                    let (range, map) = self.ranges_iter.next()?;
+                    self.pattern_iter.replace((range, map.into_iter()));
+                }
+
+                let (range, iter) = self.pattern_iter.as_mut().expect("checked none");
+                match iter.next() {
+                    None => self.pattern_iter = None,
+                    Some((pattern, node)) => {
+                        let memcmp = Memcmp {
+                            offset: range.0,
+                            bytes: pattern,
+                        };
+                        break Some((memcmp, node));
+                    }
+                }
             }
         }
     }
