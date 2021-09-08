@@ -21,7 +21,7 @@ use tokio::sync::mpsc;
 use tokio::time::{DelayQueue, Instant};
 use tracing::{debug, error, info, warn};
 
-use crate::filter::Filters;
+use crate::filter::{collect_all_matches, FilterTree, Filters};
 use crate::metrics::pubsub_metrics as metrics;
 use crate::types::{
     AccountContext, AccountInfo, AccountsDb, Commitment, Encoding, ProgramAccountsDb, Pubkey, Slot,
@@ -152,7 +152,7 @@ impl Connection {
     }
 }
 
-type ProgramFilters = HashMap<(Pubkey, Commitment), HashMap<Filters, SpawnHandle>>;
+type ProgramFilters = HashMap<(Pubkey, Commitment), FilterTree<SpawnHandle>>;
 
 pub struct AccountUpdateManager {
     websocket_url: String,
@@ -506,7 +506,7 @@ impl AccountUpdateManager {
         let handle = self
             .additional_keys
             .entry((key, commitment))
-            .or_default()
+            .or_insert_with(FilterTree::new)
             .insert(filters.clone(), {
                 ctx.run_later(self.time_to_live, move |actor, ctx| {
                     actor.purge_filter(ctx, sub, commitment, filters);
@@ -838,37 +838,20 @@ impl AccountUpdateManager {
                             let account_info = &params.result.value.account;
                             let data = &account_info.data;
 
-                            let mut filter_groups = Vec::new();
-                            if let Some(filters) =
-                                self.additional_keys.get(&(program_key, *commitment))
-                            {
-                                let filtration_starts = Instant::now();
-                                for filter_group in filters.keys() {
-                                    if filter_group.matches(data) {
-                                        /*
-                                        self.program_accounts.add(
-                                            &program_key,
-                                            key_ref,
-                                            Some(filter_group.clone()),
-                                            *commitment,
-                                        );
-                                        */
-                                        filter_groups.push(filter_group.clone());
-                                    } else {
-                                        debug!(self.actor_id, account = %key, program = %program_key, "account was removed from filtered list");
-                                        self.program_accounts.remove(
-                                            &program_key,
-                                            &key,
-                                            filter_group.clone(),
-                                            *commitment,
-                                        );
+                            let filter_groups =
+                                match self.additional_keys.get(&(program_key, *commitment)) {
+                                    Some(tree) => {
+                                        let filtration_starts = Instant::now();
+                                        let groups = collect_all_matches(tree, data);
+                                        metrics()
+                                        .filtration_time
+                                        .with_label_values(&[&self.actor_name])
+                                        .observe(filtration_starts.elapsed().as_micros() as f64);
+                                        groups
                                     }
-                                }
-                                metrics()
-                                    .filtration_time
-                                    .with_label_values(&[&self.actor_name])
-                                    .observe(filtration_starts.elapsed().as_micros() as f64);
-                            }
+                                    None => Vec::new(),
+                                };
+
                             let key_ref = self.accounts.insert(
                                 key,
                                 AccountContext {

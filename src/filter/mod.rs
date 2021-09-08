@@ -8,7 +8,7 @@ mod filters;
 mod tree;
 
 pub(crate) use filters::{Filters, NormalizeError};
-pub(crate) use tree::FilterTree;
+pub(crate) use tree::{collect_all_matches, FilterTree};
 
 type Range = (usize, usize);
 type Pattern = SmallVec<[u8; 128]>;
@@ -84,8 +84,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-
     use super::*;
 
     #[test]

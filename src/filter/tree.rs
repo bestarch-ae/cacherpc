@@ -11,19 +11,30 @@ use node::MemcmpNode;
 
 type Registered<T> = Option<T>;
 
-pub(crate) struct FilterTree<T> {
+/// Collects all matching filters into Vec
+pub fn collect_all_matches<T>(tree: &FilterTree<T>, data: &AccountData) -> Vec<Filters> {
+    let mut vec = Vec::new();
+    let closure = |filters| vec.push(filters);
+
+    tree.map_matches(data, closure);
+    vec
+}
+
+pub struct FilterTree<T> {
     // None is for filter groups that do not contain datasize filter
     data_size: HashMap<Option<u64>, MemcmpNode<T>>,
+    len: usize,
 }
 
 impl<T> FilterTree<T> {
     pub fn new() -> Self {
         Self {
             data_size: HashMap::new(),
+            len: 0,
         }
     }
 
-    pub fn insert(&mut self, filters: Filters, value: T) {
+    pub fn insert(&mut self, filters: Filters, value: T) -> Option<T> {
         let mut node = self.data_size.entry(filters.data_size).or_default();
 
         let memcmp = filters.memcmp;
@@ -38,7 +49,16 @@ impl<T> FilterTree<T> {
                 .or_default();
         }
 
-        node.registered = Some(value);
+        if node.registered.is_none() {
+            self.len = self.len.saturating_add(1);
+        }
+
+        node.registered.replace(value)
+    }
+
+    #[allow(unused)]
+    pub fn len(&self) -> usize {
+        self.len
     }
 
     pub fn remove(&mut self, filters: &Filters) -> Option<T> {
@@ -54,6 +74,10 @@ impl<T> FilterTree<T> {
                 .and_then(|nodes| nodes.get_mut(&filter.bytes));
 
             node = temp_node?;
+        }
+
+        if node.registered.is_some() {
+            self.len = self.len.saturating_sub(1);
         }
 
         node.registered.take()
@@ -138,8 +162,6 @@ impl<T> Iterator for IntoIter<T> {
 }
 
 mod node {
-    use backoff::default;
-
     use super::*;
 
     pub struct MemcmpNode<T> {
@@ -230,14 +252,6 @@ mod tests {
 
     use super::*;
 
-    fn all_matches<T>(tree: &FilterTree<T>, data: &AccountData) -> Vec<Filters> {
-        let mut vec = Vec::new();
-        let closure = |filters| vec.push(filters);
-
-        tree.map_matches(data, closure);
-        vec
-    }
-
     #[test]
     fn basic_functionality() {
         let filters = filters!(@size 20, @cmp 3: [1, 2, 3, 4]).unwrap();
@@ -249,7 +263,7 @@ mod tests {
         (1u8..8).for_each(|i| data[2 + i as usize] = i);
         let data = AccountData { data: data.into() };
 
-        assert_eq!(all_matches(&tree, &data), vec![filters.clone()]);
+        assert_eq!(collect_all_matches(&tree, &data), vec![filters.clone()]);
 
         let filters2 = filters!(@size 20, @cmp 5: [3, 4, 5, 6, 7]).unwrap();
         tree.insert(filters2.clone(), ());
@@ -257,7 +271,7 @@ mod tests {
         let expected: HashSet<_> = vec![filters.clone(), filters2.clone()]
             .into_iter()
             .collect();
-        let actual: HashSet<_> = all_matches(&tree, &data).into_iter().collect();
+        let actual: HashSet<_> = collect_all_matches(&tree, &data).into_iter().collect();
         assert_eq!(expected, actual);
 
         // A couple of bad filters
@@ -266,10 +280,10 @@ mod tests {
         tree.insert(filters3.clone(), ());
         tree.insert(filters4.clone(), ());
 
-        let actual: HashSet<_> = all_matches(&tree, &data).into_iter().collect();
+        let actual: HashSet<_> = collect_all_matches(&tree, &data).into_iter().collect();
         assert_eq!(expected, actual);
 
         tree.remove(&filters);
-        assert_eq!(all_matches(&tree, &data), vec![filters2.clone()]);
+        assert_eq!(collect_all_matches(&tree, &data), vec![filters2.clone()]);
     }
 }
