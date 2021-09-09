@@ -20,6 +20,7 @@ pub fn collect_all_matches<T>(tree: &FilterTree<T>, data: &AccountData) -> Vec<F
     vec
 }
 
+#[cfg_attr(test, derive(Clone))] // Should this be cloneable?
 pub struct FilterTree<T> {
     // None is for filter groups that do not contain datasize filter
     data_size: HashMap<Option<u64>, MemcmpNode<T>>,
@@ -164,6 +165,7 @@ impl<T> Iterator for IntoIter<T> {
 mod node {
     use super::*;
 
+    #[cfg_attr(test, derive(Clone))]
     pub struct MemcmpNode<T> {
         pub(super) registered: Registered<T>,
         pub(super) children: HashMap<Range, HashMap<Pattern, MemcmpNode<T>>>,
@@ -283,7 +285,52 @@ mod tests {
         let actual: HashSet<_> = collect_all_matches(&tree, &data).into_iter().collect();
         assert_eq!(expected, actual);
 
-        tree.remove(&filters);
+        assert!(tree.remove(&filters).is_some());
         assert_eq!(collect_all_matches(&tree, &data), vec![filters2.clone()]);
+        // No double removal
+        assert!(tree.remove(&filters).is_none());
+
+        // false on non-existent remove
+        assert!(FilterTree::<()>::new().remove(&filters).is_none());
+    }
+
+    #[test]
+    fn basic_into_iter() {
+        let groups = vec![
+            filters!(@cmp 13: [2, 4, 5, 7, 2, 4], @size 42, @cmp 1098: [3, 4, 3, 3, 3]).unwrap(),
+            filters!(@size 19, @cmp 5: [3, 4, 5, 6, 7]).unwrap(),
+            filters!(@size 28, @cmp 42: [23, 23, 23]).unwrap(),
+            filters!(@size 28).unwrap(),
+            filters!(@cmp 42: [23, 23, 23]).unwrap(),
+        ];
+        let mut groups: HashSet<_> = groups.into_iter().collect();
+
+        let mut tree = FilterTree::new();
+        groups.iter().cloned().for_each(|filters| {
+            tree.insert(filters, ());
+        });
+
+        // basic
+        let actual: HashSet<_> = tree.into_iter().map(|(f, _)| f).collect();
+        assert_eq!(actual, groups);
+
+        let mut tree = FilterTree::new();
+        groups.iter().cloned().for_each(|filters| {
+            tree.insert(filters, ());
+        });
+
+        // don't leak
+        groups.remove(&filters!(@size 28, @cmp 42: [23, 23, 23]).unwrap());
+        tree.remove(&filters!(@size 28, @cmp 42: [23, 23, 23]).unwrap());
+        let actual: HashSet<_> = tree.clone().into_iter().map(|(f, _)| f).collect();
+        assert_eq!(actual, groups);
+
+        assert!(groups.remove(&filters!(@size 28).unwrap()));
+        assert!(tree.remove(&filters!(@size 28).unwrap()).is_some());
+        let actual: HashSet<_> = tree.into_iter().map(|(f, _)| f).collect();
+        assert_eq!(actual, groups);
+
+        // empty tree => empty IntoIter
+        assert!(FilterTree::<()>::new().into_iter().next().is_none());
     }
 }
