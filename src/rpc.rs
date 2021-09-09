@@ -204,8 +204,13 @@ pub(crate) struct State {
 }
 
 impl State {
-    fn reset(&self, sub: Subscription, commitment: Commitment) {
-        self.pubsub.reset(sub, commitment);
+    fn reset(
+        &self,
+        sub: Subscription,
+        commitment: Commitment,
+        filters: Option<SmallVec<[Filter; 2]>>,
+    ) {
+        self.pubsub.reset(sub, commitment, filters);
     }
 
     fn insert(&self, key: Pubkey, data: AccountContext, commitment: Commitment) -> Arc<Pubkey> {
@@ -634,7 +639,7 @@ async fn get_account_info(
                 let account = data.get(commitment);
                 if let Some(account) = account {
                     metrics().account_cache_hits.inc();
-                    app_state.reset(Subscription::Account(pubkey), commitment);
+                    app_state.reset(Subscription::Account(pubkey), commitment, None);
                     return account_response(req.id, request_hash, account, &app_state, config);
                 }
             }
@@ -677,7 +682,7 @@ async fn get_account_info(
                     if let Some(data) = app_state.accounts.get(&pubkey) {
                         let data = data.value();
                         if let Some(account) = data.get(commitment) {
-                            app_state.reset(Subscription::Account(pubkey), commitment);
+                            app_state.reset(Subscription::Account(pubkey), commitment, None);
                             metrics().account_cache_hits.inc();
                             metrics().account_cache_filled.inc();
                             return account_response(
@@ -728,7 +733,7 @@ async fn get_account_info(
                 if let Some(data) = app_state.accounts.get(&pubkey) {
                     let data = data.value();
                     if let Some(account) = data.get(commitment) {
-                        app_state.reset(Subscription::Account(pubkey), commitment);
+                        app_state.reset(Subscription::Account(pubkey), commitment, None);
                         metrics().account_cache_hits.inc();
                         metrics().account_cache_filled.inc();
                         return account_response(
@@ -948,7 +953,7 @@ async fn get_program_accounts(
             Some(data) => {
                 let accounts = data.value();
                 if let Some(accounts) = accounts.get(commitment) {
-                    app_state.reset(Subscription::Program(pubkey), commitment);
+                    app_state.reset(Subscription::Program(pubkey), commitment, filters.clone());
                     metrics().program_accounts_cache_hits.inc();
                     match program_accounts_response(
                         req.id.clone(),
@@ -1026,7 +1031,7 @@ async fn get_program_accounts(
                         let data = data.value();
                         metrics().program_accounts_cache_filled.inc();
                         if let Some(accounts) = data.get(commitment) {
-                            app_state.reset(Subscription::Program(pubkey), commitment);
+                            app_state.reset(Subscription::Program(pubkey), commitment, filters.clone());
                             if let Ok(resp) = program_accounts_response(
                                 req.id.clone(),
                                 accounts,
