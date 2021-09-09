@@ -11,7 +11,7 @@ use smallvec::{smallvec, SmallVec};
 
 use crate::metrics::db_metrics as metrics;
 
-pub(crate) struct ProgramState([Option<HashSet<Arc<Pubkey>>>; 3]);
+pub struct ProgramState([Option<HashSet<Arc<Pubkey>>>; 3]);
 
 impl ProgramState {
     pub fn get(&self, commitment: Commitment) -> Option<&HashSet<Arc<Pubkey>>> {
@@ -64,8 +64,14 @@ impl Default for ProgramState {
 type ProgramAccountsKey = (Pubkey, Option<SmallVec<[Filter; 2]>>);
 
 #[derive(Clone)]
-pub(crate) struct ProgramAccountsDb {
+pub struct ProgramAccountsDb {
     map: Arc<DashMap<ProgramAccountsKey, ProgramState>>,
+}
+
+impl Default for ProgramAccountsDb {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ProgramAccountsDb {
@@ -163,7 +169,7 @@ impl ProgramAccountsDb {
 }
 
 #[derive(Clone)]
-pub(crate) struct AccountsDb {
+pub struct AccountsDb {
     map: Arc<DashMap<Pubkey, AccountState>>,
     slot: Arc<[AtomicU64; 3]>,
 }
@@ -178,7 +184,7 @@ struct Account {
 }
 
 #[derive(Debug)]
-pub(crate) struct AccountState {
+pub struct AccountState {
     data: [Option<Account>; 3],
     key: Pubkey,
 }
@@ -250,6 +256,12 @@ impl AccountState {
 
     fn is_empty(&self) -> bool {
         self.data.iter().all(Option::is_none)
+    }
+}
+
+impl Default for AccountsDb {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -365,7 +377,7 @@ impl Default for Commitment {
 
 #[derive(Serialize, Debug, Deserialize, Copy, Clone, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub(crate) enum Encoding {
+pub enum Encoding {
     #[serde(skip)]
     Default,
     Base58,
@@ -399,7 +411,7 @@ impl Default for Encoding {
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct AccountInfo {
+pub struct AccountInfo {
     pub lamports: u64,
     pub data: AccountData,
     pub owner: Pubkey,
@@ -408,7 +420,7 @@ pub(crate) struct AccountInfo {
 }
 
 #[derive(Hash, Eq, PartialEq, Copy, Clone, Debug, Ord, PartialOrd)]
-pub(crate) struct Pubkey([u8; 32]);
+pub struct Pubkey([u8; 32]);
 
 impl Pubkey {
     #[cfg(test)]
@@ -513,7 +525,7 @@ where
 }
 
 impl Filter {
-    pub(crate) fn matches(&self, data: &AccountData) -> bool {
+    pub fn matches(&self, data: &AccountData) -> bool {
         match self {
             Filter::DataSize(len) => data.data.len() as u64 == *len,
             Filter::Memcmp { offset, bytes } => {
@@ -528,13 +540,17 @@ impl Filter {
 }
 
 #[derive(Debug)]
-pub(crate) struct AccountData {
+pub struct AccountData {
     pub data: Bytes,
 }
 
 impl AccountData {
     pub fn len(&self) -> usize {
         self.data.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -604,13 +620,13 @@ impl Serialize for AccountData {
 
 #[derive(Serialize, Deserialize, Debug)]
 // TODO: Refactor this into WithContext<T>
-pub(crate) struct AccountContext {
+pub struct AccountContext {
     pub context: SolanaContext,
     pub value: Option<AccountInfo>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-pub(crate) struct SolanaContext {
+pub struct SolanaContext {
     pub slot: Slot,
 }
 

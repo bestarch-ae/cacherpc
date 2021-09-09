@@ -6,6 +6,24 @@ use prometheus::{
     IntGauge, IntGaugeVec,
 };
 
+pub fn version() -> &'static str {
+    static VERSION: Lazy<String> = Lazy::new(|| {
+        let pkg_version = std::env!("CARGO_PKG_VERSION");
+        option_env!("CI_COMMIT_TAG")
+            .map(ToString::to_string)
+            .unwrap_or_else(|| {
+                format!(
+                    "{}{}",
+                    pkg_version,
+                    option_env!("CI_COMMIT_SHA")
+                        .map(|sha| format!("-{}", sha))
+                        .unwrap_or_else(String::new)
+                )
+            })
+    });
+    &VERSION
+}
+
 pub struct DbMetrics {
     pub account_entries: IntGauge,
     pub program_account_entries: IntGauge,
@@ -300,8 +318,9 @@ impl RpcMetrics {
 
 pub fn rpc_metrics() -> &'static RpcMetrics {
     static METRICS: Lazy<RpcMetrics> = Lazy::new(|| RpcMetrics {
-        app_version: register_int_gauge!(Opts::new("app_version", "Dumb metric, see label")
-            .const_label("version", crate::version()))
+        app_version: register_int_gauge!(
+            Opts::new("app_version", "Dumb metric, see label").const_label("version", version())
+        )
         .unwrap(),
         request_types: register_int_counter_vec!(
             "request_types",

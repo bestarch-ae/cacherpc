@@ -169,7 +169,7 @@ impl<'a> Serialize for EncodedAccountData<'a> {
     }
 }
 
-pub(crate) struct LruEntry(Box<RawValue>);
+pub struct LruEntry(Box<RawValue>);
 
 impl AsRef<RawValue> for LruEntry {
     fn as_ref(&self) -> &RawValue {
@@ -190,11 +190,11 @@ impl Drop for LruEntry {
     }
 }
 
-pub(crate) struct State {
+pub struct State {
     pub accounts: AccountsDb,
     pub program_accounts: ProgramAccountsDb,
     pub client: Client,
-    pub pubsub: crate::PubSubManager,
+    pub pubsub: crate::accounts::PubSubManager,
     pub rpc_url: String,
     pub map_updated: Arc<Notify>,
     pub account_info_request_limit: Arc<Semaphore>,
@@ -396,7 +396,7 @@ impl<'a> ErrorResponse<'a> {
 }
 
 #[derive(Debug, Error)]
-pub(crate) enum Error<'a> {
+pub enum Error<'a> {
     #[error("invalid request")]
     InvalidRequest(Option<Id<'a>>, Option<&'a str>),
     #[error("invalid param")]
@@ -1147,7 +1147,7 @@ async fn get_program_accounts(
         .body(resp))
 }
 
-pub(crate) async fn rpc_handler(
+pub async fn rpc_handler(
     body: Bytes,
     app_state: web::Data<State>,
 ) -> Result<HttpResponse, Error<'static>> {
@@ -1242,12 +1242,12 @@ fn backoff_settings() -> backoff::ExponentialBackoff {
     }
 }
 
-pub(crate) fn bad_content_type_handler() -> HttpResponse {
+pub fn bad_content_type_handler() -> HttpResponse {
     HttpResponse::UnsupportedMediaType()
         .body("Supplied content type is not allowed. Content-Type: application/json is required")
 }
 
-pub(crate) async fn metrics_handler(
+pub async fn metrics_handler(
     _body: Bytes,
     _app_state: web::Data<State>,
 ) -> Result<HttpResponse, Error<'static>> {
