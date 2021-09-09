@@ -38,16 +38,8 @@ impl ProgramState {
         }
     }
 
-    fn remove_commitment(&mut self, commitment: Commitment) -> impl Iterator<Item = Pubkey> {
-        (self.0)[commitment.as_idx()]
-            .take()
-            .into_iter()
-            .flatten()
-            .map(|arc| {
-                let pubkey = *arc;
-                drop(arc);
-                pubkey
-            })
+    fn take_commitment(&mut self, commitment: Commitment) -> Option<HashSet<Arc<Pubkey>>> {
+        (self.0)[commitment.as_idx()].take()
     }
 
     fn is_empty(&self) -> bool {
@@ -66,6 +58,7 @@ type ProgramAccountsKey = (Pubkey, Option<Filters>);
 #[derive(Clone)]
 pub struct ProgramAccountsDb {
     map: Arc<DashMap<ProgramAccountsKey, ProgramState>>,
+    observed_filters: Arc<DashMap<Pubkey, HashSet<Filters>>>,
 }
 
 impl Default for ProgramAccountsDb {
@@ -78,6 +71,7 @@ impl ProgramAccountsDb {
     pub fn new() -> Self {
         ProgramAccountsDb {
             map: Arc::new(DashMap::new()),
+            observed_filters: Arc::new(DashMap::new()),
         }
     }
 
@@ -100,36 +94,58 @@ impl ProgramAccountsDb {
         commitment: Commitment,
         filters: Option<Filters>,
     ) {
+        if let Some(filters) = filters.as_ref() {
+            data.iter().for_each(|key| {
+                self.observed_filters
+                    .entry(**key)
+                    .or_default()
+                    .insert(filters.clone());
+            })
+        }
+
         let mut entry = self.map.entry((key, filters)).or_default();
         entry.insert(commitment, data);
         drop(entry);
         metrics().program_account_entries.set(self.map.len() as i64);
     }
 
-    // We only add here and do not create new entries because it would be incorrect (incomplete
-    // result).
-    pub fn add(
+    pub fn update_account(
         &self,
         key: &Pubkey,
         data: Arc<Pubkey>,
-        filters: Option<Filters>,
+        filter_groups: HashSet<Filters>,
         commitment: Commitment,
-    ) -> bool {
-        let mut added = false;
+    ) {
         // add to global
         if let Some(mut entry) = self.map.get_mut(&(*key, None)) {
             entry.add(commitment, data.clone());
-            added = true;
         }
 
-        // add with filter
-        if filters.is_some() {
-            if let Some(mut entry) = self.map.get_mut(&(*key, filters)) {
-                entry.add(commitment, data);
-                added = true;
+        let has_new_or_old_filters = !filter_groups.is_empty()
+            || self
+                .observed_filters
+                .get(&*data)
+                .map_or(false /* no set == empty */, |set| !set.is_empty());
+
+        if has_new_or_old_filters {
+            let mut old_groups = self.observed_filters.entry(*data).or_default();
+            let diff = old_groups.symmetric_difference(&filter_groups);
+            for filter in diff {
+                let state = self.map.get_mut(&(*key, Some(filter.clone())));
+                match state {
+                    // Account no longer matches filter
+                    Some(mut state) if !old_groups.contains(filter) => {
+                        state.remove(commitment, &data);
+                    }
+                    // Account is new to the filter
+                    Some(mut state) /*  old_groups.contains(&filter) */ => {
+                        state.add(commitment, Arc::clone(&data));
+                    }
+                    None => (), // State not found
+                }
             }
+            *old_groups = filter_groups;
         }
-        added
     }
 
     pub fn remove_all(
@@ -138,33 +154,35 @@ impl ProgramAccountsDb {
         commitment: Commitment,
         filters: Option<Filters>,
     ) -> impl Iterator<Item = Pubkey> {
-        let iter = if let Entry::Occupied(mut entry) = self.map.entry((*key, filters)) {
+        let iter = if let Entry::Occupied(mut entry) = self.map.entry((*key, filters.clone())) {
             let state = entry.get_mut();
-            let iter = state.remove_commitment(commitment);
+            let keys = state.take_commitment(commitment);
             if state.is_empty() {
                 entry.remove();
             } else {
                 drop(entry);
             }
+
+            if let Some(filters) = filters {
+                keys.as_ref().into_iter().flatten().for_each(|key| {
+                    if let Some(mut set) = self.observed_filters.get_mut(&*key) {
+                        set.remove(&filters);
+                    }
+                })
+            }
+
+            let iter = keys.into_iter().flatten().map(|arc| {
+                let key = *arc;
+                drop(arc);
+                key
+            });
+
             Either::Left(iter)
         } else {
             Either::Right(std::iter::empty())
         };
         metrics().program_account_entries.set(self.map.len() as i64);
         iter
-    }
-
-    pub fn remove(
-        &self,
-        program_key: &Pubkey,
-        account_key: &Pubkey,
-        filters: Filters,
-        commitment: Commitment,
-    ) {
-        if let Entry::Occupied(mut entry) = self.map.entry((*program_key, Some(filters))) {
-            let state = entry.get_mut();
-            state.remove(commitment, account_key);
-        }
     }
 }
 

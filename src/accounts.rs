@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -21,7 +21,7 @@ use tokio::sync::mpsc;
 use tokio::time::{DelayQueue, Instant};
 use tracing::{debug, error, info, warn};
 
-use crate::filter::{collect_all_matches, FilterTree, Filters};
+use crate::filter::{FilterTree, Filters};
 use crate::metrics::pubsub_metrics as metrics;
 use crate::types::{
     AccountContext, AccountInfo, AccountsDb, Commitment, Encoding, ProgramAccountsDb, Pubkey, Slot,
@@ -842,14 +842,18 @@ impl AccountUpdateManager {
                                 match self.additional_keys.get(&(program_key, *commitment)) {
                                     Some(tree) => {
                                         let filtration_starts = Instant::now();
-                                        let groups = collect_all_matches(tree, data);
+                                        let mut groups = HashSet::new();
+                                        tree.map_matches(data, |filter| {
+                                            groups.insert(filter);
+                                        });
+
                                         metrics()
                                         .filtration_time
                                         .with_label_values(&[&self.actor_name])
                                         .observe(filtration_starts.elapsed().as_micros() as f64);
                                         groups
                                     }
-                                    None => Vec::new(),
+                                    None => HashSet::new(),
                                 };
 
                             let key_ref = self.accounts.insert(
@@ -861,23 +865,13 @@ impl AccountUpdateManager {
                                 *commitment,
                             );
 
-                            // add() returns false if we don't have an entry
-                            // which means we haven't received complete result
-                            // from validator by rpc
-                            self.program_accounts.add(
+                            self.program_accounts.update_account(
                                 &program_key,
                                 key_ref.clone(),
-                                None,
+                                filter_groups,
                                 *commitment,
                             );
-                            for group in filter_groups.into_iter() {
-                                self.program_accounts.add(
-                                    &program_key,
-                                    key_ref.clone(),
-                                    Some(group),
-                                    *commitment,
-                                );
-                            }
+
                             // important for proper removal
                             drop(key_ref);
                             self.accounts.remove(&key, *commitment);
