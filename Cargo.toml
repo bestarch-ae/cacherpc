@@ -41,5 +41,13 @@ either = "1.6"
 actix-http = "2.2"
 humantime = "2.1"
 
+[dev-dependencies]
+criterion = "0.3"
+rand = "0.8"
+
+[[bench]]
+name = "filters_bench"
+harness = false
+
 [patch.crates-io]
 actix-http = { git = "https://github.com/polachok/actix-web", rev = "19cd7fdbd5b79e9d78c8cb562741d7513d980b18" }
