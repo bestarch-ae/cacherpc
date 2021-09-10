@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -8,8 +8,8 @@ use std::time::Duration;
 use actix::io::SinkWrite;
 use actix::prelude::AsyncContext;
 use actix::prelude::{
-    Actor, ActorContext, Addr, Context, Handler, Message, Running, StreamHandler, Supervised,
-    Supervisor,
+    Actor, ActorContext, Addr, Context, Handler, Message, Running, SpawnHandle, StreamHandler,
+    Supervised, Supervisor,
 };
 use actix::Arbiter;
 use actix_http::ws;
@@ -122,9 +122,14 @@ impl PubSubManager {
         self.0[idx].1.load(Ordering::Relaxed)
     }
 
-    pub fn reset(&self, sub: Subscription, commitment: Commitment) {
+    pub fn reset(
+        &self,
+        sub: Subscription,
+        commitment: Commitment,
+        filters: Option<smallvec::SmallVec<[Filter; 2]>>,
+    ) {
         let addr = self.get_addr_by_key(sub.key());
-        addr.do_send(AccountCommand::Reset(sub, commitment))
+        addr.do_send(AccountCommand::Reset(sub, commitment, filters))
     }
 
     pub fn subscribe(
@@ -157,6 +162,8 @@ impl Connection {
     }
 }
 
+type ProgramFilters = HashMap<(Pubkey, Commitment), HashMap<SmallVec<[Filter; 2]>, SpawnHandle>>;
+
 pub(crate) struct AccountUpdateManager {
     websocket_url: String,
     time_to_live: Duration,
@@ -172,7 +179,7 @@ pub(crate) struct AccountUpdateManager {
     accounts: AccountsDb,
     program_accounts: ProgramAccountsDb,
     purge_queue: Option<DelayQueueHandle<(Subscription, Commitment)>>,
-    additional_keys: HashMap<(Pubkey, Commitment), HashSet<SmallVec<[Filter; 2]>>>,
+    additional_keys: ProgramFilters,
     last_received_at: Instant,
     active: Arc<AtomicBool>,
     buffer: BytesMut,
@@ -498,7 +505,73 @@ impl AccountUpdateManager {
         Ok(())
     }
 
-    fn purge_key(&mut self, sub: &Subscription, commitment: Commitment) {
+    fn reset_filter(
+        &mut self,
+        ctx: &mut Context<Self>,
+        sub: Subscription,
+        commitment: Commitment,
+        filters: SmallVec<[Filter; 2]>,
+    ) {
+        let key = sub.key();
+        let handle = self
+            .additional_keys
+            .entry((key, commitment))
+            .or_default()
+            .insert(filters.clone(), {
+                ctx.run_later(self.time_to_live, move |actor, ctx| {
+                    actor.purge_filter(ctx, sub, commitment, filters);
+                })
+            });
+        metrics()
+            .additional_keys_entries
+            .with_label_values(&[&self.actor_name])
+            .set(self.additional_keys.len() as i64);
+        // reset ttl for main key
+        self.purge_queue
+            .as_ref()
+            .unwrap()
+            .reset((sub, commitment), self.time_to_live);
+        match handle {
+            Some(handle) => {
+                ctx.cancel_future(handle);
+            }
+            None => {
+                debug!(key = %sub.key(), "filter added");
+                metrics()
+                    .filters
+                    .with_label_values(&[&self.actor_name])
+                    .inc();
+            }
+        }
+    }
+
+    fn purge_filter(
+        &mut self,
+        ctx: &mut Context<Self>,
+        sub: Subscription,
+        commitment: Commitment,
+        filters: SmallVec<[Filter; 2]>,
+    ) {
+        let key = sub.key();
+        info!(key = %sub.key(), commitment = ?commitment, filter = ?filters, "purging filters");
+        let handle = self
+            .additional_keys
+            .get_mut(&(key, commitment))
+            .and_then(|map| map.remove(&filters));
+        metrics()
+            .filters
+            .with_label_values(&[&self.actor_name])
+            .dec();
+        for key in self
+            .program_accounts
+            .remove_all(&key, commitment, Some(filters))
+        {
+            self.accounts.remove(&key, commitment)
+        }
+        handle.map(|handle| ctx.cancel_future(handle));
+    }
+
+    fn purge_key(&mut self, ctx: &mut Context<Self>, sub: &Subscription, commitment: Commitment) {
         info!(self.actor_id, message = "purge", key = %sub.key(), commitment = ?commitment);
         match sub {
             Subscription::Program(program_key) => {
@@ -507,9 +580,18 @@ impl AccountUpdateManager {
                     .remove(&(*program_key, commitment))
                     .into_iter()
                     .flatten()
-                    .map(|filter| (program_key, Some(filter)))
+                    .map(|(filter, handle)| {
+                        ctx.cancel_future(handle);
+                        (program_key, Some(filter))
+                    })
                     .chain(Some((program_key, None)));
                 for (key, filter) in keys {
+                    if filter.is_some() {
+                        metrics()
+                            .filters
+                            .with_label_values(&[&self.actor_name])
+                            .dec();
+                    }
                     for key in self
                         .program_accounts
                         .remove_all(key, commitment, filter.clone())
@@ -543,7 +625,11 @@ impl AccountUpdateManager {
             .set(if is_active { 1 } else { 0 });
     }
 
-    fn process_ws_message(&mut self, text: &[u8]) -> Result<(), serde_json::Error> {
+    fn process_ws_message(
+        &mut self,
+        ctx: &mut Context<Self>,
+        text: &[u8],
+    ) -> Result<(), serde_json::Error> {
         #[derive(Deserialize, Debug)]
         struct AnyMessage<'a> {
             #[serde(borrow)]
@@ -576,7 +662,7 @@ impl AccountUpdateManager {
                             if sub.is_account() {
                                 self.active_accounts.remove(&(sub.key(), commitment));
                             }
-                            self.purge_key(&sub, commitment);
+                            self.purge_key(ctx, &sub, commitment);
                         }
                         InflightRequest::Unsub(sub, commitment) => {
                             warn!(self.actor_id, request_id = id, error = ?error, key = %sub.key(), commitment = ?commitment, "unsubscribe failed");
@@ -593,7 +679,7 @@ impl AccountUpdateManager {
                             if sub.is_account() {
                                 self.active_accounts.remove(&(sub.key(), commitment));
                             }
-                            self.purge_key(&sub, commitment);
+                            self.purge_key(ctx, &sub, commitment);
                         }
                         InflightRequest::SlotSub(_) => {
                             warn!(self.actor_id, request_id = id, error = ?error, "slot subscribe failed");
@@ -676,7 +762,7 @@ impl AccountUpdateManager {
                                             .subscription_lifetime
                                             .observe(times.since_creation().as_secs_f64());
                                     }
-                                    self.purge_key(&sub, commitment);
+                                    self.purge_key(ctx, &sub, commitment);
                                 } else {
                                     warn!(self.actor_id, sub = %sub, commitment = ?commitment, "unsubscribe for unknown subscription");
                                 }
@@ -767,7 +853,7 @@ impl AccountUpdateManager {
                                 self.additional_keys.get(&(program_key, *commitment))
                             {
                                 let filtration_starts = Instant::now();
-                                for filter_group in filters {
+                                for filter_group in filters.keys() {
                                     if filter_group.iter().all(|f| f.matches(data)) {
                                         /*
                                         self.program_accounts.add(
@@ -860,7 +946,7 @@ impl AccountUpdateManager {
         Ok(())
     }
 
-    fn on_disconnect(&mut self) {
+    fn on_disconnect(&mut self, ctx: &mut Context<Self>) {
         info!(self.actor_id, "websocket disconnected");
 
         self.connection = Connection::Disconnected;
@@ -892,15 +978,15 @@ impl AccountUpdateManager {
         );
         let to_purge: Vec<_> = self.subs.keys().cloned().collect();
         for (sub, commitment) in to_purge {
-            self.purge_key(&sub, commitment);
+            self.purge_key(ctx, &sub, commitment);
         }
         self.update_status();
     }
 }
 
 impl Supervised for AccountUpdateManager {
-    fn restarting(&mut self, _ctx: &mut Context<Self>) {
-        self.on_disconnect();
+    fn restarting(&mut self, ctx: &mut Context<Self>) {
+        self.on_disconnect(ctx);
         info!(self.actor_id, "restarting actor");
     }
 }
@@ -918,25 +1004,17 @@ impl StreamHandler<AccountCommand> for AccountUpdateManager {
 impl Handler<AccountCommand> for AccountUpdateManager {
     type Result = ();
 
-    fn handle(&mut self, item: AccountCommand, _ctx: &mut Context<Self>) {
+    fn handle(&mut self, item: AccountCommand, ctx: &mut Context<Self>) {
         let _ = (|| -> Result<(), serde_json::Error> {
             match item {
                 AccountCommand::Subscribe(sub, commitment, filters) => {
-                    let key = sub.key();
                     metrics()
                         .commands
                         .with_label_values(&[&self.actor_name, "subscribe"])
                         .inc();
                     self.subscribe(sub, commitment)?;
                     if let Some(filters) = filters {
-                        self.additional_keys
-                            .entry((key, commitment))
-                            .or_default()
-                            .insert(filters);
-                        metrics()
-                            .additional_keys_entries
-                            .with_label_values(&[&self.actor_name])
-                            .set(self.additional_keys.len() as i64);
+                        self.reset_filter(ctx, sub, commitment, filters);
                     }
                 }
                 AccountCommand::Purge(sub, commitment) => {
@@ -953,14 +1031,14 @@ impl Handler<AccountCommand> for AccountUpdateManager {
                     if sub.is_account() {
                         self.active_accounts.remove(&(sub.key(), commitment));
                     }
-                    self.purge_key(&sub, commitment);
+                    self.purge_key(ctx, &sub, commitment);
                 }
-                AccountCommand::Reset(key, commitment) => {
+                AccountCommand::Reset(sub, commitment, filters) => {
                     metrics()
                         .commands
                         .with_label_values(&[&self.actor_name, "reset"])
                         .inc();
-                    if let Some(time) = self.subs.get_mut(&(key, commitment)) {
+                    if let Some(time) = self.subs.get_mut(&(sub, commitment)) {
                         metrics()
                             .time_until_reset
                             .observe(time.update().as_secs_f64());
@@ -968,7 +1046,10 @@ impl Handler<AccountCommand> for AccountUpdateManager {
                     self.purge_queue
                         .as_ref()
                         .unwrap()
-                        .reset((key, commitment), self.time_to_live);
+                        .reset((sub, commitment), self.time_to_live);
+                    if let Some(filters) = filters {
+                        self.reset_filter(ctx, sub, commitment, filters);
+                    }
                 }
             }
             Ok(())
@@ -1015,7 +1096,7 @@ impl StreamHandler<Result<awc::ws::Frame, awc::error::WsProtocolError>> for Acco
                 }
                 Frame::Text(text) => {
                     metrics().bytes_received.with_label_values(&[&self.actor_name]).inc_by(text.len() as u64);
-                    self.process_ws_message(&text).map_err(|err| {
+                    self.process_ws_message(ctx, &text).map_err(|err| {
                             error!(error = %err, bytes = ?text, "error while parsing message");
                             err
                         })?
@@ -1045,7 +1126,7 @@ impl StreamHandler<Result<awc::ws::Frame, awc::error::WsProtocolError>> for Acco
                             .inc_by(bytes.len() as u64);
                         self.buffer.extend(&bytes);
                         let text = std::mem::replace(&mut self.buffer, BytesMut::new());
-                        self.process_ws_message(&text).map_err(|err| {
+                        self.process_ws_message(ctx, &text).map_err(|err| {
                             error!(error = %err, bytes = ?text, "error while parsing fragmented message");
                             err
                         })?;
@@ -1088,7 +1169,7 @@ impl StreamHandler<Result<awc::ws::Frame, awc::error::WsProtocolError>> for Acco
         let subs = std::mem::replace(&mut self.subs, HashMap::with_capacity(subs_len));
 
         for ((sub, commitment), _) in subs {
-            self.subscribe(sub, commitment).unwrap()
+            self.subscribe(sub, commitment).unwrap();
             // TODO: it would be nice to retrieve current state for
             // everything we had before
         }
@@ -1175,7 +1256,7 @@ impl std::fmt::Display for Subscription {
 #[rtype(result = "()")]
 pub(crate) enum AccountCommand {
     Subscribe(Subscription, Commitment, Option<SmallVec<[Filter; 2]>>),
-    Reset(Subscription, Commitment),
+    Reset(Subscription, Commitment, Option<SmallVec<[Filter; 2]>>),
     Purge(Subscription, Commitment),
 }
 

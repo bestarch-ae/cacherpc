@@ -45,6 +45,7 @@ pub struct PubSubMetrics {
     pub purge_queue_length: IntGaugeVec,
     pub purge_queue_entries: IntGaugeVec,
     pub additional_keys_entries: IntGaugeVec,
+    pub filters: IntGaugeVec,
     pub sub_id_entries: IntGaugeVec,
     pub id_sub_entries: IntGaugeVec,
     pub inflight_entries: IntGaugeVec,
@@ -172,6 +173,8 @@ pub fn pubsub_metrics() -> &'static PubSubMetrics {
             &["connection_id"]
         )
         .unwrap(),
+        filters: register_int_gauge_vec!("filters", "number of filters", &["connection_id"])
+            .unwrap(),
         websocket_disconnects: register_int_counter_vec!(
             "websocket_disconnects",
             "number of websocket disconnects",
