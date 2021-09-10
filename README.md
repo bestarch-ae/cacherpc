@@ -34,7 +34,7 @@ The server supports a number of configuration options, which are the following:
 
 In the current version caching is implemented for these methods: 
 - [getAccountInfo](https://docs.solana.com/developing/clients/jsonrpc-api#getaccountinfo)
-- [getProgramAccounts](https://docs.solana.com/developing/clients/jsonrpc-api#getprogramaccounts) (without filters)
+- [getProgramAccounts](https://docs.solana.com/developing/clients/jsonrpc-api#getprogramaccounts)
 
 Requests to other methods are passed through to the validator.
 
