@@ -76,10 +76,10 @@ type WsSink = SinkWrite<
 >;
 
 #[derive(Clone)]
-pub(crate) struct PubSubManager(Vec<(actix::Addr<AccountUpdateManager>, Arc<AtomicBool>)>);
+pub struct PubSubManager(Vec<(actix::Addr<AccountUpdateManager>, Arc<AtomicBool>)>);
 
 impl PubSubManager {
-    pub(crate) fn init(
+    pub fn init(
         connections: u32,
         accounts: AccountsDb,
         program_accounts: ProgramAccountsDb,
@@ -164,7 +164,7 @@ impl Connection {
 
 type ProgramFilters = HashMap<(Pubkey, Commitment), HashMap<SmallVec<[Filter; 2]>, SpawnHandle>>;
 
-pub(crate) struct AccountUpdateManager {
+pub struct AccountUpdateManager {
     websocket_url: String,
     time_to_live: Duration,
     actor_id: u32,
@@ -1224,7 +1224,7 @@ impl actix::io::WriteHandler<awc::error::WsProtocolError> for AccountUpdateManag
 }
 
 #[derive(Debug, Eq, PartialEq, Copy, Clone, Hash)]
-pub(crate) enum Subscription {
+pub enum Subscription {
     Account(Pubkey),
     Program(Pubkey),
 }
@@ -1254,7 +1254,7 @@ impl std::fmt::Display for Subscription {
 
 #[derive(Message, Debug)]
 #[rtype(result = "()")]
-pub(crate) enum AccountCommand {
+pub enum AccountCommand {
     Subscribe(Subscription, Commitment, Option<SmallVec<[Filter; 2]>>),
     Reset(Subscription, Commitment, Option<SmallVec<[Filter; 2]>>),
     Purge(Subscription, Commitment),
