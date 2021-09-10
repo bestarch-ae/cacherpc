@@ -8,10 +8,14 @@ mod filters;
 mod tree;
 
 pub(crate) use filters::{Filters, NormalizeError};
-pub(crate) use tree::{collect_all_matches, FilterTree};
+pub(crate) use tree::FilterTree;
 
 type Range = (usize, usize);
 type Pattern = SmallVec<[u8; 128]>;
+
+// Reserved for internal use.
+// This is ok since memcmp with empty pattern normalizes to "always true"
+const RESERVED_RANGE: Range = (usize::MAX, usize::MAX);
 
 #[derive(Deserialize, Debug, Hash, Eq, PartialEq, Clone, Ord, PartialOrd)]
 #[serde(rename_all = "camelCase")]

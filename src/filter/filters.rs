@@ -4,7 +4,7 @@ use thiserror::Error;
 
 use crate::types::AccountData;
 
-use super::{Filter, Memcmp};
+use super::{Filter, Memcmp, RESERVED_RANGE};
 
 /// Filter container that guarantees filters do not conflict with each other
 /// and determines the application order for each filter combination.  
@@ -46,6 +46,15 @@ impl Filters {
                 }
                 // TODO: check that overlapping ranges match
                 Filter::Memcmp(new) => {
+                    if new.bytes.is_empty() || new.range() == RESERVED_RANGE {
+                        const _: () = {
+                            // Just to statically assert that reserved range is empty
+                            let _: [u8; RESERVED_RANGE.1 - RESERVED_RANGE.0] = [];
+                        };
+                        // This is always true
+                        continue;
+                    }
+
                     let same_range = memcmp_vec
                         .iter()
                         .find(|filter| filter.range() == new.range());

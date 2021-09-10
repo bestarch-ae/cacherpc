@@ -5,13 +5,14 @@ use smallvec::SmallVec;
 
 use crate::types::AccountData;
 
-use super::{Filter, Filters, Memcmp, Pattern, Range};
+use super::{Filter, Filters, Memcmp, Pattern, Range, RESERVED_RANGE};
 
 use node::MemcmpNode;
 
 type Registered<T> = Option<T>;
 
 /// Collects all matching filters into Vec
+#[cfg(test)]
 pub fn collect_all_matches<T>(tree: &FilterTree<T>, data: &AccountData) -> Vec<Filters> {
     let mut vec = Vec::new();
     let closure = |filters| vec.push(filters);
@@ -101,13 +102,23 @@ impl<T> FilterTree<T> {
     }
 }
 
+impl<T> Drop for FilterTree<T> {
+    fn drop(&mut self) {
+        let data_size = std::mem::take(&mut self.data_size);
+        for (_, node) in data_size.into_iter() {
+            drop(node);
+        }
+    }
+}
+
 impl<T> IntoIterator for FilterTree<T> {
     type Item = (Filters, T);
     type IntoIter = IntoIter<T>;
 
-    fn into_iter(self) -> Self::IntoIter {
+    fn into_iter(mut self) -> Self::IntoIter {
+        let data_size = std::mem::take(&mut self.data_size);
         IntoIter {
-            roots_iter: self.data_size.into_iter(),
+            roots_iter: data_size.into_iter(),
             node_stack: Vec::new(),
         }
     }
@@ -165,11 +176,13 @@ impl<T> Iterator for IntoIter<T> {
 mod node {
     use super::*;
 
-    #[cfg_attr(test, derive(Clone))]
+    #[cfg_attr(test, derive(Clone, Debug))]
     pub struct MemcmpNode<T> {
         pub(super) registered: Registered<T>,
         pub(super) children: HashMap<Range, HashMap<Pattern, MemcmpNode<T>>>,
     }
+
+    const PARENT_RANGE: Range = RESERVED_RANGE;
 
     impl<T> MemcmpNode<T> {
         pub fn map_matches(&self, base: &Filters, data: &AccountData, f: &mut impl FnMut(Filters)) {
@@ -194,15 +207,76 @@ mod node {
                 node.map_matches(&new_base, data, f);
             }
         }
+
+        // The rest are helper methods for Drop implementation
+
+        fn take_parent(&mut self) -> Option<Self> {
+            self.children.remove(&PARENT_RANGE)?.remove([].as_ref())
+        }
+
+        fn set_parent(&mut self, parent: Self) -> Option<Self> {
+            self.children
+                .entry(PARENT_RANGE)
+                .or_default()
+                .insert(SmallVec::new(), parent)
+        }
+
+        fn take_next_child_node(&mut self) -> Option<MemcmpNode<T>> {
+            loop {
+                let (range, patterns) = self
+                    .children
+                    .iter_mut()
+                    .find(|(range, _)| **range != PARENT_RANGE)?;
+
+                let range = *range;
+                // TODO: use drain_filter to reduce pattern clones when stable
+                let pattern = match patterns.keys().find(|pattern| !pattern.is_empty()) {
+                    Some(pattern) => pattern.clone(),
+                    None => {
+                        self.children.remove(&range);
+                        continue;
+                    }
+                };
+
+                let res = self
+                    .children
+                    .get_mut(&range)
+                    .expect("checked the range")
+                    .remove(&pattern)
+                    .expect("checked the pattern");
+
+                if self.children.get(&range).map_or(true, HashMap::is_empty) {
+                    self.children.remove(&range);
+                }
+
+                return Some(res);
+            }
+        }
+
+        fn try_mutate_into_next_child(mut self) -> Result<Self, Self> {
+            if let Some(mut node) = self.take_next_child_node() {
+                // Optimization: self.children.is_empty() means that this node has no children or parent left
+                // thus there's no point in returning to it.
+                if !self.children.is_empty() {
+                    let _prev = node.set_parent(self);
+                    debug_assert!(_prev.is_none());
+                }
+
+                Ok(node)
+            } else {
+                Err(self)
+            }
+        }
     }
 
     impl<T> IntoIterator for MemcmpNode<T> {
         type Item = (Memcmp, MemcmpNode<T>);
         type IntoIter = IntoIter<T>;
 
-        fn into_iter(self) -> Self::IntoIter {
+        fn into_iter(mut self) -> Self::IntoIter {
+            let children = std::mem::take(&mut self.children);
             IntoIter {
-                ranges_iter: self.children.into_iter(),
+                ranges_iter: children.into_iter(),
                 pattern_iter: None,
             }
         }
@@ -246,11 +320,34 @@ mod node {
             }
         }
     }
+
+    impl<T> Drop for MemcmpNode<T> {
+        fn drop(&mut self) {
+            while let Some(node) = self.take_next_child_node() {
+                let mut current = Some(node);
+
+                while let Some(node) = current.take() {
+                    match node.try_mutate_into_next_child() {
+                        Ok(child) => {
+                            current.replace(child);
+                        }
+                        Err(mut node) => {
+                            current = node.take_parent();
+                            debug_assert!(node.children.is_empty());
+                            drop(node);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+
+    use smallvec::smallvec;
 
     use super::*;
 
@@ -332,5 +429,37 @@ mod tests {
 
         // empty tree => empty IntoIter
         assert!(FilterTree::<()>::new().into_iter().next().is_none());
+    }
+
+    #[test]
+    fn dont_blow_the_stack() {
+        let mut filters = filters!(@size 128).unwrap();
+        let mut tree = FilterTree::new();
+
+        filters.memcmp.reserve(1024 * 10 + 1);
+
+        for i in 0..1024 * 128 {
+            // This must not happen in reality since we deduplicate and sort all filters
+            filters.memcmp.push(Memcmp {
+                offset: i % 12,
+                bytes: smallvec![0, 0, 0],
+            });
+        }
+        tree.insert(filters.clone(), ());
+
+        filters.memcmp[10].bytes[1] = 42;
+        tree.insert(filters.clone(), ());
+
+        filters.memcmp[50].offset = 80;
+        tree.insert(filters.clone(), ());
+
+        filters.memcmp[50].offset = 45;
+        tree.insert(filters.clone(), ());
+
+        filters.data_size.replace(429);
+        tree.insert(filters.clone(), ());
+
+        eprintln!("started drop");
+        drop(tree);
     }
 }
