@@ -1,4 +1,4 @@
-use std::collections::hash_map::IntoIter as HashMapIntoIter;
+use std::collections::hash_map::{IntoIter as HashMapIntoIter, Iter as HashMapIter};
 use std::collections::HashMap;
 
 use smallvec::SmallVec;
@@ -85,20 +85,20 @@ impl<T> FilterTree<T> {
         node.registered.take()
     }
 
-    pub fn map_matches(&self, data: &AccountData, mut f: impl FnMut(Filters)) {
+    pub fn map_matches(&self, data: &AccountData, f: impl FnMut(Filters)) {
         let data_len = data.len() as u64;
 
-        for (data_size, node) in [Some(data_len), None]
-            .iter()
-            .filter_map(|k| Some(*k).zip(self.data_size.get(k)))
-        {
-            let base = Filters {
-                data_size,
-                memcmp: SmallVec::new(),
-            };
+        let iter = std::iter::once(self.data_size.get_key_value(&Some(data_len)))
+            .chain(std::iter::once(self.data_size.get_key_value(&None)))
+            .flatten();
 
-            node.map_matches(&base, data, &mut f);
-        }
+        let iter = IterMatches {
+            account_data: data,
+            roots_iter: iter,
+            node_stack: SmallVec::new(),
+        };
+
+        iter.map(|(k, _v)| k).for_each(f);
     }
 }
 
@@ -120,6 +120,94 @@ impl<T> IntoIterator for FilterTree<T> {
         IntoIter {
             roots_iter: data_size.into_iter(),
             node_stack: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum FilterRef<'a> {
+    DataSize(u64),
+    Memcmp { offset: usize, bytes: &'a [u8] },
+}
+
+impl FilterRef<'_> {
+    fn into_owned(self) -> Filter {
+        match self {
+            FilterRef::DataSize(size) => Filter::DataSize(size),
+            FilterRef::Memcmp { offset, bytes } => Filter::Memcmp(Memcmp {
+                offset,
+                bytes: Pattern::from_slice(bytes),
+            }),
+        }
+    }
+}
+
+type PatternMap<T> = HashMap<Pattern, MemcmpNode<T>>;
+// Keep the iterator over registered ranges and the corresponding filter prefix for each layer
+type StackItem<'a, T> = (Option<FilterRef<'a>>, HashMapIter<'a, Range, PatternMap<T>>);
+
+pub struct IterMatches<'a, I, T> {
+    account_data: &'a AccountData,
+    roots_iter: I,
+    node_stack: SmallVec<[StackItem<'a, T>; 4]>,
+}
+
+impl<I, T> IterMatches<'_, I, T> {
+    fn collect_current_filter(&self) -> Filters {
+        let filters = self
+            .node_stack
+            .iter()
+            .filter_map(|(filter, _)| *filter)
+            .map(FilterRef::into_owned);
+        Filters::new_normalized(filters).expect("encountered bad filter group")
+    }
+}
+
+impl<'a, I, T> Iterator for IterMatches<'a, I, T>
+where
+    I: Iterator<Item = (&'a Option<u64>, &'a MemcmpNode<T>)>,
+{
+    type Item = (Filters, &'a T);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some((_current_filter, current_node)) = self.node_stack.last_mut() {
+                match current_node.next() {
+                    Some((range, new_nodes)) => {
+                        let next_node = self
+                            .account_data
+                            .data
+                            .get(range.0..range.1)
+                            .and_then(|slice| new_nodes.get_key_value(slice));
+
+                        if let Some((pattern, node)) = next_node {
+                            let is_leaf = node.registered.as_ref();
+                            let offset = range.0;
+                            let bytes = pattern;
+                            let new_memcmp = FilterRef::Memcmp { offset, bytes };
+
+                            self.node_stack
+                                .push((Some(new_memcmp), node.children.iter()));
+
+                            if let Some(value) = is_leaf {
+                                return Some((self.collect_current_filter(), value));
+                            }
+                        }
+                    }
+                    None => {
+                        self.node_stack.pop();
+                    }
+                }
+            } else {
+                let (data_size, node) = self.roots_iter.next()?;
+                // Though Filters implementation guarantees empty group is invalid.
+                let is_leaf = data_size.and(node.registered.as_ref());
+                self.node_stack
+                    .push((data_size.map(FilterRef::DataSize), node.children.iter()));
+                if let Some(value) = is_leaf {
+                    return Some((self.collect_current_filter(), value));
+                }
+            }
         }
     }
 }
@@ -184,32 +272,8 @@ mod node {
 
     const PARENT_RANGE: Range = RESERVED_RANGE;
 
+    // These are helper methods for Drop implementation
     impl<T> MemcmpNode<T> {
-        pub fn map_matches(&self, base: &Filters, data: &AccountData, f: &mut impl FnMut(Filters)) {
-            // f is &mut so that the compiler wont fail because of recursion limit
-            if self.registered.is_some() {
-                f(base.clone())
-            }
-
-            let iter_nodes = self.children.iter().filter_map(|((from, to), nodes)| {
-                // For each available range
-                data.data
-                    .get(*from..*to) // Get dataslice
-                    .and_then(|slice| nodes.get_key_value(slice)) // Get registered nodes matching this data
-                    .map(|(slice, node)| (*from, slice.clone(), node))
-            });
-
-            for (offset, bytes, node) in iter_nodes {
-                let mut new_base = base.clone();
-                new_base.memcmp.push(Memcmp { offset, bytes });
-                new_base.memcmp.sort_unstable();
-
-                node.map_matches(&new_base, data, f);
-            }
-        }
-
-        // The rest are helper methods for Drop implementation
-
         fn take_parent(&mut self) -> Option<Self> {
             self.children.remove(&PARENT_RANGE)?.remove([].as_ref())
         }
@@ -367,23 +431,38 @@ mod tests {
         let filters2 = filters!(@size 20, @cmp 5: [3, 4, 5, 6, 7]).unwrap();
         tree.insert(filters2.clone(), ());
 
-        let expected: HashSet<_> = vec![filters.clone(), filters2.clone()]
-            .into_iter()
-            .collect();
+        let mut expected: HashSet<_> = vec![filters.clone(), filters2].into_iter().collect();
         let actual: HashSet<_> = collect_all_matches(&tree, &data).into_iter().collect();
         assert_eq!(expected, actual);
 
         // A couple of bad filters
         let filters3 = filters!(@size 19, @cmp 5: [3, 4, 5, 6, 7]).unwrap();
         let filters4 = filters!(@size 20, @cmp 5: [3, 4, 5, 5, 7]).unwrap();
-        tree.insert(filters3.clone(), ());
-        tree.insert(filters4.clone(), ());
+        tree.insert(filters3, ());
+        tree.insert(filters4, ());
 
         let actual: HashSet<_> = collect_all_matches(&tree, &data).into_iter().collect();
         assert_eq!(expected, actual);
 
+        // Insert a bunch of bad filters of different range into the same path as the filter6
+        // to check that iter implementation correctly traverses all ranges
+        // Note: This does not always fail when should
+        let mut filters5 = filters!(@size 20, @cmp 3: [1, 2, 3], @cmp 7: [0, 0]).unwrap();
+        for i in 1..200 {
+            filters5.memcmp.last_mut().unwrap().bytes = vec![0; i].into();
+            tree.insert(filters5.clone(), ());
+        }
+
+        let filters6 = filters!(@size 20, @cmp 3: [1, 2, 3], @cmp 7: [ 5, 6, 7]).unwrap();
+        tree.insert(filters6.clone(), ());
+        expected.insert(filters6);
+        let actual: HashSet<_> = collect_all_matches(&tree, &data).into_iter().collect();
+        assert_eq!(expected, actual);
+
         assert!(tree.remove(&filters).is_some());
-        assert_eq!(collect_all_matches(&tree, &data), vec![filters2.clone()]);
+        expected.remove(&filters);
+        let actual: HashSet<_> = collect_all_matches(&tree, &data).into_iter().collect();
+        assert_eq!(actual, expected);
         // No double removal
         assert!(tree.remove(&filters).is_none());
 
@@ -457,7 +536,11 @@ mod tests {
         tree.insert(filters.clone(), ());
 
         filters.data_size.replace(429);
-        tree.insert(filters.clone(), ());
+        tree.insert(filters, ());
+
+        let data = vec![0; 128];
+        let data = AccountData { data: data.into() };
+        tree.map_matches(&data, |_| ());
 
         eprintln!("started drop");
         drop(tree);
