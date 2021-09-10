@@ -31,7 +31,7 @@ fn test_filter_group(bytes: &[u8]) -> SmallVec<[Filter; 2]> {
     let end = rng.gen_range(offset / 2..limit).min(offset + 128);
     let slice = bytes
         .get(offset..end)
-        .map(|slice| SmallVec::<[u8; 128]>::from(slice))
+        .map(SmallVec::<[u8; 128]>::from)
         .unwrap_or_else(|| {
             (0..rng.gen_range(0..limit.min(128)))
                 .map(|_| rng.gen())
@@ -80,7 +80,7 @@ fn load_ruleset_from_json(path: &str) -> HashSet<SmallVec<[Filter; 2]>> {
         struct Params {
             filters: SmallVec<[Filter; 2]>,
         }
-        let req: Request = serde_json::from_str(&line).unwrap();
+        let req: Request<'_> = serde_json::from_str(&line).unwrap();
         let params: [&RawValue; 2] = serde_json::from_str(req.params.get()).unwrap();
         let params: Params = serde_json::from_str(params[1].get()).unwrap();
         let mut filters = params.filters;
@@ -147,10 +147,8 @@ fn bench_filters_real_data(c: &mut Criterion) {
 fn bench_filters(c: &mut Criterion) {
     let mut group = c.benchmark_group("Filters");
 
-    let small_data = prepare("1kb data", 1024, |data| filter_table(&data[..], 50_000));
-    let big_data = prepare("1mb data", 1024 * 1024, |data| {
-        filter_table(&data[..], 50_000)
-    });
+    let small_data = prepare("1kb data", 1024, |data| filter_table(data, 50_000));
+    let big_data = prepare("1mb data", 1024 * 1024, |data| filter_table(data, 50_000));
     let file_data = prepare("1mb data, from file", 1024 * 1024, |_| {
         load_ruleset_from_json(&ruleset_path())
     });
@@ -188,7 +186,7 @@ fn prepare(
 fn dumb<'a>(data: &AccountData, table: impl Iterator<Item = &'a SmallVec<[Filter; 2]>>) -> usize {
     let mut matches = 0;
     for group in table {
-        if group.iter().all(|f| f.matches(&data)) {
+        if group.iter().all(|f| f.matches(data)) {
             matches += 1;
         }
     }
