@@ -7,8 +7,8 @@ use crate::types::AccountData;
 mod filters;
 mod tree;
 
-pub(crate) use filters::{Filters, NormalizeError};
-pub(crate) use tree::FilterTree;
+pub use filters::{Filters, NormalizeError};
+pub use tree::FilterTree;
 
 type Range = (usize, usize);
 type Pattern = SmallVec<[u8; 128]>;
