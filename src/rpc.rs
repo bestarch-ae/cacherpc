@@ -15,7 +15,7 @@ use bytes::Bytes;
 use dashmap::mapref::one::Ref;
 use futures_util::stream::Stream;
 use lru::LruCache;
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::value::{to_raw_value, RawValue};
 use smallvec::SmallVec;
 use thiserror::Error;
@@ -28,7 +28,7 @@ use crate::filter::{Filters, NormalizeError};
 use crate::metrics::rpc_metrics as metrics;
 use crate::types::{
     AccountContext, AccountData, AccountInfo, AccountState, AccountsDb, BytesChain, Commitment,
-    Encoding, ProgramAccountsDb, Pubkey, SolanaContext,
+    Encoding, ProgramAccountsDb, Pubkey, Slot, SolanaContext,
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -820,11 +820,26 @@ impl Default for ProgramAccountsConfig<'_> {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(untagged)]
 enum MaybeContext<T> {
     With { context: SolanaContext, value: T },
     Without(T),
+}
+
+impl<T> MaybeContext<T> {
+    fn into_slot_and_value(self) -> (Option<Slot>, T) {
+        match self {
+            Self::With { context, value } => (Some(context.slot), value),
+            Self::Without(value) => (None, value),
+        }
+    }
+}
+
+#[derive(Deserialize, Debug)]
+pub struct AccountAndPubkey {
+    pub account: AccountInfo,
+    pub pubkey: Pubkey,
 }
 
 fn program_accounts_response<'a>(
@@ -971,25 +986,20 @@ async fn get_program_accounts(
         .transpose()?
         .map(Filters::new_normalized);
 
-    let filters = match filters {
-        Some(Ok(filters)) => Some(filters),
-        Some(Err(NormalizeError::Empty)) | None => None,
+    let (filters, bad_filters) = match filters {
+        Some(Ok(filters)) => (Some(filters), false),
+        Some(Err(NormalizeError::Empty)) | None => (None, false), // Empty is ok
         Some(Err(err)) => {
             warn!(%err, "received bad filters. empty response");
             // TODO: consider just opting-out from caching this request
-            return program_accounts_response(
-                req.id.clone(),
-                &HashSet::new(), // This does not allocate
-                &config,
-                None,
-                &app_state,
-                return_context,
-            )
-            .map_err(|_| Error::InvalidRequest(None, None));
+            (None, true)
         }
     };
 
-    if config.encoding != Encoding::JsonParsed && app_state.subscription_active(pubkey) {
+    let is_json_parsed = config.encoding == Encoding::JsonParsed;
+    let has_active_sub = app_state.subscription_active(pubkey);
+
+    if !is_json_parsed && has_active_sub && !bad_filters {
         match app_state.program_accounts.get(&pubkey, filters.clone()) {
             Some(data) => {
                 let accounts = data.value();
@@ -1030,14 +1040,20 @@ async fn get_program_accounts(
         }
     } else {
         cacheable_for_key = None;
+        let reason = match (is_json_parsed, !has_active_sub, bad_filters) {
+            (true, _, _) => "encoding",         // encoding has the highest priority
+            (false, true, _) => "inactive sub", // broken sub is second
+            (false, false, true) => "bad filters",
+            (false, false, false) => "", // this is unreachable
+        };
+
         metrics()
             .response_uncacheable
-            .with_label_values(&["getProgramAccounts", "encoding"])
+            .with_label_values(&["getProgramAccounts", reason])
             .inc();
     }
 
     let limit = &app_state.program_accounts_request_limit;
-
     let wait_for_response = app_state.request(&req, limit);
 
     tokio::pin!(wait_for_response);
@@ -1078,87 +1094,108 @@ async fn get_program_accounts(
         }
     };
 
-    if let Some(program_pubkey) = cacheable_for_key {
-        #[derive(Deserialize, Debug)]
-        struct AccountAndPubkey {
-            account: AccountInfo,
-            pubkey: Pubkey,
-        }
-
-        #[derive(Deserialize, Debug)]
-        struct ContextResponse {
-            context: SolanaContext,
-            value: Vec<AccountAndPubkey>,
-        }
-
-        #[derive(Deserialize, Debug)]
-        #[serde(rename_all = "lowercase")]
-        struct Flatten<T> {
-            #[serde(flatten)]
-            inner: T,
-        }
-
-        #[derive(Deserialize, Debug)]
-        #[serde(rename_all = "lowercase")]
-        enum Response<T> {
-            Result(T),
-            Error(RpcErrorOwned),
-        }
-
+    if cacheable_for_key.is_some() {
         let app_state = app_state.clone();
-        let filters = filters.clone();
-        let with_context = config.with_context.unwrap_or(false);
-        let stream = stream_generator::generate_try_stream(move |mut stream| async move {
-            let mut bytes_chain = BytesChain::new();
-            {
-                let incoming = collect_bytes("getProgramAccounts", resp, &mut bytes_chain);
+        let stream = program_response_stream::<Vec<AccountAndPubkey>, _, _>(
+            app_state,
+            (pubkey, commitment),
+            filters,
+            resp,
+            true,
+            |err| {
+                tracing::error!(error = %err, "failed to parse response");
+            },
+        );
 
-                tokio::pin!(incoming);
+        return Ok(HttpResponse::Ok()
+            .content_type("application/json")
+            .header("x-cache-status", "miss")
+            .streaming(Box::pin(stream)));
+    } else if bad_filters {
+        let app_state = app_state.clone();
+        let stream = program_response_stream::<[AccountAndPubkey; 0], _, _>(
+            app_state,
+            (pubkey, commitment),
+            filters,
+            resp,
+            false,
+            move |err| {
+                error!(pubkey = ?pubkey, error = ?err, "non-empty bad filter response");
+            },
+        );
 
-                while let Some(bytes) = incoming.next().await {
-                    let bytes = bytes.map_err(Error::Streaming)?;
-                    stream.send(Ok::<Bytes, Error<'_>>(bytes)).await;
-                }
+        return Ok(HttpResponse::Ok()
+            .content_type("application/json")
+            .header("x-cache-status", "miss")
+            .streaming(Box::pin(stream)));
+    }
+
+    Ok(HttpResponse::Ok()
+        .content_type("application/json")
+        .header("x-cache-status", "miss")
+        .streaming(Box::pin(resp)))
+}
+
+fn program_response_stream<'a, T, S, F>(
+    app_state: web::Data<State>,
+    (pubkey, commitment): (Pubkey, Commitment),
+    filters: Option<Filters>,
+    response_stream: S,
+    do_cache: bool,
+    on_error: F,
+) -> impl Stream<Item = Result<Bytes, Error<'a>>> + 'a
+where
+    T: AsRef<[AccountAndPubkey]> + IntoIterator<Item = AccountAndPubkey> + DeserializeOwned,
+    S: Stream<Item = Result<Bytes, awc::error::PayloadError>> + Unpin + 'a,
+    F: FnOnce(Error<'a>) + 'a,
+{
+    #[derive(Deserialize, Debug)]
+    #[serde(rename_all = "lowercase")]
+    struct Flatten<T> {
+        #[serde(flatten)]
+        inner: T,
+    }
+
+    #[derive(Deserialize, Debug)]
+    #[serde(rename_all = "lowercase")]
+    enum Response<T> {
+        Result(T),
+        Error(RpcErrorOwned),
+    }
+
+    stream_generator::generate_try_stream(move |mut stream| async move {
+        let mut bytes_chain = BytesChain::new();
+        {
+            let incoming = collect_bytes("getProgramAccounts", response_stream, &mut bytes_chain);
+
+            tokio::pin!(incoming);
+
+            while let Some(bytes) = incoming.next().await {
+                let bytes = bytes.map_err(Error::Streaming)?;
+                stream.send(Ok::<Bytes, Error<'_>>(bytes)).await;
             }
+        }
 
-            let res = (|| -> Result<_, Error<'_>> {
-                let (slot, accounts) = if with_context {
-                    let resp: Flatten<Response<ContextResponse>> =
-                        serde_json::from_reader(bytes_chain)?;
-                    match resp.inner {
-                        Response::Result(ctx) => (Some(ctx.context.slot), ctx.value),
-                        Response::Error(error) => {
-                            metrics()
-                                .backend_errors
-                                .with_label_values(&["getProgramAccounts"])
-                                .inc();
-                            info!(%pubkey, ?error, "can't cache for key");
-                            return Ok(());
-                        }
+        let res = (|| -> Result<_, Error<'_>> {
+            let (slot, accounts) = {
+                let resp: Flatten<Response<MaybeContext<T>>> =
+                    serde_json::from_reader(bytes_chain)?;
+                match resp.inner {
+                    Response::Result(maybe_ctx) => maybe_ctx.into_slot_and_value(),
+                    Response::Error(error) => {
+                        metrics()
+                            .backend_errors
+                            .with_label_values(&["getProgramAccounts"])
+                            .inc();
+                        info!(%pubkey, ?error, "can't cache for key");
+                        return Ok(());
                     }
-                } else {
-                    let resp: Flatten<Response<Vec<AccountAndPubkey>>> =
-                        serde_json::from_reader(bytes_chain)?;
-                    match resp.inner {
-                        Response::Result(data) => (None, data),
-                        Response::Error(error) => {
-                            metrics()
-                                .backend_errors
-                                .with_label_values(&["getProgramAccounts"])
-                                .inc();
-                            info!(%pubkey, ?error, "can't cache for key");
-                            return Ok(());
-                        }
-                    }
-                };
+                }
+            };
+            if do_cache {
+                app_state.subscribe(Subscription::Program(pubkey), commitment, filters.clone());
 
-                app_state.subscribe(
-                    Subscription::Program(program_pubkey),
-                    commitment,
-                    filters.clone(),
-                );
-
-                let mut keys = HashSet::with_capacity(accounts.len());
+                let mut keys = HashSet::with_capacity(accounts.as_ref().len());
                 for acc in accounts {
                     let AccountAndPubkey { account, pubkey } = acc;
                     let key_ref = app_state.insert(
@@ -1175,27 +1212,19 @@ async fn get_program_accounts(
                 }
                 app_state
                     .program_accounts
-                    .insert(program_pubkey, keys, commitment, filters);
+                    .insert(pubkey, keys, commitment, filters);
                 app_state.map_updated.notify();
-                Ok(())
-            })();
-            if let Err(res) = res {
-                tracing::error!(error = %res, "failed to parse response");
             }
 
             Ok(())
-        });
+        })();
 
-        return Ok(HttpResponse::Ok()
-            .content_type("application/json")
-            .header("x-cache-status", "miss")
-            .streaming(Box::pin(stream)));
-    }
+        if let Err(res) = res {
+            on_error(res);
+        }
 
-    Ok(HttpResponse::Ok()
-        .content_type("application/json")
-        .header("x-cache-status", "miss")
-        .streaming(Box::pin(resp)))
+        Ok(())
+    })
 }
 
 pub async fn rpc_handler(
