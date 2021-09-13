@@ -21,6 +21,7 @@ pub fn collect_all_matches<T>(tree: &FilterTree<T>, data: &AccountData) -> Vec<F
     vec
 }
 
+#[derive(Default)]
 #[cfg_attr(test, derive(Clone))] // Should this be cloneable?
 pub struct FilterTree<T> {
     // None is for filter groups that do not contain datasize filter
@@ -58,9 +59,12 @@ impl<T> FilterTree<T> {
         node.registered.replace(value)
     }
 
-    #[allow(unused)]
     pub fn len(&self) -> usize {
         self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
     }
 
     pub fn remove(&mut self, filters: &Filters) -> Option<T> {
