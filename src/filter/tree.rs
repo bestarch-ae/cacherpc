@@ -9,21 +9,21 @@ use super::{Filter, Filters, Memcmp, Pattern, Range};
 
 use node::MemcmpNode;
 
-type Registered = bool;
+type Registered<T> = Option<T>;
 
-pub(crate) struct FilterTree {
+pub(crate) struct FilterTree<T> {
     // None is for filter groups that do not contain datasize filter
-    data_size: HashMap<Option<u64>, MemcmpNode>,
+    data_size: HashMap<Option<u64>, MemcmpNode<T>>,
 }
 
-impl FilterTree {
+impl<T> FilterTree<T> {
     pub fn new() -> Self {
         Self {
             data_size: HashMap::new(),
         }
     }
 
-    pub fn insert(&mut self, filters: Filters) {
+    pub fn insert(&mut self, filters: Filters, value: T) {
         let mut node = self.data_size.entry(filters.data_size).or_default();
 
         let memcmp = filters.memcmp;
@@ -38,14 +38,11 @@ impl FilterTree {
                 .or_default();
         }
 
-        node.registered = true;
+        node.registered = Some(value);
     }
 
-    pub fn remove(&mut self, filters: &Filters) {
-        let mut node = match self.data_size.get_mut(&filters.data_size) {
-            Some(node) => node,
-            None => return,
-        };
+    pub fn remove(&mut self, filters: &Filters) -> Option<T> {
+        let mut node = self.data_size.get_mut(&filters.data_size)?;
 
         let memcmp = &filters.memcmp;
 
@@ -56,13 +53,10 @@ impl FilterTree {
                 .get_mut(&range)
                 .and_then(|nodes| nodes.get_mut(&filter.bytes));
 
-            node = match temp_node {
-                Some(node) => node,
-                None => return,
-            };
+            node = temp_node?;
         }
 
-        node.registered = false;
+        node.registered.take()
     }
 
     pub fn map_matches(&self, data: &AccountData, mut f: impl FnMut(Filters)) {
@@ -82,9 +76,9 @@ impl FilterTree {
     }
 }
 
-impl IntoIterator for FilterTree {
-    type Item = Filters;
-    type IntoIter = IntoIter;
+impl<T> IntoIterator for FilterTree<T> {
+    type Item = (Filters, T);
+    type IntoIter = IntoIter<T>;
 
     fn into_iter(self) -> Self::IntoIter {
         IntoIter {
@@ -94,12 +88,12 @@ impl IntoIterator for FilterTree {
     }
 }
 
-pub struct IntoIter {
-    roots_iter: HashMapIntoIter<Option<u64>, MemcmpNode>,
-    node_stack: Vec<(Option<Filter>, node::IntoIter)>,
+pub struct IntoIter<T> {
+    roots_iter: HashMapIntoIter<Option<u64>, MemcmpNode<T>>,
+    node_stack: Vec<(Option<Filter>, node::IntoIter<T>)>,
 }
 
-impl IntoIter {
+impl<T> IntoIter<T> {
     fn collect_current_filter(&self) -> Filters {
         let filters = self
             .node_stack
@@ -110,19 +104,19 @@ impl IntoIter {
     }
 }
 
-impl Iterator for IntoIter {
-    type Item = Filters;
+impl<T> Iterator for IntoIter<T> {
+    type Item = (Filters, T);
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             if let Some((_current_filter, current_node)) = self.node_stack.last_mut() {
                 match current_node.next() {
-                    Some((new_memcmp, new_node)) => {
-                        let is_leaf = new_node.registered;
+                    Some((new_memcmp, mut new_node)) => {
+                        let is_leaf = new_node.registered.take();
                         self.node_stack
                             .push((Some(Filter::Memcmp(new_memcmp)), new_node.into_iter()));
-                        if is_leaf {
-                            return Some(self.collect_current_filter());
+                        if let Some(value) = is_leaf {
+                            return Some((self.collect_current_filter(), value));
                         }
                     }
                     None => {
@@ -130,13 +124,13 @@ impl Iterator for IntoIter {
                     }
                 }
             } else {
-                let (data_size, node) = self.roots_iter.next()?;
+                let (data_size, mut node) = self.roots_iter.next()?;
                 // Though Filters implementation guarantees empty group is invalid.
-                let is_leaf = data_size.is_some() && node.registered;
+                let is_leaf = data_size.and(node.registered.take());
                 self.node_stack
                     .push((data_size.map(Filter::DataSize), node.into_iter()));
-                if is_leaf {
-                    return Some(self.collect_current_filter());
+                if let Some(value) = is_leaf {
+                    return Some((self.collect_current_filter(), value));
                 }
             }
         }
@@ -144,18 +138,19 @@ impl Iterator for IntoIter {
 }
 
 mod node {
+    use backoff::default;
+
     use super::*;
 
-    #[derive(Default)]
-    pub struct MemcmpNode {
-        pub(super) registered: Registered,
-        pub(super) children: HashMap<Range, HashMap<Pattern, MemcmpNode>>,
+    pub struct MemcmpNode<T> {
+        pub(super) registered: Registered<T>,
+        pub(super) children: HashMap<Range, HashMap<Pattern, MemcmpNode<T>>>,
     }
 
-    impl MemcmpNode {
+    impl<T> MemcmpNode<T> {
         pub fn map_matches(&self, base: &Filters, data: &AccountData, f: &mut impl FnMut(Filters)) {
             // f is &mut so that the compiler wont fail because of recursion limit
-            if self.registered {
+            if self.registered.is_some() {
                 f(base.clone())
             }
 
@@ -177,9 +172,9 @@ mod node {
         }
     }
 
-    impl IntoIterator for MemcmpNode {
-        type Item = (Memcmp, MemcmpNode);
-        type IntoIter = IntoIter;
+    impl<T> IntoIterator for MemcmpNode<T> {
+        type Item = (Memcmp, MemcmpNode<T>);
+        type IntoIter = IntoIter<T>;
 
         fn into_iter(self) -> Self::IntoIter {
             IntoIter {
@@ -189,13 +184,13 @@ mod node {
         }
     }
 
-    pub struct IntoIter {
-        ranges_iter: HashMapIntoIter<Range, HashMap<Pattern, MemcmpNode>>,
-        pattern_iter: Option<(Range, HashMapIntoIter<Pattern, MemcmpNode>)>,
+    pub struct IntoIter<T> {
+        ranges_iter: HashMapIntoIter<Range, HashMap<Pattern, MemcmpNode<T>>>,
+        pattern_iter: Option<(Range, HashMapIntoIter<Pattern, MemcmpNode<T>>)>,
     }
 
-    impl Iterator for IntoIter {
-        type Item = (Memcmp, MemcmpNode);
+    impl<T> Iterator for IntoIter<T> {
+        type Item = (Memcmp, MemcmpNode<T>);
 
         fn next(&mut self) -> Option<Self::Item> {
             loop {
@@ -218,6 +213,15 @@ mod node {
             }
         }
     }
+
+    impl<T> Default for MemcmpNode<T> {
+        fn default() -> Self {
+            Self {
+                registered: None,
+                children: HashMap::default(),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -226,7 +230,7 @@ mod tests {
 
     use super::*;
 
-    fn all_matches(tree: &FilterTree, data: &AccountData) -> Vec<Filters> {
+    fn all_matches<T>(tree: &FilterTree<T>, data: &AccountData) -> Vec<Filters> {
         let mut vec = Vec::new();
         let closure = |filters| vec.push(filters);
 
@@ -239,7 +243,7 @@ mod tests {
         let filters = filters!(@size 20, @cmp 3: [1, 2, 3, 4]).unwrap();
 
         let mut tree = FilterTree::new();
-        tree.insert(filters.clone());
+        tree.insert(filters.clone(), ());
 
         let mut data = vec![0; 20];
         (1u8..8).for_each(|i| data[2 + i as usize] = i);
@@ -248,7 +252,7 @@ mod tests {
         assert_eq!(all_matches(&tree, &data), vec![filters.clone()]);
 
         let filters2 = filters!(@size 20, @cmp 5: [3, 4, 5, 6, 7]).unwrap();
-        tree.insert(filters2.clone());
+        tree.insert(filters2.clone(), ());
 
         let expected: HashSet<_> = vec![filters.clone(), filters2.clone()]
             .into_iter()
@@ -259,8 +263,8 @@ mod tests {
         // A couple of bad filters
         let filters3 = filters!(@size 19, @cmp 5: [3, 4, 5, 6, 7]).unwrap();
         let filters4 = filters!(@size 20, @cmp 5: [3, 4, 5, 5, 7]).unwrap();
-        tree.insert(filters3.clone());
-        tree.insert(filters4.clone());
+        tree.insert(filters3.clone(), ());
+        tree.insert(filters4.clone(), ());
 
         let actual: HashSet<_> = all_matches(&tree, &data).into_iter().collect();
         assert_eq!(expected, actual);
