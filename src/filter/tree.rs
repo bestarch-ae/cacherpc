@@ -1,11 +1,11 @@
-use std::collections::hash_map::{IntoIter as HashMapIntoIter, Iter as HashMapIter};
+use std::collections::hash_map::{Entry, IntoIter as HashMapIntoIter, Iter as HashMapIter};
 use std::collections::HashMap;
 
 use smallvec::SmallVec;
-
-use crate::types::AccountData;
+use tracing::error;
 
 use super::{Filter, Filters, Memcmp, Pattern, Range, RESERVED_RANGE};
+use crate::types::AccountData;
 
 use node::MemcmpNode;
 
@@ -19,6 +19,13 @@ pub fn collect_all_matches<T>(tree: &FilterTree<T>, data: &AccountData) -> Vec<F
 
     tree.map_matches(data, closure);
     vec
+}
+
+macro_rules! assert_or_err {
+    ($cond:expr $(, $($arg:tt)+ )?) => {
+        debug_assert!($cond $(, $($arg)+ )?);
+        $(if !$cond { error!($($arg)+); })?
+    };
 }
 
 #[derive(Default)]
@@ -71,22 +78,82 @@ impl<T> FilterTree<T> {
         let mut node = self.data_size.get_mut(&filters.data_size)?;
 
         let memcmp = &filters.memcmp;
+        // Find the highest dead node
+        let mut remove_from = None;
 
-        for filter in memcmp {
+        for (idx, filter) in memcmp.into_iter().enumerate() {
             let range = filter.range();
-            let temp_node = node
-                .children
-                .get_mut(&range)
-                .and_then(|nodes| nodes.get_mut(&filter.bytes));
+            let mut to_remove = node.registered.is_none() && node.children.len() < 2;
+            let by_pattern = node.children.get_mut(&range)?;
+            // Schedule a node for removal if it has no value and not more than one child
+            // (that we're indexing into).
+            // Check the previous node so the zero index would correpond to data_size layer
+            // and applying idx filters (including data_size) to the tree
+            // would yield the node before the one to remove from and the filter to remove at.
+            to_remove &= by_pattern.len() < 2;
 
-            node = temp_node?;
+            node = by_pattern.get_mut(&filter.bytes)?;
+
+            if to_remove {
+                remove_from.get_or_insert(idx);
+            } else {
+                // A not-ok-to-remove node invalidates it's parents
+                remove_from = None;
+            }
         }
 
-        if node.registered.is_some() {
+        let value = node.registered.take();
+        if !node.children.is_empty() {
+            // If this is not a leaf node we cannot remove anything we scheduled
+            remove_from.take();
+        }
+
+        if value.is_some() {
             self.len = self.len.saturating_sub(1);
+            match remove_from {
+                Some(0) => {
+                    self.data_size.remove(&filters.data_size);
+                }
+                Some(idx) => {
+                    let idx = idx - 1; // idx > 0
+                    let mut maybe_node = self.data_size.get_mut(&filters.data_size);
+
+                    for filter in memcmp.into_iter().take(idx) {
+                        if let Some(node) = maybe_node.take() {
+                            maybe_node = node
+                                .children
+                                .get_mut(&filter.range())
+                                .and_then(|by_pattern| by_pattern.get_mut(&filter.bytes));
+                        } else {
+                            break;
+                        }
+                    }
+
+                    let maybe_node = maybe_node.zip(memcmp.get(idx)).and_then(|(node, filter)| {
+                        match node.children.entry(filter.range()) {
+                            Entry::Occupied(entry) => Some((entry, filter)),
+                            Entry::Vacant(_) => None,
+                        }
+                    });
+
+                    if let Some((mut node, filter)) = maybe_node {
+                        let removed = node.get_mut().remove(&filter.bytes);
+                        let removed_ok = removed.map_or(true, |node| {
+                            node.registered.is_none() && node.children.len() <= 1
+                        });
+                        assert_or_err!(removed_ok, "removed node that was not supposed to");
+                        if node.get_mut().is_empty() {
+                            node.remove();
+                        }
+                    } else {
+                        assert_or_err!(false, "could not index into node for deletion");
+                    }
+                }
+                None => (),
+            }
         }
 
-        node.registered.take()
+        value
     }
 
     pub fn map_matches(&self, data: &AccountData, f: impl FnMut(Filters)) {
