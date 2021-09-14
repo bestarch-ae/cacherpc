@@ -775,8 +775,8 @@ struct ProgramAccountsConfig<'a> {
     data_slice: Option<Slice>,
     #[serde(borrow)]
     filters: Option<&'a RawValue>,
-    #[serde(rename = "withContext", default = "bool::default")]
-    with_context: bool,
+    #[serde(rename = "withContext")]
+    with_context: Option<bool>,
 }
 
 impl Default for ProgramAccountsConfig<'_> {
@@ -786,7 +786,7 @@ impl Default for ProgramAccountsConfig<'_> {
             commitment: None,
             data_slice: None,
             filters: None,
-            with_context: false,
+            with_context: None,
         }
     }
 }
@@ -961,7 +961,7 @@ async fn get_program_accounts(
                         &config,
                         filters.as_ref(),
                         &app_state,
-                        return_context,
+                        return_context.unwrap_or(false),
                     ) {
                         Ok(resp) => return Ok(resp),
                         Err(ProgramAccountsResponseError::Base58) => {
@@ -999,7 +999,7 @@ async fn get_program_accounts(
     // We only enforce context for cacheable request, since we need slot for correct caching.
     // For non-cached requests we do not alter the config, so that we don't have to reserialize the response.
     if cacheable_for_key.is_some() {
-        config.with_context = true;
+        config.with_context = Some(true);
     }
 
     let params = (pubkey, &config);
@@ -1038,7 +1038,7 @@ async fn get_program_accounts(
                                 &config,
                                 filters.as_ref(),
                                 &app_state,
-                                return_context,
+                                return_context.unwrap_or(false),
                             ) {
                                 return Ok(resp);
                             }
@@ -1051,7 +1051,7 @@ async fn get_program_accounts(
     };
 
     if let Some(program_pubkey) = cacheable_for_key {
-        if !config.with_context {
+        if !config.with_context.unwrap_or(false) {
             // TODO?: consider panicing since this is a logic error
             error!("requested cacheable program accounts without context");
         }
@@ -1116,7 +1116,7 @@ async fn get_program_accounts(
 
                 // We have to reserialize if the client did not use withContext toggle,
                 // since we enforce it for every cacheable request.
-                if !return_context {
+                if !return_context.unwrap_or(false) {
                     let resp = JsonRpcResponse {
                         jsonrpc: "2.0",
                         id: req.id,
