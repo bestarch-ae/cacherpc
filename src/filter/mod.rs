@@ -5,6 +5,8 @@ use crate::types::AccountData;
 
 #[cfg_attr(test, macro_use)]
 mod filters;
+#[cfg(test)]
+mod tests;
 mod tree;
 
 pub use filters::{Filters, NormalizeError};
@@ -84,39 +86,4 @@ where
         }
     }
     de.deserialize_str(Base58Visitor)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn filters_order() {
-        let f1 = Filter::Memcmp(Memcmp {
-            offset: 1,
-            bytes: SmallVec::new(),
-        });
-        let f2 = Filter::DataSize(0);
-        assert!(f2 < f1);
-    }
-
-    #[test]
-    fn deserialize_filters() {
-        let filter: Filter = serde_json::from_str(
-            r#"{"memcmp":{"offset":13,"bytes":"HWHvQhFmJB3NUcu1aihKmrKegfVxBEHzwVX6yZCKEsi1"}}"#,
-        )
-        .unwrap();
-        let expected = Filter::Memcmp(Memcmp {
-            offset: 13,
-            bytes: smallvec::smallvec![
-                245, 59, 247, 123, 252, 249, 77, 70, 227, 252, 215, 248, 153, 192, 98, 123, 28,
-                232, 159, 173, 44, 138, 177, 107, 137, 62, 126, 139, 186, 244, 124, 90
-            ],
-        });
-        assert_eq!(filter, expected);
-
-        let filter: Filter = serde_json::from_str(r#"{"dataSize":42069}"#).unwrap();
-        let expected = Filter::DataSize(42069);
-        assert_eq!(filter, expected);
-    }
 }

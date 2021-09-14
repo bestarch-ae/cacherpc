@@ -107,35 +107,3 @@ macro_rules! filters {
         $crate::filter::Filters::new_normalized(filters)
     }};
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn normalize() {
-        // Multiple datasizes always normalize to false
-        assert_eq!(
-            filters!(@size 420, @size 69, @size 420),
-            Err(NormalizeError::DuplicateDataSize)
-        );
-
-        // Equal datasizes are stripped
-        assert_eq!(
-            filters!(@size 420, @size 420).unwrap(),
-            filters!(@size 420).unwrap(),
-        );
-
-        // Order is determined
-        let filters1 =
-            filters!(@cmp 13: [2, 4, 5, 7, 2, 4], @size 42, @cmp 1098: [3, 4, 3, 3, 3]).unwrap();
-        let filters2 =
-            filters!(@cmp 1098: [3, 4, 3, 3, 3], @cmp 13: [2, 4, 5, 7, 2, 4], @size 42).unwrap();
-        let filters3 =
-            filters!(@size 42, @cmp 13: [2, 4, 5, 7, 2, 4], @cmp 1098: [3, 4, 3, 3, 3]).unwrap();
-
-        assert_eq!(filters1, filters2);
-        assert_eq!(filters2, filters3);
-        assert_eq!(filters1, filters3);
-    }
-}
