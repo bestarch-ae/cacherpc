@@ -501,6 +501,7 @@ impl<'de> Deserialize<'de> for Pubkey {
 }
 
 #[derive(Debug)]
+#[cfg_attr(test, derive(Clone))]
 pub struct AccountData {
     pub data: Bytes,
 }

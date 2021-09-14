@@ -482,9 +482,275 @@ mod node {
 mod tests {
     use std::collections::HashSet;
 
+    use bytes::Bytes;
+    use proptest::collection::hash_set;
+    use proptest::option;
+    use proptest::prelude::*;
     use smallvec::smallvec;
 
     use super::*;
+
+    const MAX_ACCOUNT_SIZE: usize = 10 * 1024 * 1024;
+    const MAX_PATTERN_SIZE: usize = 128;
+
+    // ===== Helper filter-related strategies =====
+
+    prop_compose! {
+        fn account(max_size: usize)
+                  (vec in prop::collection::vec(any::<u8>(), 1..max_size)) -> AccountData
+        {
+            AccountData {
+                data: Bytes::from(vec)
+            }
+        }
+    }
+
+    fn is_none<T>(opt: Option<T>) -> usize {
+        opt.as_ref().map_or(1, |_| 0)
+    }
+
+    // ---- Memcmp -----
+    prop_compose! {
+        fn arb_range()(pattern_len in 1..=MAX_PATTERN_SIZE)
+                      (offset in 0..(MAX_ACCOUNT_SIZE - pattern_len), pattern_len in Just(pattern_len))
+                      -> (usize, usize)
+        {
+            (offset, (offset + pattern_len))
+        }
+    }
+
+    prop_compose! {
+        fn valid_ranges(data_len: usize)(offset in 0..(data_len - 1))
+                       (offset in Just(offset), slice_len in 1..(data_len - offset).min(128))
+                       -> (usize, usize) {
+            (offset, slice_len)
+        }
+    }
+
+    prop_compose! {
+        fn memcmp_from_range(range: (usize, usize))
+                            (data in prop::collection::vec(any::<u8>(), range.1 - range.0))
+                        -> Memcmp {
+            Memcmp {
+                offset: range.0,
+                bytes: Pattern::from(data),
+            }
+        }
+    }
+
+    prop_compose! {
+        fn valid_memcmp(account: AccountData)
+                       ((offset, slice_len) in valid_ranges(account.len()))
+                        -> Memcmp
+        {
+            let slice = account.data.get(offset..(offset + slice_len)).unwrap();
+            Memcmp {
+                offset,
+                bytes: Pattern::from_slice(slice),
+            }
+        }
+    }
+
+    // ----- Filters -----
+    fn arb_filters(max_memcmps: usize) -> impl Strategy<Value = Filters> {
+        let data_size = option::of(any::<u64>());
+        let strat = data_size.prop_flat_map(move |data_size| {
+            let memcmps = hash_set(
+                arb_range().prop_flat_map(memcmp_from_range),
+                is_none(data_size)..max_memcmps,
+            );
+            (Just(data_size), memcmps)
+        });
+
+        strat.prop_map(|(data_size, memcmps)| {
+            let raw = data_size
+                .map(Filter::DataSize)
+                .into_iter()
+                .chain(memcmps.into_iter().map(Filter::Memcmp));
+            Filters::new_normalized(raw).unwrap()
+        })
+    }
+
+    prop_compose! {
+        fn arb_non_matching_filters(max_memcmps: usize, data: AccountData)
+                                   (filters in arb_filters(max_memcmps).prop_filter(
+                                        "Filter matched",
+                                        move |f| !f.matches(&data),
+                                   ))
+                                   -> Filters
+        { filters }
+    }
+
+    prop_compose! {
+        fn valid_filters(acc: AccountData, max_memcmps: usize)
+                        (data_size in prop::option::of(Just(acc.len() as u64)))
+                        (memcmps in hash_set(valid_memcmp(acc.clone()), is_none(data_size)..max_memcmps),
+                         data_size in Just(data_size))
+                        -> Filters
+        {
+            let raw = data_size.map(Filter::DataSize).into_iter().chain(
+                memcmps.into_iter().map(Filter::Memcmp)
+            );
+            Filters::new_normalized(raw).unwrap()
+        }
+    }
+
+    // ===== HashMap Operation =====
+
+    #[derive(Debug)]
+    enum HashMapOp<K, V> {
+        Insert((K, V)),
+        Remove(K),
+    }
+
+    fn arb_ops<K: Strategy + Clone, V: Strategy>(
+        key_strat: K,
+        value_strat: V,
+    ) -> impl Strategy<Value = HashMapOp<K::Value, V::Value>> {
+        prop_oneof![
+            (key_strat.clone(), value_strat).prop_map(HashMapOp::Insert),
+            key_strat.prop_map(HashMapOp::Remove)
+        ]
+    }
+
+    // ===== Strategies for generating test parameters =====
+
+    prop_compose! {
+        /// Generate an accout and arbitrary matching filter groups
+        fn acc_and_valid_filters(max_acc_size: usize, max_depth: usize, max_filters: usize)
+                                (acc in account(max_acc_size))
+                                (acc in Just(acc.clone()),
+                                 groups in hash_set(valid_filters(acc, max_depth), 0..max_filters))
+                                -> (AccountData, HashSet<Filters>)
+        { (acc, groups) }
+    }
+
+    prop_compose! {
+        /// Generate an accout and arbitrary filter groups (both matching and non-matching)
+        fn acc_and_arb_filters(max_acc_size: usize, max_depth: usize, max_good: usize, max_bad: usize)
+                              ((acc, good) in acc_and_valid_filters(max_acc_size, max_depth, max_good))
+                              (bad in hash_set(arb_non_matching_filters(max_depth, acc.clone()), 0..max_bad),
+                               acc in Just(acc), good in Just(good))
+                              -> (AccountData, HashSet<Filters>, HashSet<Filters>)
+        { (acc, good, bad) }
+    }
+
+    prop_compose! {
+        /// Generate a set of filters and a sequence of insert-remove operations
+        /// that use filters from the set as keys
+        fn arb_hashmap_ops(max_depth: usize, max_groups: usize, max_ops: usize)
+                          (groups in hash_set(arb_filters(max_depth), 1..max_groups))
+                          (ops in prop::collection::vec(
+                               arb_ops(0..groups.len(), any::<usize>()),
+                               0..max_ops,
+                           ),
+                           groups in Just(groups))
+                          -> (HashSet<Filters>, Vec<HashMapOp<usize, usize>>)
+        { (groups, ops) }
+    }
+
+    // ===== Proptests =====
+
+    proptest! {
+        #[test]
+        /// Tests that [`FilterTree`] constructed only from filter-groups that match an account
+        /// returns all filters contained within a tree in a [`FiltersTree::map_matches`] call
+        fn test_matches_valid_filters(
+            (acc, filter_groups) in acc_and_valid_filters(128 * 1024, 3, 300)
+        ) {
+            let mut tree = FilterTree::new();
+            for group in &filter_groups {
+                tree.insert(group.clone(), ());
+            }
+
+            let matched = collect_all_matches(&tree, &acc);
+            assert_eq!(matched.len(), filter_groups.len());
+            let matched: HashSet<_> = matched.into_iter().collect();
+            assert_eq!(matched, filter_groups);
+        }
+
+        #[test]
+        /// Tests that [`FilterTree::map_matches`] will return matching
+        /// and will not return non-matching filter groups
+        fn test_matches_overall(
+            (acc, good_filters, bad_filters)
+                in acc_and_arb_filters(1024, 12, 200, 200)
+        ) {
+            let mut tree = FilterTree::new();
+            for group in good_filters.iter().chain(&bad_filters) {
+                tree.insert(group.clone(), ());
+            }
+
+            let matched = collect_all_matches(&tree, &acc);
+            assert_eq!(matched.len(), good_filters.len());
+            let matched: HashSet<_> = matched.into_iter().collect();
+            assert_eq!(matched, good_filters);
+
+            for group in good_filters {
+                tree.remove(&group).unwrap();
+            }
+
+            let actual: Vec<Filters> = tree.into_iter().map(|(k, _)| k).collect();
+            assert_eq!(actual.len(), bad_filters.len());
+            let actual: HashSet<_> = actual.into_iter().collect();
+            assert_eq!(actual, bad_filters);
+
+        }
+
+        #[test]
+        /// Tests that [`FilterTree`] operates as a map in terms of insert and remove operations,
+        /// as well as that remove do not drop or remove unrelated values or nodes.
+        fn map((set, ops) in arb_hashmap_ops(24, 300, 10_000)) {
+            let set: Vec<_> = set.into_iter().collect();
+            let mut map = HashMap::new();
+            let mut tree = FilterTree::new();
+
+            #[derive(Default, PartialEq, Eq, Debug, Clone)]
+            struct DropChecker(bool);
+            impl Drop for DropChecker {
+                fn drop(&mut self) {
+                    assert!(self.0, "dropped without removal");
+                }
+            }
+
+            fn disarm<T>((a, mut b): (T, DropChecker)) -> (T, DropChecker) {
+                b.0 = true;
+                (a, b)
+            }
+
+            ops.into_iter().for_each(|op| match op {
+                HashMapOp::Insert((key, value)) => {
+                    let filters = set.get(key).unwrap();
+                    let expected = map
+                        .insert(filters.clone(), (value, DropChecker::default()))
+                        .map(disarm);
+                    let actual = tree
+                        .insert(filters.clone(), (value, DropChecker::default()))
+                        .map(disarm);
+
+                    assert_eq!(expected, actual);
+                    assert_eq!(map.len(), tree.len());
+                }
+                HashMapOp::Remove(key) => {
+                    let filters = set.get(key).unwrap();
+                    let expected = map.remove(filters).map(disarm);
+                    let actual = tree.remove(filters).map(disarm);
+                    if let Some((expected, actual)) = expected.clone().zip(actual.clone()) {
+                        assert_eq!(expected.0, actual.0);
+                    } else {
+                        assert_eq!(expected, actual);
+                    }
+                    assert_eq!(map.len(), tree.len());
+                }
+            });
+
+            map.values_mut().for_each(|(_, checker)| checker.0 = true);
+            let tree: HashMap<_, _> = tree.into_iter().map(|(k, v)| (k, disarm(v))).collect();
+            assert_eq!(map, tree);
+        }
+    }
+
+    // ===== Basic tests =====
 
     #[test]
     fn basic_functionality() {
