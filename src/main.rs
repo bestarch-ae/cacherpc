@@ -1,4 +1,6 @@
 use std::cell::RefCell;
+use std::fs::File;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -6,12 +8,11 @@ use std::time::Duration;
 use actix_cors::Cors;
 use actix_web::{guard, web, App, HttpServer};
 use anyhow::{Context, Result};
-use arc_swap::ArcSwap;
 use awc::Client;
 use either::Either;
 use lru::LruCache;
 use structopt::StructOpt;
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::{watch, Notify, Semaphore};
 use tracing::info;
 use tracing_subscriber::fmt;
 
@@ -88,6 +89,8 @@ struct Options {
         parse(try_from_str = humantime::parse_duration)
     )]
     time_to_live: Duration,
+    #[structopt(long = "config", help = "config path")]
+    config: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -150,6 +153,53 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+#[derive(serde::Deserialize, Debug, Clone)]
+struct Config {
+    rpc: rpc::Config,
+}
+
+impl Config {
+    fn from_file(f: File) -> Result<Config> {
+        use std::io::{BufReader, Read};
+        let mut reader = BufReader::new(f);
+        let mut buf = Vec::new();
+
+        reader.read_to_end(&mut buf)?;
+        Ok(toml::from_slice(&buf)?)
+    }
+
+    fn from_options(options: &Options) -> Config {
+        Config {
+            rpc: rpc::Config {
+                request_limits: rpc::RequestLimits {
+                    account_info: options.account_info_request_limit,
+                    program_accounts: options.program_accounts_request_limit,
+                },
+            },
+        }
+    }
+}
+
+async fn config_read_loop(path: PathBuf, rpc: watch::Sender<rpc::Config>) {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut stream = signal(SignalKind::hangup()).expect("failed to register signal handler");
+
+    while stream.recv().await.is_some() {
+        match File::open(&path) {
+            Ok(file) => match Config::from_file(file) {
+                Ok(config) => {
+                    let _ = rpc.broadcast(config.rpc);
+                    info!("config reloaded");
+                }
+                Err(err) => tracing::error!(error = %err, path = ?path, "error parsing config"),
+            },
+            Err(err) => {
+                tracing::error!(path = ?path, error = %err, "failed to open config");
+            }
+        }
+    }
+}
+
 async fn run(options: Options) -> Result<()> {
     let accounts = AccountsDb::new();
     let program_accounts = ProgramAccountsDb::new();
@@ -162,6 +212,16 @@ async fn run(options: Options) -> Result<()> {
         options.time_to_live,
     );
 
+    let config_file = options
+        .config
+        .as_ref()
+        .map(std::fs::File::open)
+        .transpose()?;
+    let config = config_file
+        .map(Config::from_file)
+        .transpose()?
+        .unwrap_or_else(|| Config::from_options(&options));
+
     let rpc_url = options.rpc_url;
     let notify = Arc::new(Notify::new());
     let request_limits = rpc::RequestLimits {
@@ -172,10 +232,16 @@ async fn run(options: Options) -> Result<()> {
     let program_accounts_request_limit = Arc::new(Semaphore::new(request_limits.program_accounts));
     let total_connection_limit =
         2 * (request_limits.account_info + request_limits.program_accounts);
-    let request_limits = Arc::new(ArcSwap::from(Arc::new(request_limits)));
     let body_cache_size = options.body_cache_size;
     let worker_id_counter = Arc::new(AtomicUsize::new(0));
     let bind_addr = &options.addr;
+
+    info!(?config, "config");
+    let (sender, receiver) = watch::channel(config.rpc.clone());
+
+    if let Some(path) = options.config {
+        actix::spawn(config_read_loop(path, sender));
+    }
 
     HttpServer::new(move || {
         let client = Client::builder()
@@ -198,7 +264,8 @@ async fn run(options: Options) -> Result<()> {
             map_updated: notify.clone(),
             account_info_request_limit: account_info_request_limit.clone(),
             program_accounts_request_limit: program_accounts_request_limit.clone(),
-            request_limits: request_limits.clone(),
+            config_watch: RefCell::new(receiver.clone()),
+            config: RefCell::new(config.rpc.clone()),
             lru: RefCell::new(LruCache::new(body_cache_size)),
             worker_id: {
                 let id = worker_id_counter.fetch_add(1, Ordering::SeqCst);
@@ -222,7 +289,6 @@ async fn run(options: Options) -> Result<()> {
                     .route(web::post().to(rpc::bad_content_type_handler)),
             )
             .service(web::resource("/metrics").route(web::get().to(rpc::metrics_handler)))
-            .service(web::resource("/config").route(web::post().to(rpc::config_handler)))
     })
     .bind(bind_addr)
     .with_context(|| format!("failed to bind to {}", bind_addr))?
