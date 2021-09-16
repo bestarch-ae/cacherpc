@@ -6,6 +6,7 @@ use std::time::Duration;
 use actix_cors::Cors;
 use actix_web::{guard, web, App, HttpServer};
 use anyhow::{Context, Result};
+use arc_swap::ArcSwap;
 use awc::Client;
 use either::Either;
 use lru::LruCache;
@@ -163,11 +164,15 @@ async fn run(options: Options) -> Result<()> {
 
     let rpc_url = options.rpc_url;
     let notify = Arc::new(Notify::new());
-    let account_info_request_limit = Arc::new(Semaphore::new(options.account_info_request_limit));
-    let program_accounts_request_limit =
-        Arc::new(Semaphore::new(options.program_accounts_request_limit));
+    let request_limits = rpc::RequestLimits {
+        account_info: options.account_info_request_limit,
+        program_accounts: options.program_accounts_request_limit,
+    };
+    let account_info_request_limit = Arc::new(Semaphore::new(request_limits.account_info));
+    let program_accounts_request_limit = Arc::new(Semaphore::new(request_limits.program_accounts));
     let total_connection_limit =
-        2 * (options.account_info_request_limit + options.program_accounts_request_limit);
+        2 * (request_limits.account_info + request_limits.program_accounts);
+    let request_limits = Arc::new(ArcSwap::from(Arc::new(request_limits)));
     let body_cache_size = options.body_cache_size;
     let worker_id_counter = Arc::new(AtomicUsize::new(0));
     let bind_addr = &options.addr;
@@ -193,6 +198,7 @@ async fn run(options: Options) -> Result<()> {
             map_updated: notify.clone(),
             account_info_request_limit: account_info_request_limit.clone(),
             program_accounts_request_limit: program_accounts_request_limit.clone(),
+            request_limits: request_limits.clone(),
             lru: RefCell::new(LruCache::new(body_cache_size)),
             worker_id: {
                 let id = worker_id_counter.fetch_add(1, Ordering::SeqCst);
@@ -216,6 +222,7 @@ async fn run(options: Options) -> Result<()> {
                     .route(web::post().to(rpc::bad_content_type_handler)),
             )
             .service(web::resource("/metrics").route(web::get().to(rpc::metrics_handler)))
+            .service(web::resource("/config").route(web::post().to(rpc::config_handler)))
     })
     .bind(bind_addr)
     .with_context(|| format!("failed to bind to {}", bind_addr))?

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use actix_web::{web, HttpResponse, ResponseError};
-
+use arc_swap::ArcSwap;
 use awc::Client;
 use backoff::backoff::Backoff;
 use bytes::Bytes;
@@ -200,6 +200,7 @@ pub struct State {
     pub map_updated: Arc<Notify>,
     pub account_info_request_limit: Arc<Semaphore>,
     pub program_accounts_request_limit: Arc<Semaphore>,
+    pub request_limits: Arc<ArcSwap<RequestLimits>>,
     pub lru: RefCell<LruCache<u64, LruEntry>>,
     pub worker_id: String,
 }
@@ -259,6 +260,7 @@ impl State {
                 .wait_time
                 .with_label_values(&[req.method])
                 .start_timer();
+
             let _permit = limit.acquire().await;
             metrics()
                 .available_permits
@@ -1312,11 +1314,84 @@ pub fn bad_content_type_handler() -> HttpResponse {
         .body("Supplied content type is not allowed. Content-Type: application/json is required")
 }
 
+#[derive(Debug, Copy, Clone, Serialize)]
+pub struct RequestLimits {
+    pub account_info: usize,
+    pub program_accounts: usize,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct Config {
+    #[serde(default)]
+    account_request_limit: Option<usize>,
+    #[serde(default)]
+    program_request_limit: Option<usize>,
+}
+
+pub async fn config_handler(
+    request: actix_web::web::Json<Config>,
+    app_state: web::Data<State>,
+) -> Result<HttpResponse, Error<'static>> {
+    /* we ignore a possible race here, hoping nobody is spamming config changes */
+    let current_limits: RequestLimits = **app_state.request_limits.load();
+    let new_limits = RequestLimits {
+        account_info: request
+            .account_request_limit
+            .unwrap_or(current_limits.account_info),
+        program_accounts: request
+            .program_request_limit
+            .unwrap_or(current_limits.program_accounts),
+    };
+    app_state.request_limits.store(Arc::new(new_limits));
+
+    async fn apply_limit(old_limit: usize, new_limit: usize, semaphore: &Semaphore) {
+        if new_limit > old_limit {
+            semaphore.add_permits(new_limit - old_limit);
+        } else {
+            for _ in 0..old_limit - new_limit {
+                semaphore.acquire().await.forget();
+            }
+        }
+    }
+
+    if let Some(new_limit) = request.account_request_limit {
+        apply_limit(
+            current_limits.account_info,
+            new_limit,
+            &app_state.account_info_request_limit,
+        )
+        .await;
+    }
+
+    if let Some(new_limit) = request.program_request_limit {
+        apply_limit(
+            current_limits.program_accounts,
+            new_limit,
+            &app_state.program_accounts_request_limit,
+        )
+        .await;
+    }
+    info!(old = ?current_limits, new = ?new_limits, "limits changed");
+
+    Ok(HttpResponse::Ok().json(&new_limits))
+}
+
 pub async fn metrics_handler(
     _body: Bytes,
-    _app_state: web::Data<State>,
+    app_state: web::Data<State>,
 ) -> Result<HttpResponse, Error<'static>> {
     use prometheus::{Encoder, TextEncoder};
+
+    let current_limits = app_state.request_limits.load();
+    metrics()
+        .max_permits
+        .with_label_values(&["getAccountInfo"])
+        .set(current_limits.account_info as i64);
+    metrics()
+        .max_permits
+        .with_label_values(&["getProgramAccounts"])
+        .set(current_limits.program_accounts as i64);
+    drop(current_limits);
 
     metrics().app_version.set(0);
     let encoder = TextEncoder::new();
