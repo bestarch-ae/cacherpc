@@ -237,6 +237,7 @@ pub struct RpcMetrics {
     pub handler_time: HistogramVec,
     pub wait_time: HistogramVec,
     pub available_permits: HistogramVec,
+    pub max_permits: IntGaugeVec,
     pub response_size_bytes: HistogramVec,
     pub lru_cache_hits: IntCounter,
     pub lru_cache_filled: IntGaugeVec,
@@ -404,6 +405,12 @@ pub fn rpc_metrics() -> &'static RpcMetrics {
                 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 20.0, 50.0, 100.0, 200.0,
                 500.0
             ]
+        )
+        .unwrap(),
+        max_permits: register_int_gauge_vec!(
+            "max_permits",
+            "Permits available to make backend requests",
+            &["type"]
         )
         .unwrap(),
         response_size_bytes: register_histogram_vec!(
