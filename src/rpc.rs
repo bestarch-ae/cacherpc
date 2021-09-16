@@ -654,10 +654,19 @@ async fn get_account_info(
             Some(data) => {
                 let data = data.value();
                 let account = data.get(commitment);
-                if let Some(account) = account {
-                    metrics().account_cache_hits.inc();
-                    app_state.reset(Subscription::Account(pubkey), commitment, None);
-                    return account_response(req.id, request_hash, account, &app_state, config);
+                match account {
+                    Some((account_info, slot)) if slot != 0 => {
+                        metrics().account_cache_hits.inc();
+                        app_state.reset(Subscription::Account(pubkey), commitment, None);
+                        return account_response(
+                            req.id,
+                            request_hash,
+                            (account_info, slot),
+                            &app_state,
+                            config,
+                        );
+                    }
+                    _ => {}
                 }
             }
             None => {
