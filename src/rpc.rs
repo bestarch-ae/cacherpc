@@ -13,22 +13,23 @@ use awc::Client;
 use backoff::backoff::Backoff;
 use bytes::Bytes;
 use dashmap::mapref::one::Ref;
+use futures_util::stream::Stream;
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use serde_json::value::{to_raw_value, RawValue};
 use smallvec::SmallVec;
 use thiserror::Error;
+use tokio::stream::StreamExt;
 use tokio::sync::{Notify, Semaphore};
 use tracing::{debug, error, info, warn};
 
 use crate::accounts::Subscription;
 use crate::metrics::rpc_metrics as metrics;
 use crate::types::{
-    AccountContext, AccountData, AccountInfo, AccountState, AccountsDb, Commitment, Encoding,
-    Filter, ProgramAccountsDb, Pubkey, SolanaContext,
+    AccountContext, AccountData, AccountInfo, AccountState, AccountsDb, BytesChain, Commitment,
+    Encoding, Filter, ProgramAccountsDb, Pubkey, SolanaContext,
 };
 
-const BODY_LIMIT: usize = 1024 * 1024 * 100;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Serialize)]
@@ -221,7 +222,7 @@ impl State {
         self.pubsub.subscription_active(key)
     }
 
-    async fn subscribe(
+    fn subscribe(
         &self,
         subscription: Subscription,
         commitment: Commitment,
@@ -244,7 +245,10 @@ impl State {
         &self,
         req: &'_ Request<'_, T>,
         limit: &Semaphore,
-    ) -> Result<Bytes, awc::error::SendRequestError>
+    ) -> Result<
+        impl Stream<Item = Result<Bytes, awc::error::PayloadError>>,
+        awc::error::SendRequestError,
+    >
     where
         T: Serialize + Debug + ?Sized,
     {
@@ -261,20 +265,14 @@ impl State {
                 .with_label_values(&[req.method])
                 .observe(limit.available_permits() as f64);
             wait_time.observe_duration();
-            let timer = metrics()
-                .backend_response_time
-                .with_label_values(&[req.method])
-                .start_timer();
-            let mut resp = client
+            let body = client
                 .post(&self.rpc_url)
                 .timeout(REQUEST_TIMEOUT)
                 .send_json(&req)
-                .await?;
-            let body = resp.body().limit(BODY_LIMIT).await;
-            timer.observe_duration();
+                .await;
             match body {
-                Ok(body) => {
-                    break Ok(body);
+                Ok(resp) => {
+                    break Ok(resp);
                 }
                 Err(err) => match backoff.next_backoff() {
                     Some(duration) => tokio::time::delay_for(duration).await,
@@ -317,6 +315,14 @@ struct RpcError<'a> {
     #[serde(borrow)]
     #[serde(skip_serializing_if = "Option::is_none")]
     data: Option<Cow<'a, RawValue>>,
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+struct RpcErrorOwned {
+    code: i64,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<Box<RawValue>>,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -413,11 +419,19 @@ pub enum Error<'a> {
     Timeout(Id<'a>),
     #[error("forward error")]
     Forward(#[from] awc::error::SendRequestError),
+    #[error("streaming error")]
+    Streaming(awc::error::PayloadError),
 }
 
 impl From<serde_json::Error> for Error<'_> {
     fn from(_err: serde_json::Error) -> Self {
         Error::Parsing(None)
+    }
+}
+
+impl From<awc::error::PayloadError> for Error<'_> {
+    fn from(err: awc::error::PayloadError) -> Self {
+        Error::Streaming(err)
     }
 }
 
@@ -444,6 +458,9 @@ impl ResponseError for Error<'_> {
                 .content_type("application/json")
                 .json(&ErrorResponse::gateway_timeout(Some(req_id.clone()))),
             Error::Forward(_) => HttpResponse::Ok()
+                .content_type("application/json")
+                .json(&ErrorResponse::gateway_timeout(None)),
+            Error::Streaming(_) => HttpResponse::Ok()
                 .content_type("application/json")
                 .json(&ErrorResponse::gateway_timeout(None)),
         }
@@ -702,57 +719,64 @@ async fn get_account_info(
 
     if let Some(pubkey) = cacheable_for_key {
         #[derive(Deserialize, Debug)]
-        struct Wrap<'a> {
-            #[serde(flatten, borrow)]
-            inner: Response<'a>,
+        struct Wrap {
+            #[serde(flatten)]
+            inner: Response,
         }
         #[derive(Deserialize, Debug)]
         #[serde(rename_all = "lowercase")]
-        enum Response<'a> {
+        enum Response {
             Result(AccountContext),
-            #[serde(borrow)]
-            Error(RpcError<'a>),
+            Error(RpcErrorOwned),
         }
-        let resp: Wrap<'_> = serde_json::from_slice(&resp)?;
-        match resp.inner {
-            Response::Result(info) => {
-                debug!(%pubkey, slot = %info.context.slot, ?commitment, "cached for key");
-                app_state.insert(pubkey, info, commitment);
-                app_state.map_updated.notify();
-                app_state
-                    .subscribe(Subscription::Account(pubkey), commitment, None)
-                    .await;
-            }
-            Response::Error(error) => {
-                metrics()
-                    .backend_errors
-                    .with_label_values(&["getAccountInfo"])
-                    .inc();
-                info!(%pubkey, ?error, "can't cache for key");
-                // check cache one more time, maybe another thread was more lucky
-                if let Some(data) = app_state.accounts.get(&pubkey) {
-                    let data = data.value();
-                    if let Some(account) = data.get(commitment) {
-                        app_state.reset(Subscription::Account(pubkey), commitment, None);
-                        metrics().account_cache_hits.inc();
-                        metrics().account_cache_filled.inc();
-                        return account_response(
-                            req.id.clone(),
-                            request_hash,
-                            account,
-                            &app_state,
-                            config,
-                        );
-                    }
+        let app_state = app_state.clone();
+        let stream = stream_generator::generate_try_stream(move |mut stream| async move {
+            let mut bytes_chain = BytesChain::new();
+            {
+                let incoming = collect_bytes("getAccountInfo", resp, &mut bytes_chain);
+
+                tokio::pin!(incoming);
+
+                while let Some(bytes) = incoming.next().await {
+                    let bytes = bytes.map_err(Error::Streaming)?;
+                    stream.send(Ok::<Bytes, Error<'_>>(bytes)).await;
                 }
             }
-        }
-    }
 
+            let res = (|| -> Result<_, Error<'_>> {
+                let resp: Wrap = serde_json::from_reader(bytes_chain)?;
+                match resp.inner {
+                    Response::Result(info) => {
+                        debug!(%pubkey, slot = %info.context.slot, ?commitment, "cached for key");
+                        app_state.insert(pubkey, info, commitment);
+                        app_state.map_updated.notify();
+                        app_state.subscribe(Subscription::Account(pubkey), commitment, None);
+                    }
+                    Response::Error(error) => {
+                        metrics()
+                            .backend_errors
+                            .with_label_values(&["getAccountInfo"])
+                            .inc();
+                        info!(%pubkey, ?error, "can't cache for key");
+                    }
+                }
+                Ok(())
+            })();
+            if let Err(res) = res {
+                tracing::error!(error = %res, "failed to parse response");
+            }
+
+            Ok(())
+        });
+        return Ok(HttpResponse::Ok()
+            .header("x-cache-status", "miss")
+            .content_type("application/json")
+            .streaming(Box::pin(stream)));
+    }
     Ok(HttpResponse::Ok()
         .header("x-cache-status", "miss")
         .content_type("application/json")
-        .body(resp))
+        .streaming(resp))
 }
 
 #[derive(Error, Debug)]
@@ -922,7 +946,7 @@ async fn get_program_accounts(
     req: Request<'_, RawValue>,
     app_state: web::Data<State>,
 ) -> Result<HttpResponse, Error<'_>> {
-    let (pubkey, mut config, _hash) = parse_params::<ProgramAccountsConfig<'_>>(&req)?;
+    let (pubkey, config, _hash) = parse_params::<ProgramAccountsConfig<'_>>(&req)?;
     let return_context = config.with_context;
 
     let commitment = config.commitment.unwrap_or_default().commitment;
@@ -996,21 +1020,8 @@ async fn get_program_accounts(
     }
 
     let limit = &app_state.program_accounts_request_limit;
-    // We only enforce context for cacheable request, since we need slot for correct caching.
-    // For non-cached requests we do not alter the config, so that we don't have to reserialize the response.
-    if cacheable_for_key.is_some() {
-        config.with_context = Some(true);
-    }
 
-    let params = (pubkey, &config);
-    let req_with_context = Request {
-        jsonrpc: req.jsonrpc,
-        id: req.id.clone(),
-        method: req.method,
-        params: Some(&params),
-    };
-
-    let wait_for_response = app_state.request(&req_with_context, limit);
+    let wait_for_response = app_state.request(&req, limit);
 
     tokio::pin!(wait_for_response);
 
@@ -1051,11 +1062,6 @@ async fn get_program_accounts(
     };
 
     if let Some(program_pubkey) = cacheable_for_key {
-        if !config.with_context.unwrap_or(false) {
-            // TODO?: consider panicing since this is a logic error
-            error!("requested cacheable program accounts without context");
-        }
-
         #[derive(Deserialize, Debug)]
         struct AccountAndPubkey {
             account: AccountInfo,
@@ -1063,46 +1069,87 @@ async fn get_program_accounts(
         }
 
         #[derive(Deserialize, Debug)]
-        struct RawResponse<'a> {
+        struct ContextResponse {
             context: SolanaContext,
-            #[serde(borrow)]
-            value: &'a RawValue,
+            value: Vec<AccountAndPubkey>,
         }
 
-        // We cannot use enum and wrapping struct with #[serde(flatten)]
-        // since there's a bug in RawValue and flatten interaction
-        // Ref: https://github.com/serde-rs/json/issues/599s
         #[derive(Deserialize, Debug)]
         #[serde(rename_all = "lowercase")]
-        struct Response<'a> {
-            #[serde(borrow)]
-            result: Option<RawResponse<'a>>,
-            #[serde(borrow)]
-            error: Option<RpcError<'a>>,
+        struct Flatten<T> {
+            #[serde(flatten)]
+            inner: T,
         }
 
-        let resp: Response<'_> = serde_json::from_slice(&resp)?;
-        match (resp.result, resp.error) {
-            (Some(raw_result), None) => {
-                let result: Vec<AccountAndPubkey> = serde_json::from_str(raw_result.value.get())?;
-                info!(%pubkey, slot = %raw_result.context.slot, ?commitment, "caching program");
-                app_state
-                    .subscribe(
-                        Subscription::Program(program_pubkey),
-                        commitment,
-                        filters.clone(),
-                    )
-                    .await;
+        #[derive(Deserialize, Debug)]
+        #[serde(rename_all = "lowercase")]
+        enum Response<T> {
+            Result(T),
+            Error(RpcErrorOwned),
+        }
 
-                let mut keys = HashSet::with_capacity(result.len());
-                for acc in result {
+        let app_state = app_state.clone();
+        let filters = filters.clone();
+        let with_context = config.with_context.unwrap_or(false);
+        let stream = stream_generator::generate_try_stream(move |mut stream| async move {
+            let mut bytes_chain = BytesChain::new();
+            {
+                let incoming = collect_bytes("getProgramAccounts", resp, &mut bytes_chain);
+
+                tokio::pin!(incoming);
+
+                while let Some(bytes) = incoming.next().await {
+                    let bytes = bytes.map_err(Error::Streaming)?;
+                    stream.send(Ok::<Bytes, Error<'_>>(bytes)).await;
+                }
+            }
+
+            let res = (|| -> Result<_, Error<'_>> {
+                let (slot, accounts) = if with_context {
+                    let resp: Flatten<Response<ContextResponse>> =
+                        serde_json::from_reader(bytes_chain)?;
+                    match resp.inner {
+                        Response::Result(ctx) => (Some(ctx.context.slot), ctx.value),
+                        Response::Error(error) => {
+                            metrics()
+                                .backend_errors
+                                .with_label_values(&["getProgramAccounts"])
+                                .inc();
+                            info!(%pubkey, ?error, "can't cache for key");
+                            return Ok(());
+                        }
+                    }
+                } else {
+                    let resp: Flatten<Response<Vec<AccountAndPubkey>>> =
+                        serde_json::from_reader(bytes_chain)?;
+                    match resp.inner {
+                        Response::Result(data) => (None, data),
+                        Response::Error(error) => {
+                            metrics()
+                                .backend_errors
+                                .with_label_values(&["getProgramAccounts"])
+                                .inc();
+                            info!(%pubkey, ?error, "can't cache for key");
+                            return Ok(());
+                        }
+                    }
+                };
+
+                app_state.subscribe(
+                    Subscription::Program(program_pubkey),
+                    commitment,
+                    filters.clone(),
+                );
+
+                let mut keys = HashSet::with_capacity(accounts.len());
+                for acc in accounts {
                     let AccountAndPubkey { account, pubkey } = acc;
                     let key_ref = app_state.insert(
                         pubkey,
                         AccountContext {
                             value: Some(account),
                             context: SolanaContext {
-                                slot: raw_result.context.slot,
+                                slot: slot.unwrap_or(0),
                             },
                         },
                         commitment,
@@ -1113,38 +1160,25 @@ async fn get_program_accounts(
                     .program_accounts
                     .insert(program_pubkey, keys, commitment, filters);
                 app_state.map_updated.notify();
-
-                // We have to reserialize if the client did not use withContext toggle,
-                // since we enforce it for every cacheable request.
-                if !return_context.unwrap_or(false) {
-                    let resp = JsonRpcResponse {
-                        jsonrpc: "2.0",
-                        id: req.id,
-                        result: MaybeContext::Without(raw_result.value),
-                    };
-
-                    let response = HttpResponse::Ok()
-                        .content_type("application/json")
-                        .header("x-cache-status", "miss")
-                        .json(resp);
-                    return Ok(response);
-                }
+                Ok(())
+            })();
+            if let Err(res) = res {
+                tracing::error!(error = %res, "failed to parse response");
             }
-            (None, Some(error)) => {
-                metrics()
-                    .backend_errors
-                    .with_label_values(&["getProgramAccounts"])
-                    .inc();
-                info!(%pubkey, ?error, "can't cache for key");
-            }
-            _ => return Err(Error::Parsing(None)),
-        }
+
+            Ok(())
+        });
+
+        return Ok(HttpResponse::Ok()
+            .content_type("application/json")
+            .header("x-cache-status", "miss")
+            .streaming(Box::pin(stream)));
     }
 
     Ok(HttpResponse::Ok()
         .content_type("application/json")
         .header("x-cache-status", "miss")
-        .body(resp))
+        .streaming(Box::pin(resp)))
 }
 
 pub async fn rpc_handler(
@@ -1191,7 +1225,6 @@ pub async fn rpc_handler(
     let url = app_state.rpc_url.clone();
 
     let stream = stream_generator::generate_stream(move |mut stream| async move {
-        use tokio::stream::StreamExt;
         let mut backoff = backoff_settings();
         let total = metrics().passthrough_total_time.start_timer();
         loop {
@@ -1240,6 +1273,29 @@ fn backoff_settings() -> backoff::ExponentialBackoff {
         max_elapsed_time: Some(Duration::from_secs(60)),
         ..Default::default()
     }
+}
+
+fn collect_bytes<'a, E: 'a>(
+    method: &'a str,
+    incoming: impl Stream<Item = Result<Bytes, E>> + Unpin + 'a,
+    bytes_chain: &'a mut BytesChain,
+) -> impl Stream<Item = Result<Bytes, E>> + 'a {
+    stream_generator::generate_try_stream(move |mut stream| async move {
+        let mut resp = incoming;
+
+        let timer = metrics()
+            .backend_response_time
+            .with_label_values(&[method])
+            .start_timer();
+
+        while let Some(bytes) = resp.next().await {
+            let bytes = bytes?;
+            bytes_chain.push(bytes.clone());
+            stream.send(Ok::<Bytes, E>(bytes)).await;
+        }
+        timer.observe_duration();
+        Ok(())
+    })
 }
 
 pub fn bad_content_type_handler() -> HttpResponse {

@@ -584,14 +584,16 @@ impl<'de> Deserialize<'de> for AccountData {
             where
                 A: serde::de::SeqAccess<'de>,
             {
+                use std::borrow::Cow;
+
                 let err = || serde::de::Error::custom("can't decode");
-                let dat: &str = seq.next_element()?.ok_or_else(|| todo!())?;
-                let encoding: &str = seq.next_element()?.ok_or_else(|| todo!())?;
-                let data = match encoding {
-                    "base58" => bs58::decode(&dat).into_vec().map_err(|_| err())?,
-                    "base64" => base64::decode(&dat).map_err(|_| err())?,
+                let dat: Cow<'_, str> = seq.next_element()?.ok_or_else(|| todo!())?;
+                let encoding: Cow<'_, str> = seq.next_element()?.ok_or_else(|| todo!())?;
+                let data = match encoding.as_ref() {
+                    "base58" => bs58::decode(dat.as_ref()).into_vec().map_err(|_| err())?,
+                    "base64" => base64::decode(dat.as_ref()).map_err(|_| err())?,
                     "base64+zstd" => {
-                        let vec = base64::decode(&dat).map_err(|_| err())?;
+                        let vec = base64::decode(dat.as_ref()).map_err(|_| err())?;
                         zstd::decode_all(std::io::Cursor::new(vec)).map_err(|_| err())?
                     }
                     _ => return Err(serde::de::Error::custom("unsupported encoding")),
@@ -628,6 +630,63 @@ pub struct AccountContext {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct SolanaContext {
     pub slot: Slot,
+}
+
+pub struct BytesChain {
+    bytes: Vec<Bytes>,
+    position: usize,
+    current_reader: Option<bytes::buf::ext::Reader<Bytes>>,
+}
+
+impl Default for BytesChain {
+    fn default() -> Self {
+        BytesChain::new()
+    }
+}
+
+impl BytesChain {
+    pub fn new() -> Self {
+        BytesChain {
+            bytes: Vec::new(),
+            position: 0,
+            current_reader: None,
+        }
+    }
+
+    pub fn push(&mut self, bytes: Bytes) {
+        self.bytes.push(bytes);
+    }
+}
+
+impl std::io::Read for BytesChain {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use bytes::buf::ext::BufExt;
+        loop {
+            if self.current_reader.is_none() {
+                if let Some(reader) = self
+                    .bytes
+                    .get(self.position)
+                    .map(|bytes| bytes.clone().reader())
+                {
+                    self.current_reader = Some(reader);
+                } else {
+                    return Ok(0);
+                }
+            }
+
+            let reader = self.current_reader.as_mut().unwrap();
+            match reader.read(buf) {
+                Ok(0) if !buf.is_empty() => {
+                    self.current_reader.take();
+                    self.position += 1;
+                    continue;
+                }
+                whatever => {
+                    return whatever;
+                }
+            }
+        }
+    }
 }
 
 #[test]
