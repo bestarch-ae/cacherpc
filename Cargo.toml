@@ -42,6 +42,7 @@ actix-http = "2.2"
 humantime = "2.1"
 
 [dev-dependencies]
+proptest = "1"
 criterion = "0.3"
 rand = "0.8"
 

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -16,16 +16,16 @@ use actix_http::ws;
 use bytes::BytesMut;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
-use smallvec::SmallVec;
 use tokio::stream::{Stream, StreamExt};
 use tokio::sync::mpsc;
 use tokio::time::{DelayQueue, Instant};
 use tracing::{debug, error, info, warn};
 
+use crate::filter::{FilterTree, Filters};
 use crate::metrics::pubsub_metrics as metrics;
 use crate::types::{
-    AccountContext, AccountInfo, AccountsDb, Commitment, Encoding, Filter, ProgramAccountsDb,
-    Pubkey, Slot, SolanaContext,
+    AccountContext, AccountInfo, AccountsDb, Commitment, Encoding, ProgramAccountsDb, Pubkey, Slot,
+    SolanaContext,
 };
 
 const MAILBOX_CAPACITY: usize = 512;
@@ -122,22 +122,12 @@ impl PubSubManager {
         self.0[idx].1.load(Ordering::Relaxed)
     }
 
-    pub fn reset(
-        &self,
-        sub: Subscription,
-        commitment: Commitment,
-        filters: Option<smallvec::SmallVec<[Filter; 2]>>,
-    ) {
+    pub fn reset(&self, sub: Subscription, commitment: Commitment, filters: Option<Filters>) {
         let addr = self.get_addr_by_key(sub.key());
         addr.do_send(AccountCommand::Reset(sub, commitment, filters))
     }
 
-    pub fn subscribe(
-        &self,
-        sub: Subscription,
-        commitment: Commitment,
-        filters: Option<smallvec::SmallVec<[Filter; 2]>>,
-    ) {
+    pub fn subscribe(&self, sub: Subscription, commitment: Commitment, filters: Option<Filters>) {
         let addr = self.get_addr_by_key(sub.key());
         addr.do_send(AccountCommand::Subscribe(sub, commitment, filters))
     }
@@ -162,7 +152,7 @@ impl Connection {
     }
 }
 
-type ProgramFilters = HashMap<(Pubkey, Commitment), HashMap<SmallVec<[Filter; 2]>, SpawnHandle>>;
+type ProgramFilters = HashMap<(Pubkey, Commitment), FilterTree<SpawnHandle>>;
 
 pub struct AccountUpdateManager {
     websocket_url: String,
@@ -510,13 +500,13 @@ impl AccountUpdateManager {
         ctx: &mut Context<Self>,
         sub: Subscription,
         commitment: Commitment,
-        filters: SmallVec<[Filter; 2]>,
+        filters: Filters,
     ) {
         let key = sub.key();
         let handle = self
             .additional_keys
             .entry((key, commitment))
-            .or_default()
+            .or_insert_with(FilterTree::new)
             .insert(filters.clone(), {
                 ctx.run_later(self.time_to_live, move |actor, ctx| {
                     actor.purge_filter(ctx, sub, commitment, filters);
@@ -550,7 +540,7 @@ impl AccountUpdateManager {
         ctx: &mut Context<Self>,
         sub: Subscription,
         commitment: Commitment,
-        filters: SmallVec<[Filter; 2]>,
+        filters: Filters,
     ) {
         let key = sub.key();
         info!(key = %sub.key(), commitment = ?commitment, filter = ?filters, "purging filters");
@@ -848,37 +838,24 @@ impl AccountUpdateManager {
                             let account_info = &params.result.value.account;
                             let data = &account_info.data;
 
-                            let mut filter_groups = Vec::new();
-                            if let Some(filters) =
-                                self.additional_keys.get(&(program_key, *commitment))
-                            {
-                                let filtration_starts = Instant::now();
-                                for filter_group in filters.keys() {
-                                    if filter_group.iter().all(|f| f.matches(data)) {
-                                        /*
-                                        self.program_accounts.add(
-                                            &program_key,
-                                            key_ref,
-                                            Some(filter_group.clone()),
-                                            *commitment,
-                                        );
-                                        */
-                                        filter_groups.push(filter_group.clone());
-                                    } else {
-                                        debug!(self.actor_id, account = %key, program = %program_key, "account was removed from filtered list");
-                                        self.program_accounts.remove(
-                                            &program_key,
-                                            &key,
-                                            filter_group.clone(),
-                                            *commitment,
-                                        );
+                            let filter_groups =
+                                match self.additional_keys.get(&(program_key, *commitment)) {
+                                    Some(tree) => {
+                                        let filtration_starts = Instant::now();
+                                        let mut groups = HashSet::new();
+                                        tree.map_matches(data, |filter| {
+                                            groups.insert(filter);
+                                        });
+
+                                        metrics()
+                                        .filtration_time
+                                        .with_label_values(&[&self.actor_name])
+                                        .observe(filtration_starts.elapsed().as_micros() as f64);
+                                        groups
                                     }
-                                }
-                                metrics()
-                                    .filtration_time
-                                    .with_label_values(&[&self.actor_name])
-                                    .observe(filtration_starts.elapsed().as_micros() as f64);
-                            }
+                                    None => HashSet::new(),
+                                };
+
                             let key_ref = self.accounts.insert(
                                 key,
                                 AccountContext {
@@ -888,23 +865,13 @@ impl AccountUpdateManager {
                                 *commitment,
                             );
 
-                            // add() returns false if we don't have an entry
-                            // which means we haven't received complete result
-                            // from validator by rpc
-                            self.program_accounts.add(
+                            self.program_accounts.update_account(
                                 &program_key,
                                 key_ref.clone(),
-                                None,
+                                filter_groups,
                                 *commitment,
                             );
-                            for group in filter_groups.into_iter() {
-                                self.program_accounts.add(
-                                    &program_key,
-                                    key_ref.clone(),
-                                    Some(group),
-                                    *commitment,
-                                );
-                            }
+
                             // important for proper removal
                             drop(key_ref);
                             self.accounts.remove(&key, *commitment);
@@ -1255,8 +1222,8 @@ impl std::fmt::Display for Subscription {
 #[derive(Message, Debug)]
 #[rtype(result = "()")]
 pub enum AccountCommand {
-    Subscribe(Subscription, Commitment, Option<SmallVec<[Filter; 2]>>),
-    Reset(Subscription, Commitment, Option<SmallVec<[Filter; 2]>>),
+    Subscribe(Subscription, Commitment, Option<Filters>),
+    Reset(Subscription, Commitment, Option<Filters>),
     Purge(Subscription, Commitment),
 }
 
