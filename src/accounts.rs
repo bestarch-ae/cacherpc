@@ -553,22 +553,27 @@ impl AccountUpdateManager {
         filters: SmallVec<[Filter; 2]>,
     ) {
         let key = sub.key();
-        info!(key = %sub.key(), commitment = ?commitment, filter = ?filters, "purging filters");
         let handle = self
             .additional_keys
             .get_mut(&(key, commitment))
             .and_then(|map| map.remove(&filters));
-        metrics()
-            .filters
-            .with_label_values(&[&self.actor_name])
-            .dec();
-        for key in self
-            .program_accounts
-            .remove_all(&key, commitment, Some(filters))
-        {
-            self.accounts.remove(&key, commitment)
+
+        if let Some(handle) = handle {
+            info!(key = %sub.key(), commitment = ?commitment, filter = ?filters, "purging filters");
+            metrics()
+                .filters
+                .with_label_values(&[&self.actor_name])
+                .dec();
+
+            for key in self
+                .program_accounts
+                .remove_all(&key, commitment, Some(filters))
+            {
+                self.accounts.remove(&key, commitment)
+            }
+
+            ctx.cancel_future(handle);
         }
-        handle.map(|handle| ctx.cancel_future(handle));
     }
 
     fn purge_key(&mut self, ctx: &mut Context<Self>, sub: &Subscription, commitment: Commitment) {
