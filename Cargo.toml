@@ -12,6 +12,7 @@ actix-web = "3.3"
 actix = "0.10"
 actix-codec = "0.3"
 actix-cors = "0.5"
+actix-http = "2.2"
 tokio = { version = "0.2", features = ["sync", "time", "macros"] }
 bytes = "0.5"
 serde = "1.0"
@@ -38,9 +39,8 @@ backoff = "0.2"
 signal-hook = "0.1.11"
 file-reopen = { git = "https://github.com/polachok/file-reopen.git", rev = "da89261" }
 either = "1.6"
-actix-http = "2.2"
 humantime = "2.1"
-arc-swap = "1.3"
+toml = "0.5"
 
 [dev-dependencies]
 proptest = "1"

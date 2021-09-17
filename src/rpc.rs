@@ -8,19 +8,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use actix_web::{web, HttpResponse, ResponseError};
-use arc_swap::ArcSwap;
 use awc::Client;
 use backoff::backoff::Backoff;
 use bytes::Bytes;
 use dashmap::mapref::one::Ref;
 use futures_util::stream::Stream;
+use futures_util::stream::TryStreamExt;
 use lru::LruCache;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::value::{to_raw_value, RawValue};
 use smallvec::SmallVec;
 use thiserror::Error;
 use tokio::stream::StreamExt;
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::{watch, Notify, Semaphore};
 use tracing::{debug, error, info, warn};
 
 use crate::accounts::Subscription;
@@ -201,7 +201,8 @@ pub struct State {
     pub map_updated: Arc<Notify>,
     pub account_info_request_limit: Arc<Semaphore>,
     pub program_accounts_request_limit: Arc<Semaphore>,
-    pub request_limits: Arc<ArcSwap<RequestLimits>>,
+    pub config: RefCell<Config>,
+    pub config_watch: RefCell<watch::Receiver<Config>>,
     pub lru: RefCell<LruCache<u64, LruEntry>>,
     pub worker_id: String,
 }
@@ -1096,7 +1097,7 @@ async fn get_program_accounts(
         }
     };
 
-    if cacheable_for_key.is_some() {
+    let stream = if cacheable_for_key.is_some() {
         let app_state = app_state.clone();
         let stream = program_response_stream::<Vec<AccountAndPubkey>, _, _>(
             app_state,
@@ -1108,11 +1109,7 @@ async fn get_program_accounts(
                 tracing::error!(error = %err, "failed to parse response");
             },
         );
-
-        return Ok(HttpResponse::Ok()
-            .content_type("application/json")
-            .header("x-cache-status", "miss")
-            .streaming(Box::pin(stream)));
+        Box::pin(stream)
     } else if bad_filters {
         let app_state = app_state.clone();
         let stream = program_response_stream::<[AccountAndPubkey; 0], _, _>(
@@ -1125,17 +1122,16 @@ async fn get_program_accounts(
                 error!(pubkey = ?pubkey, error = ?err, "non-empty bad filter response");
             },
         );
-
-        return Ok(HttpResponse::Ok()
-            .content_type("application/json")
-            .header("x-cache-status", "miss")
-            .streaming(Box::pin(stream)));
-    }
+        Box::pin(stream)
+    } else {
+        Box::pin(resp.map_err(|err| err.into()))
+            as std::pin::Pin<Box<dyn Stream<Item = Result<Bytes, Error<'static>>>>>
+    };
 
     Ok(HttpResponse::Ok()
         .content_type("application/json")
         .header("x-cache-status", "miss")
-        .streaming(Box::pin(resp)))
+        .streaming(stream))
 }
 
 fn program_response_stream<'a, T, S, F>(
@@ -1233,6 +1229,9 @@ pub async fn rpc_handler(
     body: Bytes,
     app_state: web::Data<State>,
 ) -> Result<HttpResponse, Error<'static>> {
+    use std::future::Future;
+    use std::task::Poll;
+
     let req: Request<'_, _> = match serde_json::from_slice(&body) {
         Ok(req) => req,
         Err(err) => {
@@ -1255,6 +1254,22 @@ pub async fn rpc_handler(
             timer.observe_duration();
             Ok(resp.unwrap_or_else(|err| err.error_response()))
         }};
+    }
+    {
+        let mut rx = app_state.config_watch.borrow_mut();
+
+        let config = futures_util::future::poll_fn(|ctx| {
+            let fut = rx.recv();
+            tokio::pin!(fut);
+            match fut.poll(ctx) {
+                Poll::Pending => Poll::Ready(None),
+                whatever => whatever,
+            }
+        })
+        .await;
+        if let Some(config) = config {
+            apply_config(&app_state, config).await;
+        }
     }
 
     match req.method {
@@ -1351,35 +1366,24 @@ pub fn bad_content_type_handler() -> HttpResponse {
         .body("Supplied content type is not allowed. Content-Type: application/json is required")
 }
 
-#[derive(Debug, Copy, Clone, Serialize)]
+#[derive(Debug, Copy, Clone, Deserialize, PartialEq, Eq)]
 pub struct RequestLimits {
     pub account_info: usize,
     pub program_accounts: usize,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Config {
-    #[serde(default)]
-    account_request_limit: Option<usize>,
-    #[serde(default)]
-    program_request_limit: Option<usize>,
+    pub request_limits: RequestLimits,
 }
 
-pub async fn config_handler(
-    request: actix_web::web::Json<Config>,
-    app_state: web::Data<State>,
-) -> Result<HttpResponse, Error<'static>> {
-    /* we ignore a possible race here, hoping nobody is spamming config changes */
-    let current_limits: RequestLimits = **app_state.request_limits.load();
-    let new_limits = RequestLimits {
-        account_info: request
-            .account_request_limit
-            .unwrap_or(current_limits.account_info),
-        program_accounts: request
-            .program_request_limit
-            .unwrap_or(current_limits.program_accounts),
-    };
-    app_state.request_limits.store(Arc::new(new_limits));
+pub async fn apply_config(app_state: &web::Data<State>, new_config: Config) {
+    let current_limits = app_state.config.borrow().request_limits;
+    let new_limits = new_config.request_limits;
+
+    if current_limits == new_limits {
+        return;
+    }
 
     async fn apply_limit(old_limit: usize, new_limit: usize, semaphore: &Semaphore) {
         if new_limit > old_limit {
@@ -1391,26 +1395,21 @@ pub async fn config_handler(
         }
     }
 
-    if let Some(new_limit) = request.account_request_limit {
-        apply_limit(
-            current_limits.account_info,
-            new_limit,
-            &app_state.account_info_request_limit,
-        )
-        .await;
-    }
+    apply_limit(
+        current_limits.account_info,
+        new_limits.account_info,
+        &app_state.account_info_request_limit,
+    )
+    .await;
 
-    if let Some(new_limit) = request.program_request_limit {
-        apply_limit(
-            current_limits.program_accounts,
-            new_limit,
-            &app_state.program_accounts_request_limit,
-        )
-        .await;
-    }
-    info!(old = ?current_limits, new = ?new_limits, "limits changed");
-
-    Ok(HttpResponse::Ok().json(&new_limits))
+    apply_limit(
+        current_limits.program_accounts,
+        new_limits.program_accounts,
+        &app_state.program_accounts_request_limit,
+    )
+    .await;
+    *app_state.config.borrow_mut() = new_config;
+    info!(old = ?current_limits, worker_id = %app_state.worker_id, new = ?new_limits, "rpc limits updated");
 }
 
 pub async fn metrics_handler(
@@ -1419,7 +1418,7 @@ pub async fn metrics_handler(
 ) -> Result<HttpResponse, Error<'static>> {
     use prometheus::{Encoder, TextEncoder};
 
-    let current_limits = app_state.request_limits.load();
+    let current_limits = app_state.config.borrow().request_limits;
     metrics()
         .max_permits
         .with_label_values(&["getAccountInfo"])
@@ -1428,7 +1427,6 @@ pub async fn metrics_handler(
         .max_permits
         .with_label_values(&["getProgramAccounts"])
         .set(current_limits.program_accounts as i64);
-    drop(current_limits);
 
     metrics().app_version.set(0);
     let encoder = TextEncoder::new();
