@@ -23,9 +23,9 @@ use tokio::stream::StreamExt;
 use tokio::sync::{watch, Notify, Semaphore};
 use tracing::{debug, error, info, warn};
 
-use crate::accounts::Subscription;
 use crate::filter::{Filter, Filters};
 use crate::metrics::rpc_metrics as metrics;
+use crate::pubsub::{PubSubManager, Subscription};
 use crate::types::{
     AccountContext, AccountData, AccountInfo, AccountState, AccountsDb, BytesChain, Commitment,
     Encoding, ProgramAccountsDb, Pubkey, Slot, SolanaContext,
@@ -202,7 +202,7 @@ pub struct State {
     pub accounts: AccountsDb,
     pub program_accounts: ProgramAccountsDb,
     pub client: Client,
-    pub pubsub: crate::accounts::PubSubManager,
+    pub pubsub: PubSubManager,
     pub rpc_url: String,
     pub map_updated: Arc<Notify>,
     pub account_info_request_limit: Arc<Semaphore>,

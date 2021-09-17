@@ -17,9 +17,9 @@ use tokio::sync::{watch, Notify, Semaphore};
 use tracing::info;
 use tracing_subscriber::fmt;
 
-pub use cache_rpc::{accounts, metrics, rpc, types};
+pub use cache_rpc::{metrics, pubsub, rpc, types};
 
-use accounts::PubSubManager;
+use pubsub::PubSubManager;
 use types::{AccountsDb, ProgramAccountsDb};
 
 #[derive(Debug, structopt::StructOpt)]
