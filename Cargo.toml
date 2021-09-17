@@ -41,6 +41,7 @@ file-reopen = { git = "https://github.com/polachok/file-reopen.git", rev = "da89
 either = "1.6"
 humantime = "2.1"
 toml = "0.5"
+arc-swap = "1.4"
 
 [dev-dependencies]
 proptest = "1"

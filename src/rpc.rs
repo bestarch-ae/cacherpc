@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use actix_web::{web, HttpResponse, ResponseError};
+use arc_swap::ArcSwap;
 use awc::Client;
 use backoff::backoff::Backoff;
 use bytes::Bytes;
@@ -201,7 +202,7 @@ pub struct State {
     pub map_updated: Arc<Notify>,
     pub account_info_request_limit: Arc<Semaphore>,
     pub program_accounts_request_limit: Arc<Semaphore>,
-    pub config: RefCell<Config>,
+    pub config: Arc<ArcSwap<Config>>,
     pub config_watch: RefCell<watch::Receiver<Config>>,
     pub lru: RefCell<LruCache<u64, LruEntry>>,
     pub worker_id: String,
@@ -1378,12 +1379,15 @@ pub struct Config {
 }
 
 pub async fn apply_config(app_state: &web::Data<State>, new_config: Config) {
-    let current_limits = app_state.config.borrow().request_limits;
-    let new_limits = new_config.request_limits;
-
-    if current_limits == new_limits {
+    let current_config = app_state.config.load();
+    if **current_config == new_config {
         return;
     }
+
+    let current_limits = current_config.request_limits;
+    let new_limits = new_config.request_limits;
+
+    app_state.config.store(Arc::new(new_config));
 
     async fn apply_limit(old_limit: usize, new_limit: usize, semaphore: &Semaphore) {
         if new_limit > old_limit {
@@ -1408,8 +1412,13 @@ pub async fn apply_config(app_state: &web::Data<State>, new_config: Config) {
         &app_state.program_accounts_request_limit,
     )
     .await;
-    *app_state.config.borrow_mut() = new_config;
-    info!(old = ?current_limits, worker_id = %app_state.worker_id, new = ?new_limits, "rpc limits updated");
+
+    let available_accounts = &app_state.account_info_request_limit.available_permits();
+    let available_programs = &app_state.program_accounts_request_limit.available_permits();
+    info!(old = ?current_limits,
+        new = ?new_limits,
+        %available_accounts,
+        %available_programs, "rpc limits updated");
 }
 
 pub async fn metrics_handler(
@@ -1418,7 +1427,7 @@ pub async fn metrics_handler(
 ) -> Result<HttpResponse, Error<'static>> {
     use prometheus::{Encoder, TextEncoder};
 
-    let current_limits = app_state.config.borrow().request_limits;
+    let current_limits = app_state.config.load().request_limits;
     metrics()
         .max_permits
         .with_label_values(&["getAccountInfo"])
