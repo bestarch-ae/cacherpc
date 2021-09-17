@@ -8,6 +8,7 @@ use std::time::Duration;
 use actix_cors::Cors;
 use actix_web::{guard, web, App, HttpServer};
 use anyhow::{Context, Result};
+use arc_swap::ArcSwap;
 use awc::Client;
 use either::Either;
 use lru::LruCache;
@@ -224,14 +225,12 @@ async fn run(options: Options) -> Result<()> {
 
     let rpc_url = options.rpc_url;
     let notify = Arc::new(Notify::new());
-    let request_limits = rpc::RequestLimits {
-        account_info: options.account_info_request_limit,
-        program_accounts: options.program_accounts_request_limit,
-    };
-    let account_info_request_limit = Arc::new(Semaphore::new(request_limits.account_info));
-    let program_accounts_request_limit = Arc::new(Semaphore::new(request_limits.program_accounts));
+    let account_info_request_limit =
+        Arc::new(Semaphore::new(config.rpc.request_limits.account_info));
+    let program_accounts_request_limit =
+        Arc::new(Semaphore::new(config.rpc.request_limits.program_accounts));
     let total_connection_limit =
-        2 * (request_limits.account_info + request_limits.program_accounts);
+        2 * (config.rpc.request_limits.account_info + config.rpc.request_limits.program_accounts);
     let body_cache_size = options.body_cache_size;
     let worker_id_counter = Arc::new(AtomicUsize::new(0));
     let bind_addr = &options.addr;
@@ -242,6 +241,8 @@ async fn run(options: Options) -> Result<()> {
     if let Some(path) = options.config {
         actix::spawn(config_read_loop(path, sender));
     }
+
+    let rpc_config = Arc::new(ArcSwap::from(Arc::new(config.rpc)));
 
     HttpServer::new(move || {
         let client = Client::builder()
@@ -265,7 +266,7 @@ async fn run(options: Options) -> Result<()> {
             account_info_request_limit: account_info_request_limit.clone(),
             program_accounts_request_limit: program_accounts_request_limit.clone(),
             config_watch: RefCell::new(receiver.clone()),
-            config: RefCell::new(config.rpc.clone()),
+            config: rpc_config.clone(),
             lru: RefCell::new(LruCache::new(body_cache_size)),
             worker_id: {
                 let id = worker_id_counter.fetch_add(1, Ordering::SeqCst);
