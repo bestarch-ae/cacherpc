@@ -150,30 +150,39 @@ build_docker:
 #    - master
 #    - web
 
-Deploy DEB to Dev:
-  stage: deploy_dev
-  tags:
-    - deploy_rpm_dev
+deploy_tt_test_04:
+  stage: deploy_tt_test
+  image: gableroux/ansible:2.10.7
+  tags: [docker19_hetz_nocache]
+  before_script:
+    - eval $(ssh-agent -s)
+    - mkdir ~/.ssh/
+    - chmod 700 ~/.ssh
+    - '[[ -f /.dockerenv ]] && echo -e "Host *\n\tStrictHostKeyChecking no\n\n" > ~/.ssh/config'
+    - echo "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+    - chmod 644 ~/.ssh/known_hosts
+    - echo "$DEPLOY_SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add - > /dev/null
   script:
-    - find . -mindepth 1 -maxdepth 1 -exec rm -rf {} \;
+    - PIPELINE_ID_VERSION=$(curl --user "$REPO_LOGIN:$REPO_PASS" https://$REPO_SRV/repository/$ARTIFACTS_PATH/$APPNAME_SHORT/pipelin-id/$CI_PIPELINE_ID/$VERSION_FILE)
     - git clone https://git.zubr.dev/shared/ci-scripts.git
-    - chmod 0700 ci-scripts/deploy_deb.sh
-    - ci-scripts/deploy_deb.sh DEV
+    - ansible --version
+    - ansible-playbook -i tt_stg -e "install_version=${PIPELINE_ID_VERSION}" --private-key ~/.ssh/id_rsa deploy.yml
   only:
     - develop
     - master
     - tags
     - web
 
-deploy_dev_not_master:
-  stage: deploy_dev
-  tags:
-    - deploy_rpm_dev
-  script:
-    - find . -mindepth 1 -maxdepth 1 -exec rm -rf {} \;
-    - git clone https://git.zubr.dev/shared/ci-scripts.git
-    - chmod 0700 ci-scripts/deploy_deb.sh
-    - ci-scripts/deploy_deb.sh DEV
-  when: manual
-  except:
-    - master
+#deploy_dev_not_master:
+#  stage: deploy_dev
+#  tags:
+#    - deploy_rpm_dev
+#  script:
+#    - find . -mindepth 1 -maxdepth 1 -exec rm -rf {} \;
+#    - git clone https://git.zubr.dev/shared/ci-scripts.git
+#    - chmod 0700 ci-scripts/deploy_deb.sh
+#    - ci-scripts/deploy_deb.sh DEV
+#  when: manual
+#  except:
+#    - master
+#    - tags
