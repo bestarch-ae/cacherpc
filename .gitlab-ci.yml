@@ -150,8 +150,8 @@ build_docker:
 #    - master
 #    - web
 
-deploy_tt_test_04:
-  stage: deploy_tt_test
+deploy_dev_aws:
+  stage: deploy_dev
   image: gableroux/ansible:2.10.7
   tags: [docker19_hetz_nocache]
   before_script:
