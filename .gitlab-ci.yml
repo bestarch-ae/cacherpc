@@ -167,11 +167,15 @@ deploy_dev_aws:
     - git clone https://git.zubr.dev/shared/ci-scripts.git
     - ansible --version
     - ansible-playbook -i tt_stg -e "install_version=${PIPELINE_ID_VERSION}" --private-key ~/.ssh/id_rsa deploy.yml
-  only:
-    - develop
+  when: manual
+  except:
     - master
     - tags
-    - web
+#  only:
+#    - develop
+#    - master
+#    - tags
+#    - web
 
 #deploy_dev_not_master:
 #  stage: deploy_dev
