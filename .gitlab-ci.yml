@@ -166,6 +166,7 @@ deploy_dev_aws:
   script:
     - PIPELINE_ID_VERSION=$(curl --user "$REPO_LOGIN:$REPO_PASS" https://$REPO_SRV/repository/$ARTIFACTS_PATH/$APPNAME_SHORT/pipelin-id/$CI_PIPELINE_ID/$VERSION_FILE)
     - git clone https://git.zubr.dev/shared/ci-scripts.git
+    - cd ci-scripts
     - ansible --version
     - ansible-playbook -i tt_stg -e "install_version=${PIPELINE_ID_VERSION}" --private-key ~/.ssh/id_rsa deploy.yml
   when: manual
