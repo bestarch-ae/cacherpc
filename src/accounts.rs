@@ -775,7 +775,7 @@ impl AccountUpdateManager {
                             }
                         }
                         InflightRequest::SlotSub(_) => {
-                            info!(self.actor_id, message = "subscribed to root");
+                            info!(self.actor_id, message = "subscribed to slots");
                         }
                     }
                 }
@@ -795,6 +795,7 @@ impl AccountUpdateManager {
                             subscription: u64,
                         }
                         let params: Params = serde_json::from_str(params.get())?;
+                        let slot = params.result.context.slot;
                         if let Some((sub, commitment)) = self.id_to_sub.get(&params.subscription) {
                             //info!(key = %sub.key(), "received account notification");
                             self.accounts.insert(sub.key(), params.result, *commitment);
@@ -805,6 +806,10 @@ impl AccountUpdateManager {
                                 sub = params.subscription
                             );
                         }
+                        metrics()
+                            .pubsub_account_slot
+                            .with_label_values(&[&self.actor_name])
+                            .set(slot as i64);
                         metrics()
                             .notifications_received
                             .with_label_values(&[&self.actor_name, "accountNotification"])
@@ -830,15 +835,20 @@ impl AccountUpdateManager {
                         if let Some((program_sub, commitment)) =
                             self.id_to_sub.get(&params.subscription)
                         {
+                            let slot = params.result.context.slot;
+                            let program_key = program_sub.key();
+
                             if let Some(meta) = self.subs.get_mut(&(*program_sub, *commitment)) {
                                 if meta.first_slot.is_none() {
-                                    let (key, slot) =
-                                        (program_sub.key(), params.result.context.slot);
-                                    info!(program = %key, slot, "first update for program");
+                                    info!(program = %program_key, slot, "first update for program");
                                     meta.first_slot.replace(slot);
                                 }
                             }
-                            let program_key = program_sub.key();
+                            metrics()
+                                .pubsub_program_slot
+                                .with_label_values(&[&self.actor_name])
+                                .set(slot as i64);
+
                             let key = params.result.value.pubkey;
                             let account_info = &params.result.value.account;
                             let data = &account_info.data;
@@ -892,14 +902,26 @@ impl AccountUpdateManager {
                             .with_label_values(&[&self.actor_name, "programNotification"])
                             .inc();
                     }
-                    "rootNotification" => {
+                    "slotNotification" => {
+                        #[derive(Deserialize)]
+                        struct SlotInfo {
+                            slot: u64,
+                        }
                         #[derive(Deserialize)]
                         struct Params {
-                            result: u64, //SlotInfo,
+                            result: SlotInfo,
                         }
                         let params: Params = serde_json::from_str(params.get())?;
                         //info!("slot {} root {} parent {}", params.result.slot, params.result.root, params.result.parent);
-                        let _slot = params.result; // TODO: figure out which slot validator *actually* reports
+                        let slot = params.result.slot; // TODO: figure out which slot validator *actually* reports
+                        metrics()
+                            .pubsub_slot
+                            .with_label_values(&[&self.actor_name])
+                            .set(slot as i64);
+                        metrics()
+                            .notifications_received
+                            .with_label_values(&[&self.actor_name, "slotNotification"])
+                            .inc();
                     }
                     _ => {
                         warn!(
@@ -1122,7 +1144,7 @@ impl StreamHandler<Result<awc::ws::Frame, awc::error::WsProtocolError>> for Acco
         let request = serde_json::json!({
             "jsonrpc": "2.0",
             "id": request_id,
-            "method": "rootSubscribe",
+            "method": "slotSubscribe",
         });
         self.inflight.insert(
             request_id,
