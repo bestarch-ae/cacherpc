@@ -74,6 +74,8 @@ pub struct PubSubMetrics {
     pub accounts_filtered_out: IntCounterVec,
     pub filtration_time: HistogramVec,
     pub pubsub_slot: IntGaugeVec,
+    pub pubsub_program_slot: IntGaugeVec,
+    pub pubsub_account_slot: IntGaugeVec,
 }
 
 pub fn pubsub_metrics() -> &'static PubSubMetrics {
@@ -220,8 +222,20 @@ pub fn pubsub_metrics() -> &'static PubSubMetrics {
         )
         .unwrap(),
         pubsub_slot: register_int_gauge_vec!(
-            "pubsub_slot",
+            "pubsub_subscription_slot",
             "latest slot reported by slotSubscribe",
+            &["connection_id"]
+        )
+        .unwrap(),
+        pubsub_program_slot: register_int_gauge_vec!(
+            "pubsub_program_slot",
+            "latest slot reported by programNotification",
+            &["connection_id"]
+        )
+        .unwrap(),
+        pubsub_account_slot: register_int_gauge_vec!(
+            "pubsub_account_slot",
+            "latest slot reported by accountNotification",
             &["connection_id"]
         )
         .unwrap(),
