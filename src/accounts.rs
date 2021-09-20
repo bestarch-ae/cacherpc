@@ -775,7 +775,7 @@ impl AccountUpdateManager {
                             }
                         }
                         InflightRequest::SlotSub(_) => {
-                            info!(self.actor_id, message = "subscribed to root");
+                            info!(self.actor_id, message = "subscribed to slots");
                         }
                     }
                 }
@@ -892,14 +892,26 @@ impl AccountUpdateManager {
                             .with_label_values(&[&self.actor_name, "programNotification"])
                             .inc();
                     }
-                    "rootNotification" => {
+                    "slotNotification" => {
+                        #[derive(Deserialize)]
+                        struct SlotInfo {
+                            slot: u64,
+                        }
                         #[derive(Deserialize)]
                         struct Params {
-                            result: u64, //SlotInfo,
+                            result: SlotInfo,
                         }
                         let params: Params = serde_json::from_str(params.get())?;
                         //info!("slot {} root {} parent {}", params.result.slot, params.result.root, params.result.parent);
-                        let _slot = params.result; // TODO: figure out which slot validator *actually* reports
+                        let slot = params.result.slot; // TODO: figure out which slot validator *actually* reports
+                        metrics()
+                            .pubsub_slot
+                            .with_label_values(&[&self.actor_name])
+                            .set(slot as i64);
+                        metrics()
+                            .notifications_received
+                            .with_label_values(&[&self.actor_name, "slotNotification"])
+                            .inc();
                     }
                     _ => {
                         warn!(
@@ -1122,7 +1134,7 @@ impl StreamHandler<Result<awc::ws::Frame, awc::error::WsProtocolError>> for Acco
         let request = serde_json::json!({
             "jsonrpc": "2.0",
             "id": request_id,
-            "method": "rootSubscribe",
+            "method": "slotSubscribe",
         });
         self.inflight.insert(
             request_id,
