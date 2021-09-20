@@ -277,16 +277,20 @@ async fn run(options: Options) -> Result<()> {
             .allow_any_origin()
             .allowed_methods(vec!["POST"])
             .allowed_header(actix_web::http::header::CONTENT_TYPE);
+
+        let content_type_guard = guard::fn_guard(move |req| {
+            req.headers()
+                .get("content-type")
+                .map(move |header| header.as_bytes().starts_with(b"application/json"))
+                .unwrap_or(false)
+        });
+
         App::new()
             .data(state)
             .wrap(cors)
             .service(
                 web::resource("/")
-                    .route(
-                        web::post()
-                            .guard(guard::Header("content-type", "application/json"))
-                            .to(rpc::rpc_handler),
-                    )
+                    .route(web::post().guard(content_type_guard).to(rpc::rpc_handler))
                     .route(web::post().to(rpc::bad_content_type_handler)),
             )
             .service(web::resource("/metrics").route(web::get().to(rpc::metrics_handler)))
