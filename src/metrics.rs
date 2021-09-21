@@ -267,6 +267,7 @@ pub struct RpcMetrics {
     pub passthrough_request_time: Histogram,
     pub passthrough_forward_response_time: Histogram,
     pub passthrough_errors: IntCounter,
+    pub rpc_slot: IntGauge,
 }
 
 impl RpcMetrics {
@@ -464,6 +465,7 @@ pub fn rpc_metrics() -> &'static RpcMetrics {
             "Time to send passthrough request"
         )
         .unwrap(),
+        rpc_slot: register_int_gauge!("rpc_slot", "slot received by polling rpc").unwrap(),
     });
 
     &METRICS

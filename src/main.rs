@@ -213,6 +213,9 @@ async fn run(options: Options) -> Result<()> {
         options.time_to_live,
     );
 
+    let _rpc_monitor =
+        cache_rpc::rpc_monitor::RpcMonitor::init(&options.rpc_url, Client::default());
+
     let config_file = options
         .config
         .as_ref()
