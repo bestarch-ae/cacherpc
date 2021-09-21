@@ -90,6 +90,12 @@ struct Options {
         parse(try_from_str = humantime::parse_duration)
     )]
     time_to_live: Duration,
+
+    #[structopt(
+        long = "ignore-base58-limit",
+        help = "ignore base58 overflowing size limit"
+    )]
+    ignore_base58: bool,
     #[structopt(long = "config", help = "config path")]
     config: Option<PathBuf>,
 }
@@ -176,6 +182,7 @@ impl Config {
                     account_info: options.account_info_request_limit,
                     program_accounts: options.program_accounts_request_limit,
                 },
+                ignore_base58_limit: options.ignore_base58,
             },
         }
     }
