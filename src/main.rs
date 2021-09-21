@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::fs::File;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -212,16 +212,20 @@ async fn run(options: Options) -> Result<()> {
     let accounts = AccountsDb::new();
     let program_accounts = ProgramAccountsDb::new();
 
+    let rpc_slot = Arc::new(AtomicU64::new(0));
+    let _rpc_monitor = cache_rpc::rpc_monitor::RpcMonitor::init(
+        &options.rpc_url,
+        Client::default(),
+        rpc_slot.clone(),
+    );
     let pubsub = PubSubManager::init(
         options.websocket_connections,
         accounts.clone(),
         program_accounts.clone(),
         &options.ws_url,
         options.time_to_live,
+        rpc_slot.clone(),
     );
-
-    let _rpc_monitor =
-        cache_rpc::rpc_monitor::RpcMonitor::init(&options.rpc_url, Client::default());
 
     let config_file = options
         .config

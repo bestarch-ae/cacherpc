@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
 use std::time::Duration;
@@ -27,6 +27,7 @@ use crate::types::{
     SolanaContext,
 };
 
+const SLOT_DISTANCE: u64 = 150;
 const MAILBOX_CAPACITY: usize = 512;
 const DEAD_REQUEST_LIMIT: usize = 0;
 const IN_FLIGHT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -84,6 +85,7 @@ impl PubSubManager {
         program_accounts: ProgramAccountsDb,
         websocket_url: &str,
         time_to_live: Duration,
+        rpc_slot: Arc<AtomicU64>,
     ) -> Self {
         let mut addrs = Vec::new();
         for id in 0..connections {
@@ -95,6 +97,7 @@ impl PubSubManager {
                 Arc::clone(&active),
                 websocket_url,
                 time_to_live,
+                rpc_slot.clone(),
             );
             addrs.push((addr, active))
         }
@@ -171,6 +174,7 @@ pub struct AccountUpdateManager {
     additional_keys: ProgramFilters,
     last_received_at: Instant,
     active: Arc<AtomicBool>,
+    rpc_slot: Arc<AtomicU64>,
     buffer: BytesMut,
 }
 
@@ -188,6 +192,7 @@ impl AccountUpdateManager {
         active: Arc<AtomicBool>,
         websocket_url: &str,
         time_to_live: Duration,
+        rpc_slot: Arc<AtomicU64>,
     ) -> Addr<Self> {
         let arbiter = Arbiter::new();
         let websocket_url = websocket_url.to_owned();
@@ -209,6 +214,7 @@ impl AccountUpdateManager {
             purge_queue: None,
             additional_keys: HashMap::default(),
             active,
+            rpc_slot,
             last_received_at: Instant::now(),
             buffer: BytesMut::new(),
         })
@@ -274,6 +280,18 @@ impl AccountUpdateManager {
         let request_id = self.request_id;
         self.request_id += 1;
         request_id
+    }
+
+    fn check_slot(&self, slot: u64, ctx: &mut Context<Self>) {
+        let rpc_slot = self.rpc_slot.load(Ordering::Relaxed);
+        let behind = rpc_slot
+            .checked_sub(slot)
+            .map(|diff| diff > SLOT_DISTANCE)
+            .unwrap_or(false);
+        if behind {
+            error!("websocket slot behind rpc, stopping");
+            ctx.stop()
+        }
     }
 
     fn send<T: Serialize>(&mut self, request: &T) -> Result<(), serde_json::Error> {
@@ -921,6 +939,7 @@ impl AccountUpdateManager {
                             .notifications_received
                             .with_label_values(&[&self.actor_name, "slotNotification"])
                             .inc();
+                        self.check_slot(slot, ctx);
                     }
                     _ => {
                         warn!(
