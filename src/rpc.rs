@@ -891,6 +891,7 @@ fn program_accounts_response<'a>(
 
     let mut encoded_accounts = Vec::with_capacity(accounts.len());
     let mut slot = 0;
+    let enforce_base58_limit = !app_state.config.load().ignore_base58_limit;
 
     for key in accounts {
         if let Some(data) = app_state.accounts.get(key) {
@@ -909,7 +910,7 @@ fn program_accounts_response<'a>(
                 .unwrap_or(0);
 
             // TODO: kinda hacky, find a better way
-            if account_len > 128 && config.encoding.is_base58() {
+            if enforce_base58_limit && account_len > 128 && config.encoding.is_base58() {
                 return Err(ProgramAccountsResponseError::Base58);
             }
 
@@ -1376,6 +1377,7 @@ pub struct RequestLimits {
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub request_limits: RequestLimits,
+    pub ignore_base58_limit: bool,
 }
 
 pub async fn apply_config(app_state: &web::Data<State>, new_config: Config) {
