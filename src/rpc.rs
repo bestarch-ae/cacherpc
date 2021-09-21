@@ -327,19 +327,6 @@ impl State {
             .content_type("application/json");
 
         if is_cacheable {
-            #[derive(Deserialize, Debug)]
-            struct Wrap<T> {
-                #[serde(flatten)]
-                inner: Response<T>,
-            }
-
-            #[derive(Deserialize, Debug)]
-            #[serde(rename_all = "lowercase")]
-            enum Response<T> {
-                Result(T),
-                Error(RpcErrorOwned),
-            }
-
             let this = Arc::clone(&self);
             let stream = stream_generator::generate_try_stream(move |mut stream| async move {
                 let mut bytes_chain = BytesChain::new();
@@ -354,7 +341,7 @@ impl State {
                 }
 
                 let resp = serde_json::from_reader(bytes_chain)
-                    .map(|wrap: Wrap<T::ResponseData>| wrap.inner);
+                    .map(|wrap: Flatten<Response<T::ResponseData>>| wrap.inner);
 
                 match resp {
                     Ok(Response::Result(data)) => {
@@ -671,6 +658,19 @@ where
     pub params: Option<&'a T>,
 }
 
+#[derive(Deserialize, Debug)]
+pub struct Flatten<T> {
+    #[serde(flatten)]
+    pub inner: T,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum Response<T> {
+    Result(T),
+    Error(RpcErrorOwned),
+}
+
 #[derive(Deserialize, Serialize, Debug)]
 struct RpcError<'a> {
     code: i64,
@@ -682,7 +682,7 @@ struct RpcError<'a> {
 }
 
 #[derive(Deserialize, Serialize, Debug)]
-struct RpcErrorOwned {
+pub struct RpcErrorOwned {
     code: i64,
     message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
