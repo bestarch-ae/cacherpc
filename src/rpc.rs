@@ -24,7 +24,7 @@ use tokio::sync::{watch, Notify, Semaphore};
 use tracing::{debug, error, info, warn};
 
 use crate::accounts::Subscription;
-use crate::filter::{Filters, NormalizeError};
+use crate::filter::{Filter, Filters};
 use crate::metrics::rpc_metrics as metrics;
 use crate::types::{
     AccountContext, AccountData, AccountInfo, AccountState, AccountsDb, BytesChain, Commitment,
@@ -797,21 +797,42 @@ enum ProgramAccountsResponseError {
     Base58,
 }
 
-#[derive(Deserialize, Serialize, Debug)]
-struct ProgramAccountsConfig<'a> {
+#[derive(Debug, Deserialize)]
+#[serde(from = "SmallVec<[Filter; 3]>")]
+enum MaybeFilters {
+    Valid(Filters),
+    Invalid(SmallVec<[Filter; 3]>),
+}
+
+impl MaybeFilters {
+    fn valid(&self) -> Option<&Filters> {
+        match self {
+            Self::Valid(ref filters) => Some(filters),
+            Self::Invalid(..) => None,
+        }
+    }
+}
+
+impl From<SmallVec<[Filter; 3]>> for MaybeFilters {
+    fn from(value: SmallVec<[Filter; 3]>) -> MaybeFilters {
+        Filters::new_normalized(value.clone()).map_or(Self::Invalid(value), Self::Valid)
+    }
+}
+
+#[derive(Deserialize, Debug)]
+struct ProgramAccountsConfig {
     #[serde(default = "Encoding::default")]
     encoding: Encoding,
     #[serde(flatten)]
     commitment: Option<CommitmentConfig>,
     #[serde(rename = "dataSlice")]
     data_slice: Option<Slice>,
-    #[serde(borrow)]
-    filters: Option<&'a RawValue>,
+    filters: Option<MaybeFilters>,
     #[serde(rename = "withContext")]
     with_context: Option<bool>,
 }
 
-impl Default for ProgramAccountsConfig<'_> {
+impl Default for ProgramAccountsConfig {
     fn default() -> Self {
         ProgramAccountsConfig {
             encoding: Encoding::Default,
@@ -966,7 +987,7 @@ async fn get_program_accounts(
     req: Request<'_, RawValue>,
     app_state: web::Data<State>,
 ) -> Result<HttpResponse, Error<'_>> {
-    let (pubkey, config, _hash) = parse_params::<ProgramAccountsConfig<'_>>(&req)?;
+    let (pubkey, config, _hash) = parse_params::<ProgramAccountsConfig>(&req)?;
     let return_context = config.with_context;
 
     let commitment = config.commitment.unwrap_or_default().commitment;
@@ -982,38 +1003,29 @@ async fn get_program_accounts(
         .inc();
 
     let mut cacheable_for_key = Some(pubkey);
-    let filters = config
-        .filters
-        .map(RawValue::get)
-        .map(serde_json::from_str::<SmallVec<[_; 3]>>)
-        .transpose()?
-        .map(Filters::new_normalized);
 
-    let (filters, bad_filters) = match filters {
-        Some(Ok(filters)) => (Some(filters), false),
-        Some(Err(NormalizeError::Empty)) | None => (None, false), // Empty is ok
-        Some(Err(err)) => {
-            warn!(%err, "received bad filters. empty response");
-            // TODO: consider just opting-out from caching this request
-            (None, true)
-        }
+    let (filters, bad_filters) = match config.filters.as_ref() {
+        Some(MaybeFilters::Valid(filters)) => (Some(filters), false),
+        Some(MaybeFilters::Invalid(vec)) if vec.is_empty() => (None, false), // Empty is ok
+        Some(MaybeFilters::Invalid(_vec)) => (None, true),
+        None => (None, false), // Empty is ok
     };
 
     let is_json_parsed = config.encoding == Encoding::JsonParsed;
     let has_active_sub = app_state.subscription_active(pubkey);
 
     if !is_json_parsed && has_active_sub && !bad_filters {
-        match app_state.program_accounts.get(&pubkey, filters.clone()) {
+        match app_state.program_accounts.get(&pubkey, filters.cloned()) {
             Some(data) => {
                 let accounts = data.value();
                 if let Some(accounts) = accounts.get(commitment) {
-                    app_state.reset(Subscription::Program(pubkey), commitment, filters.clone());
+                    app_state.reset(Subscription::Program(pubkey), commitment, filters.cloned());
                     metrics().program_accounts_cache_hits.inc();
                     match program_accounts_response(
                         req.id.clone(),
                         accounts,
                         &config,
-                        filters.as_ref(),
+                        filters,
                         &app_state,
                         return_context.unwrap_or(false),
                     ) {
@@ -1074,16 +1086,16 @@ async fn get_program_accounts(
             }
             _ = notified => {
                 if let Some(program_pubkey) = cacheable_for_key {
-                    if let Some(data) = app_state.program_accounts.get(&program_pubkey, filters.clone()) {
+                    if let Some(data) = app_state.program_accounts.get(&program_pubkey, filters.cloned()) {
                         let data = data.value();
                         metrics().program_accounts_cache_filled.inc();
                         if let Some(accounts) = data.get(commitment) {
-                            app_state.reset(Subscription::Program(pubkey), commitment, filters.clone());
+                            app_state.reset(Subscription::Program(pubkey), commitment, filters.cloned());
                             if let Ok(resp) = program_accounts_response(
                                 req.id.clone(),
                                 accounts,
                                 &config,
-                                filters.as_ref(),
+                                filters,
                                 &app_state,
                                 return_context.unwrap_or(false),
                             ) {
@@ -1102,7 +1114,7 @@ async fn get_program_accounts(
         let stream = program_response_stream::<Vec<AccountAndPubkey>, _, _>(
             app_state,
             (pubkey, commitment),
-            filters,
+            filters.cloned(),
             resp,
             true,
             |err| {
@@ -1115,7 +1127,7 @@ async fn get_program_accounts(
         let stream = program_response_stream::<[AccountAndPubkey; 0], _, _>(
             app_state,
             (pubkey, commitment),
-            filters,
+            filters.cloned(),
             resp,
             false,
             move |err| {
