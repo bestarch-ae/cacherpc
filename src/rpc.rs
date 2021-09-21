@@ -557,8 +557,8 @@ fn account_response<'a, 'b>(
     req_id: Id<'a>,
     request_hash: u64,
     acc: (Option<&'b AccountInfo>, u64),
-    app_state: &web::Data<State>,
-    config: AccountInfoConfig,
+    app_state: &State,
+    config: &AccountInfoConfig,
 ) -> Result<HttpResponse, Error<'a>> {
     let request_and_slot_hash = hash((request_hash, acc.1));
     if let Some(result) = app_state.lru.borrow_mut().get(&request_and_slot_hash) {
@@ -662,7 +662,7 @@ async fn get_account_info(
                             request_hash,
                             (account_info, slot),
                             &app_state,
-                            config,
+                            &config,
                         );
                     }
                     _ => {}
@@ -715,7 +715,7 @@ async fn get_account_info(
                                     request_hash,
                                     account,
                                     &app_state,
-                                    config,
+                                    &config,
                             );
                         }
                     }
@@ -848,9 +848,9 @@ pub struct AccountAndPubkey {
 fn program_accounts_response<'a>(
     req_id: Id<'a>,
     accounts: &HashSet<Arc<Pubkey>>,
-    config: &'_ ProgramAccountsConfig<'_>,
+    config: &'_ ProgramAccountsConfig,
     filters: Option<&'a Filters>,
-    app_state: &web::Data<State>,
+    app_state: &State,
     with_context: bool,
 ) -> Result<HttpResponse, ProgramAccountsResponseError> {
     struct Encode<'a, K> {
