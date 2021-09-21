@@ -660,15 +660,15 @@ pub enum Id<'a> {
 
 #[derive(Deserialize, Serialize, Debug)]
 #[serde(bound(deserialize = "&'a T: Deserialize<'de>"))]
-struct Request<'a, T>
+pub struct Request<'a, T>
 where
     T: ?Sized,
 {
-    jsonrpc: &'a str,
-    id: Id<'a>,
-    method: &'a str,
+    pub jsonrpc: &'a str,
+    pub id: Id<'a>,
+    pub method: &'a str,
     #[serde(borrow)]
-    params: Option<&'a T>,
+    pub params: Option<&'a T>,
 }
 
 #[derive(Deserialize, Serialize, Debug)]

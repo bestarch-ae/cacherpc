@@ -6,10 +6,9 @@ use std::sync::{
 use std::time::Duration;
 
 use actix::io::SinkWrite;
-use actix::prelude::AsyncContext;
 use actix::prelude::{
-    Actor, ActorContext, Addr, Context, Handler, Message, Running, SpawnHandle, StreamHandler,
-    Supervised, Supervisor,
+    Actor, ActorContext, Addr, AsyncContext, Context, Handler, Message, Running, SpawnHandle,
+    StreamHandler, Supervised, Supervisor,
 };
 use actix::Arbiter;
 use actix_http::ws;
