@@ -846,6 +846,7 @@ impl Default for CommitmentConfig {
 
 #[derive(Deserialize, Debug)]
 struct AccountInfoConfig {
+    #[serde(default = "Encoding::default")]
     encoding: Encoding,
     #[serde(flatten)]
     commitment: Option<CommitmentConfig>,
