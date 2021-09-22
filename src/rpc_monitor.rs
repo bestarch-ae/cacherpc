@@ -6,28 +6,16 @@ use std::time::Duration;
 use actix::fut::{ActorFuture, WrapFuture};
 use actix::prelude::{Actor, Addr, AsyncContext, Context, Handler, Message};
 use awc::Client;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tracing::{debug, warn};
 
 use crate::metrics::rpc_metrics as metrics;
-use crate::rpc::{Id, Request};
+use crate::rpc::{Flatten, Id, Request, Response};
 use crate::types::Commitment;
 
 #[derive(Serialize)]
 struct Param {
     commitment: Commitment,
-}
-#[derive(Deserialize, Debug)]
-struct Wrap<T> {
-    #[serde(flatten)]
-    inner: Response<T>,
-}
-
-#[derive(Deserialize, Debug)]
-#[serde(rename_all = "lowercase")]
-enum Response<T> {
-    Result(T),
-    Error(Box<serde_json::value::RawValue>),
 }
 
 #[derive(Message, Debug)]
@@ -109,11 +97,11 @@ impl RpcMonitor {
             .send_json(&request)
             .await
             .map_err(|err| anyhow::Error::msg(err.to_string()))?;
-        let resp = resp.json::<Wrap<Resp>>().await?;
+        let resp = resp.json::<Flatten<Response<Resp>>>().await?;
         match resp.inner {
             Response::Result(resp) => Ok(resp),
             Response::Error(err) => {
-                anyhow::bail!(err);
+                anyhow::bail!("{:?}", err);
             }
         }
     }
@@ -162,8 +150,11 @@ impl Handler<MonitorMessage> for RpcMonitor {
                 metrics().rpc_slot.set(slot as i64);
                 self.slot.store(slot, Ordering::Relaxed);
             }
-            MonitorMessage::HealthUpdated(health) => {
-                debug!(healthy = %health, "rpc health updated");
+            MonitorMessage::HealthUpdated(healthy) => {
+                debug!(healthy, "rpc health updated");
+                if !healthy {
+                    warn!("rpc is unhealthy");
+                }
             }
         }
     }
