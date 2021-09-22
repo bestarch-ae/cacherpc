@@ -1,4 +1,6 @@
 use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use actix::fut::{ActorFuture, WrapFuture};
@@ -39,19 +41,21 @@ pub struct RpcMonitor {
     client: Client,
     rpc_url: String,
     id: u64,
+    slot: Arc<AtomicU64>,
 }
 
 impl RpcMonitor {
-    pub fn init(url: &str, client: Client) -> Addr<Self> {
-        let actor = Self::new(url, client);
+    pub fn init(url: &str, client: Client, rpc_slot: Arc<AtomicU64>) -> Addr<Self> {
+        let actor = Self::new(url, client, rpc_slot);
         actor.start()
     }
 
-    fn new(url: &str, client: Client) -> Self {
+    fn new(url: &str, client: Client, slot: Arc<AtomicU64>) -> Self {
         RpcMonitor {
             client,
             rpc_url: url.to_owned(),
             id: 1,
+            slot,
         }
     }
 
@@ -156,6 +160,7 @@ impl Handler<MonitorMessage> for RpcMonitor {
             MonitorMessage::SlotUpdated(slot) => {
                 debug!(%slot, "rpc slot updated");
                 metrics().rpc_slot.set(slot as i64);
+                self.slot.store(slot, Ordering::Relaxed);
             }
             MonitorMessage::HealthUpdated(health) => {
                 debug!(healthy = %health, "rpc health updated");
