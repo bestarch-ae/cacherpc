@@ -15,6 +15,7 @@ use bytes::Bytes;
 use dashmap::mapref::one::Ref;
 use futures_util::stream::Stream;
 use lru::LruCache;
+use prometheus::IntCounter;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::value::{to_raw_value, RawValue};
 use smallvec::SmallVec;
@@ -285,6 +286,7 @@ impl State {
             .map(|_| request.get_from_cache(&raw_request.id, &self))
         {
             Ok(Some(data)) => {
+                T::cache_hit_counter().inc();
                 self.reset(request.sub_descriptor());
                 return data;
             }
@@ -313,6 +315,8 @@ impl State {
                 }
                 _ = notified, if is_cacheable => {
                     if let Some(data) = request.get_from_cache(&raw_request.id, &self) {
+                        T::cache_hit_counter().inc();
+                        T::cache_filled_counter().inc();
                         self.reset(request.sub_descriptor());
                         return data;
                     }
@@ -388,6 +392,10 @@ trait Cacheable: Sized + 'static {
     fn handle_parse_error(&self, err: Error<'_>) {
         tracing::error!(error = %err, "failed to parse response");
     }
+
+    // Metrics
+    fn cache_hit_counter<'a>() -> &'a IntCounter;
+    fn cache_filled_counter<'a>() -> &'a IntCounter;
 }
 
 macro_rules! emit_request_metrics {
@@ -474,6 +482,13 @@ impl Cacheable for GetAccountInfo {
             commitment: self.commitment(),
             filters: None,
         }
+    }
+
+    fn cache_hit_counter<'a>() -> &'a IntCounter {
+        &metrics().account_cache_hits
+    }
+    fn cache_filled_counter<'a>() -> &'a IntCounter {
+        &metrics().account_cache_filled
     }
 }
 
@@ -604,6 +619,13 @@ impl Cacheable for GetProgramAccounts {
             commitment: self.commitment(),
             filters: self.filters.clone(),
         }
+    }
+
+    fn cache_hit_counter<'a>() -> &'a IntCounter {
+        &metrics().program_accounts_cache_hits
+    }
+    fn cache_filled_counter<'a>() -> &'a IntCounter {
+        &metrics().program_accounts_cache_filled
     }
 }
 
