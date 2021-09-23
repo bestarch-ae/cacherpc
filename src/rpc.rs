@@ -458,6 +458,7 @@ impl Cacheable for GetAccountInfo {
             data.get(self.commitment())
                 .filter(|(_, slot)| *slot != 0)
                 .map(|data| {
+                    metrics().account_cache_hits.inc();
                     account_response(id.clone(), self.config_hash, data, state, &self.config)
                 })
         })
@@ -556,9 +557,16 @@ impl Cacheable for GetProgramAccounts {
             .and_then(|data| {
                 let accounts = data.value().get(commitment)?;
 
-                let id_ = id.clone();
-                let res =
-                    program_accounts_response(id_, accounts, config, filters, state, with_context);
+                metrics().program_accounts_cache_hits.inc();
+
+                let res = program_accounts_response(
+                    id.clone(),
+                    accounts,
+                    config,
+                    filters,
+                    state,
+                    with_context,
+                );
                 match res {
                     Ok(res) => Some(Ok(res)),
                     Err(ProgramAccountsResponseError::Base58) => {
