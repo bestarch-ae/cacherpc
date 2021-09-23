@@ -50,9 +50,10 @@ impl AccountInfo {
         &self,
         encoding: Encoding,
         slice: Option<Slice>,
+        enforce_base58_limit: bool,
     ) -> Result<EncodedAccountInfo<'_>, Base58Error> {
         // Encoded binary (base 58) data should be less than 128 bytes
-        if self.data.len() > 128 && encoding.is_base58() {
+        if enforce_base58_limit && self.data.len() > 128 && encoding.is_base58() {
             return Err(Base58Error);
         }
         Ok(EncodedAccountInfo {
@@ -978,7 +979,7 @@ fn account_response<'a, 'b>(
             .as_ref()
             .map(|acc| {
                 Ok::<_, Base58Error>(
-                    acc.encode(config.encoding, config.data_slice)?
+                    acc.encode(config.encoding, config.data_slice, true)?
                         .with_context(&ctx),
                 )
             })
@@ -1098,6 +1099,7 @@ fn program_accounts_response<'a>(
         encoding: Encoding,
         slice: Option<Slice>,
         commitment: Commitment,
+        enforce_base58_limit: bool,
     }
 
     impl<'a, K> Serialize for Encode<'a, K>
@@ -1110,7 +1112,7 @@ fn program_accounts_response<'a>(
         {
             if let Some((Some(value), _)) = self.inner.value().get(self.commitment) {
                 let encoded = value
-                    .encode(self.encoding, self.slice)
+                    .encode(self.encoding, self.slice, self.enforce_base58_limit)
                     .map_err(serde::ser::Error::custom)?;
                 encoded.serialize(serializer)
             } else {
@@ -1168,6 +1170,7 @@ fn program_accounts_response<'a>(
                     encoding: config.encoding,
                     slice: config.data_slice,
                     commitment,
+                    enforce_base58_limit,
                 },
                 pubkey: **key,
             })
