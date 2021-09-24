@@ -1367,6 +1367,7 @@ pub struct RequestLimits {
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub request_limits: RequestLimits,
+    #[serde(default)]
     pub ignore_base58_limit: bool,
 }
 
