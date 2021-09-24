@@ -616,7 +616,7 @@ impl Cacheable for GetProgramAccounts {
 
     fn sub_descriptor(&self) -> SubDescriptor {
         SubDescriptor {
-            kind: Subscription::Account(self.pubkey),
+            kind: Subscription::Program(self.pubkey),
             commitment: self.commitment(),
             filters: self.filters.clone(),
         }
