@@ -282,7 +282,7 @@ impl State {
         raw_request: Request<'_, RawValue>,
     ) -> CacheResult<'_> {
         let request = T::parse(&raw_request)?;
-        let is_cacheable = match request
+        let (is_cacheable, can_use_cache) = match request
             .is_cacheable(&self)
             .map(|_| request.get_from_cache(&raw_request.id, &self))
         {
@@ -291,13 +291,24 @@ impl State {
                 self.reset(request.sub_descriptor());
                 return data;
             }
-            Ok(None) => true,
+            Ok(None) => (true, true),
             Err(reason) => {
+                let data = reason
+                    .can_use_cache()
+                    .then(|| request.get_from_cache(&raw_request.id, &self))
+                    .flatten();
+
+                if let Some(data) = data {
+                    T::cache_hit_counter().inc();
+                    self.reset(request.sub_descriptor());
+                    return data;
+                }
+
                 metrics()
                     .response_uncacheable
                     .with_label_values(&[T::REQUEST_TYPE, reason.as_str()])
                     .inc();
-                false
+                (false, reason.can_use_cache())
             }
         };
 
@@ -314,7 +325,7 @@ impl State {
                         Error::Timeout(raw_request.id.clone())
                     })?;
                 }
-                _ = notified, if is_cacheable => {
+                _ = notified, if can_use_cache => {
                     if let Some(data) = request.get_from_cache(&raw_request.id, &self) {
                         T::cache_hit_counter().inc();
                         T::cache_filled_counter().inc();
@@ -656,6 +667,14 @@ impl UncacheableReason {
             Self::Inactive => "inactive_sub",
             Self::DataSlice => "data_slice",
             Self::Filters => "bad_filters",
+        }
+    }
+
+    /// Returns true if the request can still be fetched from cache
+    fn can_use_cache(&self) -> bool {
+        match self {
+            Self::DataSlice => true,
+            Self::Encoding | Self::Inactive | Self::Filters => false,
         }
     }
 }
