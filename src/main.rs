@@ -98,6 +98,13 @@ struct Options {
     ignore_base58: bool,
     #[structopt(long = "config", help = "config path")]
     config: Option<PathBuf>,
+    #[structopt(
+        long = "slot-distance",
+        short = "d",
+        help = "Health check slot distance",
+        default_value = "150"
+    )]
+    slot_dist: u32,
 }
 
 #[derive(Debug)]
@@ -225,6 +232,7 @@ async fn run(options: Options) -> Result<()> {
         &options.ws_url,
         options.time_to_live,
         rpc_slot.clone(),
+        options.slot_dist,
     );
 
     let config_file = options
