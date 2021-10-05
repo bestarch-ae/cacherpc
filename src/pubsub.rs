@@ -27,7 +27,6 @@ use crate::types::{
     SolanaContext,
 };
 
-const SLOT_DISTANCE: u64 = 150;
 const MAILBOX_CAPACITY: usize = 512;
 const DEAD_REQUEST_LIMIT: usize = 0;
 const IN_FLIGHT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -86,6 +85,7 @@ impl PubSubManager {
         websocket_url: &str,
         time_to_live: Duration,
         rpc_slot: Arc<AtomicU64>,
+        slot_dist: u32,
     ) -> Self {
         let mut addrs = Vec::new();
         for id in 0..connections {
@@ -98,6 +98,7 @@ impl PubSubManager {
                 websocket_url,
                 time_to_live,
                 rpc_slot.clone(),
+                slot_dist,
             );
             addrs.push((addr, active))
         }
@@ -176,6 +177,7 @@ pub struct AccountUpdateManager {
     active: Arc<AtomicBool>,
     rpc_slot: Arc<AtomicU64>,
     buffer: BytesMut,
+    slot_dist: u32,
 }
 
 impl std::fmt::Debug for AccountUpdateManager {
@@ -193,6 +195,7 @@ impl AccountUpdateManager {
         websocket_url: &str,
         time_to_live: Duration,
         rpc_slot: Arc<AtomicU64>,
+        slot_dist: u32,
     ) -> Addr<Self> {
         let arbiter = Arbiter::new();
         let websocket_url = websocket_url.to_owned();
@@ -217,6 +220,7 @@ impl AccountUpdateManager {
             rpc_slot,
             last_received_at: Instant::now(),
             buffer: BytesMut::new(),
+            slot_dist,
         })
     }
 
@@ -286,7 +290,7 @@ impl AccountUpdateManager {
         let rpc_slot = self.rpc_slot.load(Ordering::Relaxed);
         let behind = rpc_slot
             .checked_sub(slot)
-            .map(|diff| diff > SLOT_DISTANCE)
+            .map(|diff| diff > self.slot_dist as u64)
             .unwrap_or(false);
         if behind {
             error!("websocket slot behind rpc, stopping");
