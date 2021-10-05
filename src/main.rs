@@ -172,6 +172,18 @@ struct Config {
     rpc: rpc::Config,
 }
 
+impl std::fmt::Display for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let lim = &self.rpc.request_limits;
+        write!(
+            f,
+            "RPC:\n limits:\n  accounts: {}\n  program accounts: {}\n ignore base 58 limit: {}",
+            lim.account_info, lim.program_accounts, self.rpc.ignore_base58_limit
+        )?;
+        Ok(())
+    }
+}
+
 impl Config {
     fn from_file(f: File) -> Result<Config> {
         use std::io::{BufReader, Read};
@@ -203,8 +215,8 @@ async fn config_read_loop(path: PathBuf, rpc: watch::Sender<rpc::Config>) {
         match File::open(&path) {
             Ok(file) => match Config::from_file(file) {
                 Ok(config) => {
+                    info!("\nConfiguration reloaded:\n{}\n", config);
                     let _ = rpc.broadcast(config.rpc);
-                    info!("config reloaded");
                 }
                 Err(err) => tracing::error!(error = %err, path = ?path, "error parsing config"),
             },
