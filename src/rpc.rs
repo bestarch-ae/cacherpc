@@ -1381,16 +1381,7 @@ pub async fn apply_config(app_state: &web::Data<State>, new_config: Config) {
     let current_limits = current_config.request_limits;
     let new_limits = new_config.request_limits;
 
-    let diff = format!("RPC:\n limits:\n  accounts: {} -> {}\n  program accounts: {} -> {}\n ignore base 58 limit: {} -> {}", 
-            current_limits.account_info,
-            new_limits.account_info,
-            current_limits.program_accounts,
-            new_limits.program_accounts,
-            current_config.ignore_base58_limit,
-            new_config.ignore_base58_limit,
-        );
-
-    app_state.config.store(Arc::new(new_config));
+    app_state.config.store(Arc::new(new_config.clone()));
 
     async fn apply_limit(old_limit: usize, new_limit: usize, semaphore: &Semaphore) {
         if new_limit > old_limit {
@@ -1420,8 +1411,11 @@ pub async fn apply_config(app_state: &web::Data<State>, new_config: Config) {
     let available_programs = &app_state.program_accounts_request_limit.available_permits();
 
     info!(
-        "\nNew configuration applied:\n{}\n\n Available accounts: {}\n Available programs: {}\n",
-        diff, available_accounts, available_programs,
+        old_config = ?current_config,
+        new_config = ?new_config,
+        %available_accounts,
+        %available_programs,
+        "new configuration applied"
     );
 }
 
