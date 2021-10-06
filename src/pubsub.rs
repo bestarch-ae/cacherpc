@@ -75,6 +75,13 @@ type WsSink = SinkWrite<
 >;
 
 #[derive(Clone)]
+pub struct Config {
+    pub ttl: Duration,      // time to live
+    pub slot_distance: u32, // slot distance
+    pub websocket_url: String,
+}
+
+#[derive(Clone)]
 pub struct PubSubManager(Vec<(actix::Addr<AccountUpdateManager>, Arc<AtomicBool>)>);
 
 impl PubSubManager {
@@ -82,10 +89,8 @@ impl PubSubManager {
         connections: u32,
         accounts: AccountsDb,
         program_accounts: ProgramAccountsDb,
-        websocket_url: &str,
-        time_to_live: Duration,
         rpc_slot: Arc<AtomicU64>,
-        slot_dist: u32,
+        config: Config,
     ) -> Self {
         let mut addrs = Vec::new();
         for id in 0..connections {
@@ -95,10 +100,8 @@ impl PubSubManager {
                 accounts.clone(),
                 program_accounts.clone(),
                 Arc::clone(&active),
-                websocket_url,
-                time_to_live,
                 rpc_slot.clone(),
-                slot_dist,
+                config.clone(),
             );
             addrs.push((addr, active))
         }
@@ -158,8 +161,6 @@ impl Connection {
 type ProgramFilters = HashMap<(Pubkey, Commitment), FilterTree<SpawnHandle>>;
 
 pub struct AccountUpdateManager {
-    websocket_url: String,
-    time_to_live: Duration,
     actor_id: u32,
     actor_name: String,
     request_id: u64,
@@ -177,7 +178,7 @@ pub struct AccountUpdateManager {
     active: Arc<AtomicBool>,
     rpc_slot: Arc<AtomicU64>,
     buffer: BytesMut,
-    slot_dist: u32,
+    config: Arc<Config>,
 }
 
 impl std::fmt::Debug for AccountUpdateManager {
@@ -192,19 +193,15 @@ impl AccountUpdateManager {
         accounts: AccountsDb,
         program_accounts: ProgramAccountsDb,
         active: Arc<AtomicBool>,
-        websocket_url: &str,
-        time_to_live: Duration,
         rpc_slot: Arc<AtomicU64>,
-        slot_dist: u32,
+        config: Config,
     ) -> Addr<Self> {
         let arbiter = Arbiter::new();
-        let websocket_url = websocket_url.to_owned();
         let actor_name = format!("pubsub-{}", actor_id);
+        let config = Arc::new(config);
         Supervisor::start_in_arbiter(&arbiter, move |_ctx| AccountUpdateManager {
             actor_id,
-            time_to_live,
             actor_name,
-            websocket_url,
             connection: Connection::Disconnected,
             id_to_sub: HashMap::default(),
             sub_to_id: HashMap::default(),
@@ -220,7 +217,7 @@ impl AccountUpdateManager {
             rpc_slot,
             last_received_at: Instant::now(),
             buffer: BytesMut::new(),
-            slot_dist,
+            config: Arc::clone(&config),
         })
     }
 
@@ -290,7 +287,7 @@ impl AccountUpdateManager {
         let rpc_slot = self.rpc_slot.load(Ordering::Relaxed);
         let behind = rpc_slot
             .checked_sub(slot)
-            .map(|diff| diff > self.slot_dist as u64)
+            .map(|diff| diff > self.config.slot_distance as u64)
             .unwrap_or(false);
         if behind {
             error!("websocket slot behind rpc, stopping");
@@ -313,7 +310,7 @@ impl AccountUpdateManager {
         use actix::fut::{ActorFuture, WrapFuture};
         use backoff::backoff::Backoff;
 
-        let websocket_url = self.websocket_url.clone();
+        let websocket_url = self.config.websocket_url.clone();
         let actor_id = self.actor_id;
 
         if self.connection.is_connected() {
@@ -470,7 +467,7 @@ impl AccountUpdateManager {
         self.purge_queue
             .as_ref()
             .unwrap()
-            .insert((sub, commitment), self.time_to_live);
+            .insert((sub, commitment), self.config.ttl);
         metrics()
             .subscribe_requests
             .with_label_values(&[&self.actor_name])
@@ -529,7 +526,7 @@ impl AccountUpdateManager {
             .entry((key, commitment))
             .or_insert_with(FilterTree::new)
             .insert(filters.clone(), {
-                ctx.run_later(self.time_to_live, move |actor, ctx| {
+                ctx.run_later(self.config.ttl, move |actor, ctx| {
                     actor.purge_filter(ctx, sub, commitment, filters);
                 })
             });
@@ -541,7 +538,7 @@ impl AccountUpdateManager {
         self.purge_queue
             .as_ref()
             .unwrap()
-            .reset((sub, commitment), self.time_to_live);
+            .reset((sub, commitment), self.config.ttl);
         match handle {
             Some(handle) => {
                 ctx.cancel_future(handle);
@@ -1062,7 +1059,7 @@ impl Handler<AccountCommand> for AccountUpdateManager {
                     self.purge_queue
                         .as_ref()
                         .unwrap()
-                        .reset((sub, commitment), self.time_to_live);
+                        .reset((sub, commitment), self.config.ttl);
                     if let Some(filters) = filters {
                         self.reset_filter(ctx, sub, commitment, filters);
                     }

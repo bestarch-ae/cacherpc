@@ -1373,6 +1373,7 @@ pub struct Config {
 
 pub async fn apply_config(app_state: &web::Data<State>, new_config: Config) {
     let current_config = app_state.config.load();
+
     if **current_config == new_config {
         return;
     }
@@ -1380,7 +1381,7 @@ pub async fn apply_config(app_state: &web::Data<State>, new_config: Config) {
     let current_limits = current_config.request_limits;
     let new_limits = new_config.request_limits;
 
-    app_state.config.store(Arc::new(new_config));
+    app_state.config.store(Arc::new(new_config.clone()));
 
     async fn apply_limit(old_limit: usize, new_limit: usize, semaphore: &Semaphore) {
         if new_limit > old_limit {
@@ -1408,10 +1409,14 @@ pub async fn apply_config(app_state: &web::Data<State>, new_config: Config) {
 
     let available_accounts = &app_state.account_info_request_limit.available_permits();
     let available_programs = &app_state.program_accounts_request_limit.available_permits();
-    info!(old = ?current_limits,
-        new = ?new_limits,
+
+    info!(
+        old_config = ?current_config,
+        new_config = ?new_config,
         %available_accounts,
-        %available_programs, "rpc limits updated");
+        %available_programs,
+        "new configuration applied"
+    );
 }
 
 pub async fn metrics_handler(
