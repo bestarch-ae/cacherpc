@@ -32,6 +32,7 @@ The server supports a number of configuration options, which are the following:
 - `-d, --slot-distance` — sets the maximum slot distance for health check purposes
 - `--ignore-base58-limit` — flag whether to ignore base58 overflowing size limit
 - `--log-format` — the format, in which to output the logs: plain | json
+- `--rules` — path to firewall rules written in lua
 
 ## Features
 
