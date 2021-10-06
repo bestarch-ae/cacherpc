@@ -27,6 +27,12 @@ The server supports a number of configuration options, which are the following:
 - `-a, --account-request-limit` — sets a maximum number of concurrent [getAccountInfo](https://docs.solana.com/developing/clients/jsonrpc-api#getaccountinfo) requests the cache is allowed to send to the cluster/validator.
 - `-p, --program-request-limit` — sets a maximum number of concurrent [getProgramAccounts](https://docs.solana.com/developing/clients/jsonrpc-api#getaccountinfo) requests the cache is allowed to send to the cluster/validator.
 - `-b, --body-cache-size` — sets the maximum amount of cached responses.
+- `-c, --websocket-connections` — sets the number of websocket connections to validator.
+- `-t, --time-to-live` — sets the duration before the cache entries expire, e.g. 10m.
+- `-d, --slot-distance` — sets the maximum distance between slots.
+- `--config` — path to configuration file in Toml format
+- `--ignore-base58-limit` — whether to ignore base58 overflowing size limit
+
 
 ## Features
 
