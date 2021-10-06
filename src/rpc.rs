@@ -15,6 +15,7 @@ use bytes::Bytes;
 use dashmap::mapref::one::Ref;
 use futures_util::stream::Stream;
 use lru::LruCache;
+use mlua::Lua;
 use prometheus::IntCounter;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::value::{to_raw_value, RawValue};
@@ -213,6 +214,7 @@ pub struct State {
     pub config_watch: RefCell<watch::Receiver<Config>>,
     pub lru: RefCell<LruCache<u64, LruEntry>>,
     pub worker_id: String,
+    pub lua: Option<Lua>,
 }
 
 impl State {
@@ -281,6 +283,17 @@ impl State {
         self: Arc<Self>,
         raw_request: Request<'_, RawValue>,
     ) -> CacheResult<'_> {
+        if let Some(lua) = &self.lua {
+            let res = lua.scope(|scope| {
+                lua.globals()
+                    .set("request", scope.create_nonstatic_userdata(&raw_request)?)?;
+                lua.load("require 'waf'.request(request)").eval::<bool>()
+            });
+            if !res.unwrap_or(true) {
+                return Err(Error::InvalidRequest(Some(raw_request.id.clone()), None));
+            }
+        }
+
         let request = T::parse(&raw_request)?;
         let is_cacheable = match request
             .is_cacheable(&self)
@@ -679,6 +692,14 @@ where
     pub method: &'a str,
     #[serde(borrow)]
     pub params: Option<&'a T>,
+}
+
+impl<'a, 'b> mlua::UserData for &'b Request<'a, RawValue> {
+    fn add_fields<'lua, F: mlua::UserDataFields<'lua, Self>>(fields: &mut F) {
+        fields.add_field_method_get("jsonrpc", |_, this| Ok(this.jsonrpc));
+        fields.add_field_method_get("method", |_, this| Ok(this.method));
+        fields.add_field_method_get("params", |_, this| Ok(this.params.map(|v| v.get())));
+    }
 }
 
 #[derive(Deserialize, Debug)]

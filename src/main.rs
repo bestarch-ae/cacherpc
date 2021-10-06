@@ -17,10 +17,14 @@ use tokio::sync::{watch, Notify, Semaphore};
 use tracing::info;
 use tracing_subscriber::fmt;
 
+use mlua::Lua;
+
 pub use cache_rpc::{metrics, pubsub, rpc, types};
 
 use pubsub::PubSubManager;
 use types::{AccountsDb, ProgramAccountsDb};
+
+const LUA_JSON: &'static str = include_str!("json.lua");
 
 #[derive(Debug, structopt::StructOpt)]
 #[structopt(about = "Solana RPC cache server")]
@@ -105,6 +109,8 @@ struct Options {
         default_value = "150"
     )]
     slot_dist: u32,
+    #[structopt(long = "rules", help = "waf rules")]
+    rules: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -245,6 +251,12 @@ async fn run(options: Options) -> Result<()> {
         .transpose()?
         .unwrap_or_else(|| Config::from_options(&options));
 
+    let rules = options
+        .rules
+        .as_ref()
+        .map(std::fs::read_to_string)
+        .transpose()?;
+
     let rpc_url = options.rpc_url;
     let notify = Arc::new(Notify::new());
     let account_info_request_limit =
@@ -294,6 +306,16 @@ async fn run(options: Options) -> Result<()> {
                 let id = worker_id_counter.fetch_add(1, Ordering::SeqCst);
                 format!("rpc-{}", id)
             },
+            lua: rules.as_ref().map(|rules| {
+                let lua = Lua::new();
+                let func = lua.load(LUA_JSON).into_function().unwrap();
+                let _: mlua::Value = lua.load_from_function("json", func).unwrap();
+
+                let rules = lua.load(&rules).into_function().unwrap();
+                let _: mlua::Value = lua.load_from_function("waf", rules).unwrap();
+                info!("loaded rules");
+                lua
+            }),
         };
         let cors = Cors::default()
             .allow_any_origin()
