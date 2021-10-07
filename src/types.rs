@@ -134,11 +134,11 @@ impl ProgramAccountsDb {
                 let state = self.map.get_mut(&(*key, Some(filter.clone())));
                 match state {
                     // Account no longer matches filter
-                    Some(mut state) if !old_groups.contains(filter) => {
+                    Some(mut state) if old_groups.contains(filter) => {
                         state.remove(commitment, &data);
                     }
                     // Account is new to the filter
-                    Some(mut state) /*  old_groups.contains(&filter) */ => {
+                    Some(mut state) /* !old_groups.contains(&filter) */ => {
                         state.add(commitment, Arc::clone(&data));
                     }
                     None => (), // State not found
