@@ -28,7 +28,7 @@ tracing-appender = { version = "0.1" }
 tracing-futures = "0.2"
 structopt = "0.3"
 base64 = "0.13"
-zstd = "0.9"
+zstd = "0.5"
 smallvec = { version = "1.6", features = ["serde", "union"] }
 thiserror = "1.0"
 anyhow = "1.0"
@@ -43,6 +43,10 @@ humantime = "2.1"
 toml = "0.5"
 arc-swap = "1.4"
 
+solana-account-decoder = { version = "1.8", optional = true }
+solana-sdk = { version =  "1.8", optional = true }
+spl-token-v2-0 = { package = "spl-token", version = "=3.2.0", features = ["no-entrypoint"], optional = true}
+
 [dev-dependencies]
 proptest = "1"
 criterion = "0.3"
@@ -55,3 +59,7 @@ harness = false
 [patch.crates-io]
 actix-http = { git = "https://github.com/polachok/actix-web", rev = "19cd7fdbd5b79e9d78c8cb562741d7513d980b18" }
 actix = { git = "https://github.com/polachok/actix", rev = "58e5309310cccd38ce9b75141547a67610454759" }
+
+[features]
+default = ["jsonparsed"]
+jsonparsed = ["solana-account-decoder", "solana-sdk", "spl-token-v2-0"]
