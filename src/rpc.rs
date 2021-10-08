@@ -1298,16 +1298,21 @@ pub async fn rpc_handler(
     let client = app_state.client.clone();
     let url = app_state.rpc_url.clone();
 
+    let mut resp = client
+        .post(&url)
+        .content_type("application/json")
+        .send_body(body.clone())
+        .await;
+
+    if let Err(_) = resp {
+        return Ok(Error::Timeout(req.id).error_response());
+    }
+
     let stream = stream_generator::generate_stream(move |mut stream| async move {
         let mut backoff = backoff_settings();
         let total = metrics().passthrough_total_time.start_timer();
         loop {
             let request_time = metrics().passthrough_request_time.start_timer();
-            let resp = client
-                .post(&url)
-                .content_type("application/json")
-                .send_body(body.clone())
-                .await;
             request_time.observe_duration();
             match resp {
                 Ok(mut resp) => {
@@ -1325,13 +1330,19 @@ pub async fn rpc_handler(
                         Some(duration) => tokio::time::delay_for(duration).await,
                         None => {
                             warn!("request error: {:?}", err);
-                            // TODO: return error
+                            // TODO implement proper error handling
                             break;
                         }
                     }
                 }
             }
+            resp = client
+                .post(&url)
+                .content_type("application/json")
+                .send_body(body.clone())
+                .await;
         }
+
         total.observe_duration();
     });
 
