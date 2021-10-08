@@ -7,6 +7,7 @@ use std::fmt::{self, Debug};
 use std::sync::Arc;
 use std::time::Duration;
 
+use actix_http::error::PayloadError;
 use actix_web::{web, HttpResponse, ResponseError};
 use arc_swap::ArcSwap;
 use awc::Client;
@@ -244,7 +245,7 @@ impl State {
         T: Serialize + Debug + ?Sized,
     {
         let client = &self.client;
-        let mut backoff = backoff_settings();
+        let mut backoff = backoff_settings(60);
         loop {
             let wait_time = metrics()
                 .wait_time
@@ -1297,9 +1298,10 @@ pub async fn rpc_handler(
 
     let client = app_state.client.clone();
     let url = app_state.rpc_url.clone();
+    let mut error = Error::Timeout(req.id.clone()).error_response();
 
     let stream = stream_generator::generate_stream(move |mut stream| async move {
-        let mut backoff = backoff_settings();
+        let mut backoff = backoff_settings(30);
         let total = metrics().passthrough_total_time.start_timer();
         loop {
             let request_time = metrics().passthrough_request_time.start_timer();
@@ -1324,8 +1326,13 @@ pub async fn rpc_handler(
                     match backoff.next_backoff() {
                         Some(duration) => tokio::time::delay_for(duration).await,
                         None => {
+                            let mut error_stream = error.take_body();
                             warn!("request error: {:?}", err);
-                            // TODO: return error
+                            while let Some(chunk) = error_stream.next().await {
+                                stream
+                                    .send(chunk.map_err(|_| PayloadError::Incomplete(None))) // should never error
+                                    .await;
+                            }
                             break;
                         }
                     }
@@ -1340,11 +1347,11 @@ pub async fn rpc_handler(
         .streaming(Box::pin(stream)))
 }
 
-fn backoff_settings() -> backoff::ExponentialBackoff {
+fn backoff_settings(max: u64) -> backoff::ExponentialBackoff {
     backoff::ExponentialBackoff {
         initial_interval: Duration::from_millis(100),
         max_interval: Duration::from_secs(5),
-        max_elapsed_time: Some(Duration::from_secs(60)),
+        max_elapsed_time: Some(Duration::from_secs(max)),
         ..Default::default()
     }
 }
