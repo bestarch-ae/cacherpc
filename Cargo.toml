@@ -28,7 +28,7 @@ tracing-appender = { version = "0.1" }
 tracing-futures = "0.2"
 structopt = "0.3"
 base64 = "0.13"
-zstd = "0.9"
+zstd = "0.5"
 smallvec = { version = "1.6", features = ["serde", "union"] }
 thiserror = "1.0"
 anyhow = "1.0"
@@ -42,6 +42,9 @@ either = "1.6"
 humantime = "2.1"
 toml = "0.5"
 arc-swap = "1.4"
+
+solana-account-decoder = "1.8"
+solana-sdk = "1.8"
 
 [dev-dependencies]
 proptest = "1"

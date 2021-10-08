@@ -440,6 +440,12 @@ pub struct AccountInfo {
 #[derive(Hash, Eq, PartialEq, Copy, Clone, Debug, Ord, PartialOrd)]
 pub struct Pubkey([u8; 32]);
 
+impl From<Pubkey> for [u8; 32] {
+    fn from(key: Pubkey) -> [u8; 32] {
+        key.0
+    }
+}
+
 impl Pubkey {
     #[cfg(test)]
     fn zero() -> Self {

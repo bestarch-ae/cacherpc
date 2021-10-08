@@ -51,6 +51,7 @@ impl AccountInfo {
         encoding: Encoding,
         slice: Option<Slice>,
         enforce_base58_limit: bool,
+        pubkey: Pubkey,
     ) -> Result<EncodedAccountInfo<'_>, Base58Error> {
         // Encoded binary (base 58) data should be less than 128 bytes
         if enforce_base58_limit && self.data.len() > 128 && encoding.is_base58() {
@@ -60,6 +61,7 @@ impl AccountInfo {
             account_info: self,
             slice,
             encoding,
+            pubkey,
         })
     }
 }
@@ -75,6 +77,7 @@ struct EncodedAccountInfo<'a> {
     encoding: Encoding,
     slice: Option<Slice>,
     account_info: &'a AccountInfo,
+    pubkey: Pubkey,
 }
 
 impl<'a> EncodedAccountInfo<'a> {
@@ -97,6 +100,8 @@ impl<'a> Serialize for EncodedAccountInfo<'a> {
             encoding: self.encoding,
             data: &self.account_info.data,
             slice: self.slice,
+            owner: self.account_info.owner,
+            pubkey: self.pubkey,
         };
         account_info.serialize_field("data", &encoded_data)?;
         account_info.serialize_field("lamports", &self.account_info.lamports)?;
@@ -126,6 +131,8 @@ struct EncodedAccountData<'a> {
     encoding: Encoding,
     data: &'a AccountData,
     slice: Option<Slice>,
+    pubkey: Pubkey,
+    owner: Pubkey,
 }
 
 impl<'a> Serialize for EncodedAccountData<'a> {
@@ -135,6 +142,31 @@ impl<'a> Serialize for EncodedAccountData<'a> {
     {
         use serde::ser::{Error, SerializeSeq};
 
+        let mut encoding = self.encoding;
+
+        if let Encoding::JsonParsed = self.encoding {
+            use solana_account_decoder::parse_account_data::parse_account_data;
+            use solana_sdk::pubkey::Pubkey as SolanaPubkey;
+
+            let pubkey = SolanaPubkey::new_from_array(self.pubkey.into());
+            let program_id = SolanaPubkey::new_from_array(self.owner.into());
+
+            match parse_account_data(
+                &pubkey,
+                &program_id,
+                &self.data.data[..],
+                None, /* TODO: figure out wtf this is */
+            ) {
+                Ok(parsed_acc) => {
+                    return parsed_acc.serialize(serializer);
+                }
+                Err(_err) => {
+                    encoding = Encoding::Base64;
+                }
+            }
+        }
+
+        // TODO: error out if json AND slice was requested
         let data = if let Some(slice) = &self.slice {
             let end = slice
                 .offset
@@ -150,7 +182,7 @@ impl<'a> Serialize for EncodedAccountData<'a> {
         }
 
         let mut seq = serializer.serialize_seq(Some(2))?;
-        match self.encoding {
+        match encoding {
             Encoding::Base58 => {
                 seq.serialize_element(&bs58::encode(&data).into_string())?;
             }
@@ -164,11 +196,11 @@ impl<'a> Serialize for EncodedAccountData<'a> {
                 ))?;
             }
             Encoding::JsonParsed => {
-                return Err(Error::custom("jsonParsed is not supported yet")); // TODO
+                todo!() // checked above
             }
             _ => panic!("must not happen, handled above"),
         }
-        seq.serialize_element(&self.encoding)?;
+        seq.serialize_element(&encoding)?;
         seq.end()
     }
 }
@@ -478,7 +510,14 @@ impl Cacheable for GetAccountInfo {
             data.get(self.commitment())
                 .filter(|(_, slot)| *slot != 0)
                 .map(|data| {
-                    account_response(id.clone(), self.config_hash, data, state, &self.config)
+                    account_response(
+                        id.clone(),
+                        self.config_hash,
+                        data,
+                        state,
+                        &self.config,
+                        self.pubkey,
+                    )
                 })
         })
     }
@@ -673,8 +712,8 @@ impl UncacheableReason {
     /// Returns true if the request can still be fetched from cache
     fn can_use_cache(&self) -> bool {
         match self {
-            Self::DataSlice => true,
-            Self::Encoding | Self::Inactive | Self::Filters => false,
+            Self::Encoding | Self::DataSlice => true,
+            Self::Inactive | Self::Filters => false,
         }
     }
 }
@@ -967,6 +1006,7 @@ fn account_response<'a, 'b>(
     acc: (Option<&'b AccountInfo>, u64),
     app_state: &State,
     config: &AccountInfoConfig,
+    pubkey: Pubkey,
 ) -> Result<HttpResponse, Error<'a>> {
     let request_and_slot_hash = hash((request_hash, acc.1));
     if let Some(result) = app_state.lru.borrow_mut().get(&request_and_slot_hash) {
@@ -998,7 +1038,7 @@ fn account_response<'a, 'b>(
             .as_ref()
             .map(|acc| {
                 Ok::<_, Base58Error>(
-                    acc.encode(config.encoding, config.data_slice, true)?
+                    acc.encode(config.encoding, config.data_slice, true, pubkey)?
                         .with_context(&ctx),
                 )
             })
@@ -1119,6 +1159,7 @@ fn program_accounts_response<'a>(
         slice: Option<Slice>,
         commitment: Commitment,
         enforce_base58_limit: bool,
+        pubkey: Pubkey,
     }
 
     impl<'a, K> Serialize for Encode<'a, K>
@@ -1131,7 +1172,12 @@ fn program_accounts_response<'a>(
         {
             if let Some((Some(value), _)) = self.inner.value().get(self.commitment) {
                 let encoded = value
-                    .encode(self.encoding, self.slice, self.enforce_base58_limit)
+                    .encode(
+                        self.encoding,
+                        self.slice,
+                        self.enforce_base58_limit,
+                        self.pubkey,
+                    )
                     .map_err(serde::ser::Error::custom)?;
                 encoded.serialize(serializer)
             } else {
@@ -1190,6 +1236,7 @@ fn program_accounts_response<'a>(
                     slice: config.data_slice,
                     commitment,
                     enforce_base58_limit,
+                    pubkey: **key,
                 },
                 pubkey: **key,
             })
