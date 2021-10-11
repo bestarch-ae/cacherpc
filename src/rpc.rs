@@ -32,6 +32,9 @@ use crate::types::{
     Encoding, ProgramAccountsDb, Pubkey, Slot, SolanaContext,
 };
 
+#[cfg(feature = "jsonparsed")]
+use solana_sdk::pubkey::Pubkey as SolanaPubkey;
+
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Serialize)]
@@ -100,7 +103,9 @@ impl<'a> Serialize for EncodedAccountInfo<'a> {
             encoding: self.encoding,
             data: &self.account_info.data,
             slice: self.slice,
+            #[cfg(feature = "jsonparsed")]
             owner: self.account_info.owner,
+            #[cfg(feature = "jsonparsed")]
             pubkey: self.pubkey,
         };
         account_info.serialize_field("data", &encoded_data)?;
@@ -131,7 +136,9 @@ struct EncodedAccountData<'a> {
     encoding: Encoding,
     data: &'a AccountData,
     slice: Option<Slice>,
+    #[cfg(feature = "jsonparsed")]
     pubkey: Pubkey,
+    #[cfg(feature = "jsonparsed")]
     owner: Pubkey,
 }
 
@@ -142,31 +149,40 @@ impl<'a> Serialize for EncodedAccountData<'a> {
     {
         use serde::ser::{Error, SerializeSeq};
 
+        #[cfg_attr(not(feature = "jsonparsed"), allow(unused_mut))]
         let mut encoding = self.encoding;
 
+        #[cfg(feature = "jsonparsed")]
         if let Encoding::JsonParsed = self.encoding {
-            use solana_account_decoder::parse_account_data::parse_account_data;
-            use solana_sdk::pubkey::Pubkey as SolanaPubkey;
+            use solana_account_decoder::{
+                parse_account_data::{parse_account_data, AccountAdditionalData},
+                parse_token::get_token_account_mint,
+            };
 
             let pubkey = SolanaPubkey::new_from_array(self.pubkey.into());
             let program_id = SolanaPubkey::new_from_array(self.owner.into());
 
-            match parse_account_data(
-                &pubkey,
-                &program_id,
-                &self.data.data[..],
-                None, /* TODO: figure out wtf this is */
-            ) {
+            let additional_data = get_token_account_mint(&self.data.data)
+                .map(|key| get_mint_decimals(&key).ok())
+                .map(|decimals| AccountAdditionalData {
+                    spl_token_decimals: decimals,
+                });
+
+            match parse_account_data(&pubkey, &program_id, &self.data.data, additional_data) {
                 Ok(parsed_acc) => {
                     return parsed_acc.serialize(serializer);
                 }
                 Err(_err) => {
+                    if self.slice.is_some() {
+                        return Err(Error::custom(
+                            "Sliced account data can only be encoded using binary (base 58) or base64 encoding.",
+                        ));
+                    }
                     encoding = Encoding::Base64;
                 }
             }
         }
 
-        // TODO: error out if json AND slice was requested
         let data = if let Some(slice) = &self.slice {
             let end = slice
                 .offset
@@ -182,6 +198,7 @@ impl<'a> Serialize for EncodedAccountData<'a> {
         }
 
         let mut seq = serializer.serialize_seq(Some(2))?;
+
         match encoding {
             Encoding::Base58 => {
                 seq.serialize_element(&bs58::encode(&data).into_string())?;
@@ -196,9 +213,12 @@ impl<'a> Serialize for EncodedAccountData<'a> {
                 ))?;
             }
             Encoding::JsonParsed => {
-                todo!() // checked above
+                #[cfg_attr(feature = "jsonparsed", allow(unused))]
+                return Err(Error::custom("jsonParsed encoding is not supported"));
             }
-            _ => panic!("must not happen, handled above"),
+            Encoding::Default => {
+                panic!("default encoding should've been handled before");
+            }
         }
         seq.serialize_element(&encoding)?;
         seq.end()
@@ -1507,4 +1527,15 @@ pub async fn metrics_handler(
     let families = prometheus::gather();
     let _ = encoder.encode(&families, &mut buffer);
     Ok(HttpResponse::Ok().content_type("text/plain").body(buffer))
+}
+
+#[cfg(feature = "jsonparsed")]
+pub fn get_mint_decimals(mint: &SolanaPubkey) -> Result<u8, &'static str> {
+    use solana_account_decoder::parse_token::spl_token_v2_0_native_mint;
+
+    if mint == &spl_token_v2_0_native_mint() {
+        Ok(spl_token_v2_0::native_mint::DECIMALS)
+    } else {
+        Err("Invalid param: mint is not native")
+    }
 }
