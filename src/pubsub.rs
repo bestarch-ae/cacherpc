@@ -325,6 +325,8 @@ impl AccountUpdateManager {
             let mut backoff = backoff::ExponentialBackoff {
                 current_interval: Duration::from_millis(300),
                 initial_interval: Duration::from_millis(300),
+                max_interval: Duration::from_secs(10),
+                max_elapsed_time: None, // will never terminate
                 ..Default::default()
             };
 
