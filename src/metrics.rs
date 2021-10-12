@@ -76,6 +76,7 @@ pub struct PubSubMetrics {
     pub pubsub_slot: IntGaugeVec,
     pub pubsub_program_slot: IntGaugeVec,
     pub pubsub_account_slot: IntGaugeVec,
+    pub websocket_reconnects: IntCounterVec,
 }
 
 pub fn pubsub_metrics() -> &'static PubSubMetrics {
@@ -239,6 +240,12 @@ pub fn pubsub_metrics() -> &'static PubSubMetrics {
             &["connection_id"]
         )
         .unwrap(),
+        websocket_reconnects: register_int_counter_vec!(
+            "websocket_reconnects",
+            "attempts to reconnect to websocket",
+            &["connection_id"]
+        )
+        .unwrap(),
     });
     &METRICS
 }
@@ -268,6 +275,7 @@ pub struct RpcMetrics {
     pub passthrough_forward_response_time: Histogram,
     pub passthrough_errors: IntCounter,
     pub rpc_slot: IntGauge,
+    pub request_retries: IntCounter,
 }
 
 impl RpcMetrics {
@@ -466,6 +474,11 @@ pub fn rpc_metrics() -> &'static RpcMetrics {
         )
         .unwrap(),
         rpc_slot: register_int_gauge!("rpc_slot", "slot received by polling rpc").unwrap(),
+        request_retries: register_int_counter!(
+            "request_retries",
+            "Number of attempts to retry request after failure"
+        )
+        .unwrap(),
     });
 
     &METRICS

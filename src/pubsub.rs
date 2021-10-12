@@ -321,6 +321,8 @@ impl AccountUpdateManager {
 
         self.update_status();
 
+        let actor_name = self.actor_name.clone();
+
         let fut = async move {
             let mut backoff = backoff::ExponentialBackoff {
                 current_interval: Duration::from_millis(300),
@@ -349,6 +351,10 @@ impl AccountUpdateManager {
                             .unwrap_or_else(|| Duration::from_secs(1));
                         error!(message = "failed to connect, waiting", url = %websocket_url,
                                 error = ?err, actor_id = %actor_id, delay = ?delay);
+                        metrics()
+                            .websocket_reconnects
+                            .with_label_values(&[&actor_name])
+                            .inc();
                         tokio::time::delay_for(delay).await;
                     }
                 }

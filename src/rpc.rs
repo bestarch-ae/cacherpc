@@ -268,7 +268,10 @@ impl State {
                     break Ok(resp);
                 }
                 Err(err) => match backoff.next_backoff() {
-                    Some(duration) => tokio::time::delay_for(duration).await,
+                    Some(duration) => {
+                        metrics().request_retries.inc();
+                        tokio::time::delay_for(duration).await;
+                    }
                     None => {
                         warn!("request: {:?} error: {:?}", req, err);
                         break Err(awc::error::SendRequestError::Timeout);
@@ -1324,7 +1327,10 @@ pub async fn rpc_handler(
                 Err(err) => {
                     metrics().passthrough_errors.inc();
                     match backoff.next_backoff() {
-                        Some(duration) => tokio::time::delay_for(duration).await,
+                        Some(duration) => {
+                            metrics().request_retries.inc();
+                            tokio::time::delay_for(duration).await;
+                        }
                         None => {
                             let mut error_stream = error.take_body();
                             warn!("request error: {:?}", err);
