@@ -40,19 +40,17 @@ prop_compose! {
     }
 }
 
-fn offsets(data_len: usize) -> impl Strategy<Value = usize> {
+fn offset_and_len(data_len: usize) -> impl Strategy<Value = (usize, usize)> {
     if data_len < 2 {
-        // We have to stick to 0 for short sizes, so tests won't fail with
-        // 'Uniform::new called with `low >= high`'
-        Just(0).boxed()
-    } else {
-        (0..(data_len - 1)).boxed()
+        return Just((0, 2)).boxed();
     }
+    ((0..(data_len - 1)), Just(data_len)).boxed()
 }
 
 prop_compose! {
-    fn valid_ranges(data_len: usize)(offset in offsets(data_len))
-                   (offset in Just(offset), slice_len in 1..(data_len - offset).min(128))
+    // data_len should always be greater than 1
+    fn valid_ranges(data_len: usize)((offset, len) in offset_and_len(data_len))
+                   (offset in Just(offset), slice_len in 1..(len - offset).min(128))
                    -> (usize, usize) {
         (offset, slice_len)
     }
