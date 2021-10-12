@@ -74,7 +74,6 @@ type WsSink = SinkWrite<
     >,
 >;
 
-#[derive(Clone)]
 pub struct Config {
     pub ttl: Duration,      // time to live
     pub slot_distance: u32, // slot distance
@@ -93,6 +92,7 @@ impl PubSubManager {
         config: Config,
     ) -> Self {
         let mut addrs = Vec::new();
+        let config = Arc::new(config);
         for id in 0..connections {
             let active = Arc::new(AtomicBool::new(false));
             let addr = AccountUpdateManager::init(
@@ -101,7 +101,7 @@ impl PubSubManager {
                 program_accounts.clone(),
                 Arc::clone(&active),
                 rpc_slot.clone(),
-                config.clone(),
+                Arc::clone(&config),
             );
             addrs.push((addr, active))
         }
@@ -194,11 +194,10 @@ impl AccountUpdateManager {
         program_accounts: ProgramAccountsDb,
         active: Arc<AtomicBool>,
         rpc_slot: Arc<AtomicU64>,
-        config: Config,
+        config: Arc<Config>,
     ) -> Addr<Self> {
         let arbiter = Arbiter::new();
         let actor_name = format!("pubsub-{}", actor_id);
-        let config = Arc::new(config);
         Supervisor::start_in_arbiter(&arbiter, move |_ctx| AccountUpdateManager {
             actor_id,
             actor_name,
@@ -217,7 +216,7 @@ impl AccountUpdateManager {
             rpc_slot,
             last_received_at: Instant::now(),
             buffer: BytesMut::new(),
-            config: Arc::clone(&config),
+            config,
         })
     }
 
