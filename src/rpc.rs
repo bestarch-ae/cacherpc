@@ -1245,8 +1245,8 @@ pub async fn rpc_handler(
 
     let req: Request<'_, _> = match serde_json::from_slice(&body) {
         Ok(req) => req,
-        Err(err) => {
-            return Ok(Error::from(err).error_response());
+        Err(_) => {
+            return Ok(Error::InvalidRequest(None, Some("Invalid request")).error_response());
         }
     };
 
