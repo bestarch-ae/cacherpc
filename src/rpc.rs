@@ -7,6 +7,7 @@ use std::fmt::{self, Debug};
 use std::sync::Arc;
 use std::time::Duration;
 
+use actix_http::error::PayloadError;
 use actix_web::{web, HttpResponse, ResponseError};
 use arc_swap::ArcSwap;
 use awc::Client;
@@ -33,6 +34,9 @@ use crate::types::{
     Encoding, ProgramAccountsDb, Pubkey, Slot, SolanaContext,
 };
 
+#[cfg(feature = "jsonparsed")]
+use solana_sdk::pubkey::Pubkey as SolanaPubkey;
+
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Serialize)]
@@ -52,6 +56,7 @@ impl AccountInfo {
         encoding: Encoding,
         slice: Option<Slice>,
         enforce_base58_limit: bool,
+        pubkey: Pubkey,
     ) -> Result<EncodedAccountInfo<'_>, Base58Error> {
         // Encoded binary (base 58) data should be less than 128 bytes
         if enforce_base58_limit && self.data.len() > 128 && encoding.is_base58() {
@@ -61,6 +66,7 @@ impl AccountInfo {
             account_info: self,
             slice,
             encoding,
+            pubkey,
         })
     }
 }
@@ -76,6 +82,7 @@ struct EncodedAccountInfo<'a> {
     encoding: Encoding,
     slice: Option<Slice>,
     account_info: &'a AccountInfo,
+    pubkey: Pubkey,
 }
 
 impl<'a> EncodedAccountInfo<'a> {
@@ -98,6 +105,10 @@ impl<'a> Serialize for EncodedAccountInfo<'a> {
             encoding: self.encoding,
             data: &self.account_info.data,
             slice: self.slice,
+            #[cfg(feature = "jsonparsed")]
+            owner: self.account_info.owner,
+            #[cfg(feature = "jsonparsed")]
+            pubkey: self.pubkey,
         };
         account_info.serialize_field("data", &encoded_data)?;
         account_info.serialize_field("lamports", &self.account_info.lamports)?;
@@ -127,6 +138,10 @@ struct EncodedAccountData<'a> {
     encoding: Encoding,
     data: &'a AccountData,
     slice: Option<Slice>,
+    #[cfg(feature = "jsonparsed")]
+    pubkey: Pubkey,
+    #[cfg(feature = "jsonparsed")]
+    owner: Pubkey,
 }
 
 impl<'a> Serialize for EncodedAccountData<'a> {
@@ -135,6 +150,35 @@ impl<'a> Serialize for EncodedAccountData<'a> {
         S: serde::Serializer,
     {
         use serde::ser::{Error, SerializeSeq};
+
+        let encoding = self.encoding;
+
+        #[cfg(feature = "jsonparsed")]
+        if let Encoding::JsonParsed = self.encoding {
+            use solana_account_decoder::{
+                parse_account_data::{parse_account_data, AccountAdditionalData},
+                parse_token::get_token_account_mint,
+            };
+
+            let pubkey = SolanaPubkey::new_from_array(self.pubkey.into());
+            let program_id = SolanaPubkey::new_from_array(self.owner.into());
+
+            let additional_data = get_token_account_mint(&self.data.data)
+                .map(|key| get_mint_decimals(&key).ok())
+                .map(|decimals| AccountAdditionalData {
+                    spl_token_decimals: decimals,
+                });
+
+            match parse_account_data(&pubkey, &program_id, &self.data.data, additional_data) {
+                Ok(parsed_acc) => {
+                    return parsed_acc.serialize(serializer);
+                }
+                Err(_err) => {
+                    // if we failed to parse the data, try to pass the request on to validator
+                    return Err(Error::custom("Couldn't parse cached data"));
+                }
+            }
+        }
 
         let data = if let Some(slice) = &self.slice {
             let end = slice
@@ -151,7 +195,8 @@ impl<'a> Serialize for EncodedAccountData<'a> {
         }
 
         let mut seq = serializer.serialize_seq(Some(2))?;
-        match self.encoding {
+
+        match encoding {
             Encoding::Base58 => {
                 seq.serialize_element(&bs58::encode(&data).into_string())?;
             }
@@ -165,11 +210,14 @@ impl<'a> Serialize for EncodedAccountData<'a> {
                 ))?;
             }
             Encoding::JsonParsed => {
-                return Err(Error::custom("jsonParsed is not supported yet")); // TODO
+                #[cfg_attr(feature = "jsonparsed", allow(unused))]
+                return Err(Error::custom("jsonParsed encoding is not supported"));
             }
-            _ => panic!("must not happen, handled above"),
+            Encoding::Default => {
+                panic!("default encoding should've been handled before");
+            }
         }
-        seq.serialize_element(&self.encoding)?;
+        seq.serialize_element(&encoding)?;
         seq.end()
     }
 }
@@ -246,7 +294,7 @@ impl State {
         T: Serialize + Debug + ?Sized,
     {
         let client = &self.client;
-        let mut backoff = backoff_settings();
+        let mut backoff = backoff_settings(60);
         loop {
             let wait_time = metrics()
                 .wait_time
@@ -269,7 +317,10 @@ impl State {
                     break Ok(resp);
                 }
                 Err(err) => match backoff.next_backoff() {
-                    Some(duration) => tokio::time::delay_for(duration).await,
+                    Some(duration) => {
+                        metrics().request_retries.inc();
+                        tokio::time::delay_for(duration).await;
+                    }
                     None => {
                         warn!("request: {:?} error: {:?}", req, err);
                         break Err(awc::error::SendRequestError::Timeout);
@@ -307,7 +358,7 @@ impl State {
         }
 
         let request = T::parse(&raw_request)?;
-        let is_cacheable = match request
+        let (is_cacheable, can_use_cache) = match request
             .is_cacheable(&self)
             .map(|_| request.get_from_cache(&raw_request.id, &self))
         {
@@ -316,13 +367,24 @@ impl State {
                 self.reset(request.sub_descriptor());
                 return data;
             }
-            Ok(None) => true,
+            Ok(None) => (true, true),
             Err(reason) => {
+                let data = reason
+                    .can_use_cache()
+                    .then(|| request.get_from_cache(&raw_request.id, &self))
+                    .flatten();
+
+                if let Some(data) = data {
+                    T::cache_hit_counter().inc();
+                    self.reset(request.sub_descriptor());
+                    return data;
+                }
+
                 metrics()
                     .response_uncacheable
                     .with_label_values(&[T::REQUEST_TYPE, reason.as_str()])
                     .inc();
-                false
+                (false, reason.can_use_cache())
             }
         };
 
@@ -339,7 +401,7 @@ impl State {
                         Error::Timeout(raw_request.id.clone())
                     })?;
                 }
-                _ = notified, if is_cacheable => {
+                _ = notified, if can_use_cache => {
                     if let Some(data) = request.get_from_cache(&raw_request.id, &self) {
                         T::cache_hit_counter().inc();
                         T::cache_filled_counter().inc();
@@ -488,12 +550,25 @@ impl Cacheable for GetAccountInfo {
 
     fn get_from_cache<'a>(&self, id: &Id<'a>, state: &State) -> Option<CacheResult<'a>> {
         state.accounts.get(&self.pubkey).and_then(|data| {
-            let data = data.value();
-            data.get(self.commitment())
-                .filter(|(_, slot)| *slot != 0)
-                .map(|data| {
-                    account_response(id.clone(), self.config_hash, data, state, &self.config)
-                })
+            let account = data.value().get(self.commitment());
+            match account.filter(|(_, slot)| *slot != 0) {
+                Some(data) => {
+                    let resp = account_response(
+                        id.clone(),
+                        self.config_hash,
+                        data,
+                        state,
+                        &self.config,
+                        self.pubkey,
+                    );
+                    match resp {
+                        Ok(res) => Some(Ok(res)),
+                        Err(Error::Parsing(_)) => None,
+                        e => Some(e),
+                    }
+                }
+                _ => None,
+            }
         })
     }
 
@@ -681,6 +756,14 @@ impl UncacheableReason {
             Self::Inactive => "inactive_sub",
             Self::DataSlice => "data_slice",
             Self::Filters => "bad_filters",
+        }
+    }
+
+    /// Returns true if the request can still be fetched from cache
+    fn can_use_cache(&self) -> bool {
+        match self {
+            Self::Encoding | Self::DataSlice => true,
+            Self::Inactive | Self::Filters => false,
         }
     }
 }
@@ -1015,6 +1098,7 @@ fn account_response<'a, 'b>(
     acc: (Option<&'b AccountInfo>, u64),
     app_state: &State,
     config: &AccountInfoConfig,
+    pubkey: Pubkey,
 ) -> Result<HttpResponse, Error<'a>> {
     let request_and_slot_hash = hash((request_hash, acc.1));
     if let Some(result) = app_state.lru.borrow_mut().get(&request_and_slot_hash) {
@@ -1046,7 +1130,7 @@ fn account_response<'a, 'b>(
             .as_ref()
             .map(|acc| {
                 Ok::<_, Base58Error>(
-                    acc.encode(config.encoding, config.data_slice, true)?
+                    acc.encode(config.encoding, config.data_slice, true, pubkey)?
                         .with_context(&ctx),
                 )
             })
@@ -1167,6 +1251,7 @@ fn program_accounts_response<'a>(
         slice: Option<Slice>,
         commitment: Commitment,
         enforce_base58_limit: bool,
+        pubkey: Pubkey,
     }
 
     impl<'a, K> Serialize for Encode<'a, K>
@@ -1179,7 +1264,12 @@ fn program_accounts_response<'a>(
         {
             if let Some((Some(value), _)) = self.inner.value().get(self.commitment) {
                 let encoded = value
-                    .encode(self.encoding, self.slice, self.enforce_base58_limit)
+                    .encode(
+                        self.encoding,
+                        self.slice,
+                        self.enforce_base58_limit,
+                        self.pubkey,
+                    )
                     .map_err(serde::ser::Error::custom)?;
                 encoded.serialize(serializer)
             } else {
@@ -1238,6 +1328,7 @@ fn program_accounts_response<'a>(
                     slice: config.data_slice,
                     commitment,
                     enforce_base58_limit,
+                    pubkey: **key,
                 },
                 pubkey: **key,
             })
@@ -1289,8 +1380,8 @@ pub async fn rpc_handler(
 
     let req: Request<'_, _> = match serde_json::from_slice(&body) {
         Ok(req) => req,
-        Err(err) => {
-            return Ok(Error::from(err).error_response());
+        Err(_) => {
+            return Ok(Error::InvalidRequest(None, Some("Invalid request")).error_response());
         }
     };
 
@@ -1345,9 +1436,10 @@ pub async fn rpc_handler(
 
     let client = app_state.client.clone();
     let url = app_state.rpc_url.clone();
+    let mut error = Error::Timeout(req.id.clone()).error_response();
 
     let stream = stream_generator::generate_stream(move |mut stream| async move {
-        let mut backoff = backoff_settings();
+        let mut backoff = backoff_settings(30);
         let total = metrics().passthrough_total_time.start_timer();
         loop {
             let request_time = metrics().passthrough_request_time.start_timer();
@@ -1370,10 +1462,18 @@ pub async fn rpc_handler(
                 Err(err) => {
                     metrics().passthrough_errors.inc();
                     match backoff.next_backoff() {
-                        Some(duration) => tokio::time::delay_for(duration).await,
+                        Some(duration) => {
+                            metrics().request_retries.inc();
+                            tokio::time::delay_for(duration).await;
+                        }
                         None => {
+                            let mut error_stream = error.take_body();
                             warn!("request error: {:?}", err);
-                            // TODO: return error
+                            while let Some(chunk) = error_stream.next().await {
+                                stream
+                                    .send(chunk.map_err(|_| PayloadError::Incomplete(None))) // should never error
+                                    .await;
+                            }
                             break;
                         }
                     }
@@ -1388,11 +1488,11 @@ pub async fn rpc_handler(
         .streaming(Box::pin(stream)))
 }
 
-fn backoff_settings() -> backoff::ExponentialBackoff {
+fn backoff_settings(max: u64) -> backoff::ExponentialBackoff {
     backoff::ExponentialBackoff {
         initial_interval: Duration::from_millis(100),
         max_interval: Duration::from_secs(5),
-        max_elapsed_time: Some(Duration::from_secs(60)),
+        max_elapsed_time: Some(Duration::from_secs(max)),
         ..Default::default()
     }
 }
@@ -1440,6 +1540,7 @@ pub struct Config {
 
 pub async fn apply_config(app_state: &web::Data<State>, new_config: Config) {
     let current_config = app_state.config.load();
+
     if **current_config == new_config {
         return;
     }
@@ -1447,7 +1548,7 @@ pub async fn apply_config(app_state: &web::Data<State>, new_config: Config) {
     let current_limits = current_config.request_limits;
     let new_limits = new_config.request_limits;
 
-    app_state.config.store(Arc::new(new_config));
+    app_state.config.store(Arc::new(new_config.clone()));
 
     async fn apply_limit(old_limit: usize, new_limit: usize, semaphore: &Semaphore) {
         if new_limit > old_limit {
@@ -1475,10 +1576,14 @@ pub async fn apply_config(app_state: &web::Data<State>, new_config: Config) {
 
     let available_accounts = &app_state.account_info_request_limit.available_permits();
     let available_programs = &app_state.program_accounts_request_limit.available_permits();
-    info!(old = ?current_limits,
-        new = ?new_limits,
+
+    info!(
+        old_config = ?current_config,
+        new_config = ?new_config,
         %available_accounts,
-        %available_programs, "rpc limits updated");
+        %available_programs,
+        "new configuration applied"
+    );
 }
 
 pub async fn metrics_handler(
@@ -1503,4 +1608,15 @@ pub async fn metrics_handler(
     let families = prometheus::gather();
     let _ = encoder.encode(&families, &mut buffer);
     Ok(HttpResponse::Ok().content_type("text/plain").body(buffer))
+}
+
+#[cfg(feature = "jsonparsed")]
+pub fn get_mint_decimals(mint: &SolanaPubkey) -> Result<u8, &'static str> {
+    use solana_account_decoder::parse_token::spl_token_v2_0_native_mint;
+
+    if mint == &spl_token_v2_0_native_mint() {
+        Ok(spl_token_v2_0::native_mint::DECIMALS)
+    } else {
+        Err("Invalid param: mint is not native")
+    }
 }

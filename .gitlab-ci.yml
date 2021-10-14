@@ -175,7 +175,17 @@ deploy_dev_aws:
     - tags
     - web
 
-deploy_dev_aws_not_master:
+deploy_dev_aws_cacher_13:
+  extends: .deploy_dev_aws_not_master
+  variables:
+    LIMIT_HOST: "ad-pub-cacher-13.tt-int.net"
+
+deploy_dev_aws_cacher_15:
+  extends: .deploy_dev_aws_not_master
+  variables:
+    LIMIT_HOST: "ad-pub-cacher-15.tt-int.net"
+
+.deploy_dev_aws_not_master:
   stage: deploy_dev
   image: gableroux/ansible:2.10.7
   tags: [docker19_hetz_nocache]
@@ -193,7 +203,7 @@ deploy_dev_aws_not_master:
     - git clone https://git.zubr.dev/shared/ci-scripts.git
     - cd ci-scripts/deploy/cacherpc
     - ansible --version
-    - ansible-playbook -i tt_stg -e "install_version=${PIPELINE_ID_VERSION}" --private-key ~/.ssh/id_rsa deploy.yml
+    - ansible-playbook -i tt_stg -e "install_version=${PIPELINE_ID_VERSION}" --limit ${LIMIT_HOST} --private-key ~/.ssh/id_rsa deploy.yml
   when: manual
   except:
     - master
