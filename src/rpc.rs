@@ -287,10 +287,22 @@ impl State {
             let res = lua.scope(|scope| {
                 lua.globals()
                     .set("request", scope.create_nonstatic_userdata(&raw_request)?)?;
-                lua.load("require 'waf'.request(request)").eval::<bool>()
+                lua.load("require 'waf'.request(request)")
+                    .eval::<(bool, String)>()
             });
-            if !res.unwrap_or(true) {
-                return Err(Error::InvalidRequest(Some(raw_request.id.clone()), None));
+
+            let (ok, err) = match res {
+                Ok(tuple) => tuple,
+                Err(e) => {
+                    tracing::error!(%e, "Error occured during WAF rules evaluation");
+                    return Err(Error::Internal(
+                        Some(raw_request.id.clone()),
+                        Cow::from("WAF internal error"),
+                    ));
+                }
+            };
+            if !ok {
+                return Err(Error::WAFRejection(Some(raw_request.id.clone()), err));
             }
         }
 
@@ -772,6 +784,30 @@ impl<'a> ErrorResponse<'a> {
         }
     }
 
+    fn internal(id: Option<Id<'a>>, msg: Cow<'a, str>) -> ErrorResponse<'a> {
+        ErrorResponse {
+            jsonrpc: "2.0",
+            id,
+            error: RpcError {
+                code: -32603,
+                message: msg,
+                data: None,
+            },
+        }
+    }
+
+    fn waf_rejection(id: Option<Id<'a>>, msg: &'a str) -> ErrorResponse<'a> {
+        ErrorResponse {
+            jsonrpc: "2.0",
+            id,
+            error: RpcError {
+                code: -33000,
+                message: Cow::from(msg),
+                data: None,
+            },
+        }
+    }
+
     fn invalid_request(id: Option<Id<'a>>, msg: Option<&'a str>) -> ErrorResponse<'a> {
         ErrorResponse {
             jsonrpc: "2.0",
@@ -813,6 +849,8 @@ impl<'a> ErrorResponse<'a> {
 pub enum Error<'a> {
     #[error("invalid request")]
     InvalidRequest(Option<Id<'a>>, Option<&'a str>),
+    #[error("waf rejection error")]
+    WAFRejection(Option<Id<'a>>, String),
     #[error("invalid param")]
     InvalidParam {
         req_id: Id<'a>,
@@ -829,6 +867,8 @@ pub enum Error<'a> {
     Forward(#[from] awc::error::SendRequestError),
     #[error("streaming error")]
     Streaming(awc::error::PayloadError),
+    #[error("internal error")]
+    Internal(Option<Id<'a>>, Cow<'a, str>),
 }
 
 impl From<serde_json::Error> for Error<'_> {
@@ -849,6 +889,9 @@ impl ResponseError for Error<'_> {
             Error::InvalidRequest(req_id, msg) => HttpResponse::Ok()
                 .content_type("application/json")
                 .json(&ErrorResponse::invalid_request(req_id.clone(), *msg)),
+            Error::WAFRejection(req_id, msg) => HttpResponse::Ok()
+                .content_type("application/json")
+                .json(&ErrorResponse::waf_rejection(req_id.clone(), msg)),
             Error::InvalidParam {
                 req_id,
                 message,
@@ -856,6 +899,9 @@ impl ResponseError for Error<'_> {
             } => HttpResponse::Ok().content_type("application/json").json(
                 &ErrorResponse::invalid_param(req_id.clone(), message.clone(), data.clone()),
             ),
+            Error::Internal(req_id, msg) => HttpResponse::Ok()
+                .content_type("application/json")
+                .json(&ErrorResponse::internal(req_id.clone(), msg.clone())),
             Error::Parsing(req_id) => HttpResponse::Ok()
                 .content_type("application/json")
                 .json(&ErrorResponse::parse_error(req_id.clone())),
