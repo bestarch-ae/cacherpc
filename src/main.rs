@@ -17,7 +17,7 @@ use tokio::sync::{watch, Notify, Semaphore};
 use tracing::info;
 use tracing_subscriber::fmt;
 
-use mlua::Lua;
+use mlua::{Lua, LuaOptions, StdLib};
 
 pub use cache_rpc::{metrics, pubsub, rpc, types};
 
@@ -109,7 +109,10 @@ struct Options {
         default_value = "150"
     )]
     slot_dist: u32,
-    #[structopt(long = "rules", help = "waf rules")]
+    #[structopt(
+        long = "rules",
+        help = "web application firewall rules, to filter out specific requests"
+    )]
     rules: Option<PathBuf>,
 }
 
@@ -221,6 +224,25 @@ async fn config_read_loop(path: PathBuf, rpc: watch::Sender<rpc::Config>) {
     }
 }
 
+fn lua(rules: &str) -> Result<Lua, mlua::Error> {
+    // if any of the lua preparation steps contain errors, then WAF will not be used
+    let lua = Lua::new_with(
+        StdLib::MATH | StdLib::STRING | StdLib::PACKAGE,
+        LuaOptions::default(),
+    )?;
+
+    let func = lua.load(LUA_JSON).into_function()?;
+
+    let _: mlua::Value = lua.load_from_function("json", func)?;
+
+    let rules = lua.load(&rules).into_function()?;
+
+    let _: mlua::Value = lua.load_from_function("waf", rules)?;
+
+    info!("loaded WAF rules");
+    Ok(lua)
+}
+
 async fn run(options: Options) -> Result<()> {
     let accounts = AccountsDb::new();
     let program_accounts = ProgramAccountsDb::new();
@@ -306,16 +328,16 @@ async fn run(options: Options) -> Result<()> {
                 let id = worker_id_counter.fetch_add(1, Ordering::SeqCst);
                 format!("rpc-{}", id)
             },
-            lua: rules.as_ref().map(|rules| {
-                let lua = Lua::new();
-                let func = lua.load(LUA_JSON).into_function().unwrap();
-                let _: mlua::Value = lua.load_from_function("json", func).unwrap();
-
-                let rules = lua.load(&rules).into_function().unwrap();
-                let _: mlua::Value = lua.load_from_function("waf", rules).unwrap();
-                info!("loaded rules");
-                lua
-            }),
+            lua: rules
+                .as_ref()
+                .map(|rules| match lua(rules) {
+                    Ok(lua) => Some(lua),
+                    Err(e) => {
+                        tracing::error!(%e, "WAF rules loading/compilation error");
+                        None
+                    }
+                })
+                .flatten(),
         };
         let cors = Cors::default()
             .allow_any_origin()
