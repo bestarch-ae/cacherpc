@@ -233,11 +233,11 @@ fn lua(rules: &str) -> Result<Lua, mlua::Error> {
 
     let func = lua.load(LUA_JSON).into_function()?;
 
-    let _: mlua::Value = lua.load_from_function("json", func)?;
+    let _: mlua::Value<'_> = lua.load_from_function("json", func)?;
 
     let rules = lua.load(&rules).into_function()?;
 
-    let _: mlua::Value = lua.load_from_function("waf", rules)?;
+    let _: mlua::Value<'_> = lua.load_from_function("waf", rules)?;
 
     info!("loaded WAF rules");
     Ok(lua)
