@@ -276,6 +276,7 @@ pub struct RpcMetrics {
     pub passthrough_errors: IntCounter,
     pub rpc_slot: IntGauge,
     pub request_retries: IntCounter,
+    pub batch_requests: IntCounter,
 }
 
 impl RpcMetrics {
@@ -477,6 +478,11 @@ pub fn rpc_metrics() -> &'static RpcMetrics {
         request_retries: register_int_counter!(
             "request_retries",
             "Number of attempts to retry request after failure"
+        )
+        .unwrap(),
+        batch_requests: register_int_counter!(
+            "batch_requests",
+            "Number of request which contained multiple subqueries"
         )
         .unwrap(),
     });
