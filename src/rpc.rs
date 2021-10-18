@@ -994,8 +994,8 @@ fn parse_params<'a, T: Default + Deserialize<'a>>(
     if params.len() > 2 {
         return Err(Error::InvalidParam {
             req_id: req.id.clone(),
-            message: "Expected from 1 to 2 parameters".into(),
-            data: Some(format!("Got {}", params.len()).into()),
+            message: "Invalid parameters: Expected from 1 to 2 parameters".into(),
+            data: Some(format!("\"Got {}\"", params.len()).into()),
         });
     }
 
