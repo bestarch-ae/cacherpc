@@ -335,8 +335,11 @@ async fn run(options: Options) -> Result<()> {
                 .map(|rules| match lua(rules) {
                     Ok(lua) => Some(lua),
                     Err(e) => {
-                        tracing::error!(%e, "WAF rules loading/compilation error");
-                        None
+                        eprintln!(
+                            "WAF rules were provided, but program was unable to parse them:\n{}\nFix the rules and try again.",
+                            e
+                        );
+                        std::process::exit(1);
                     }
                 })
                 .flatten(),
