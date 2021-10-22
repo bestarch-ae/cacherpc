@@ -1304,6 +1304,46 @@ fn base58_error(id: Id<'_>) -> Error<'_> {
     )
 }
 
+enum OneOrMany<'a> {
+    One(Request<'a, RawValue>),
+    Many(Vec<&'a RawValue>),
+}
+
+impl<'de> Deserialize<'de> for OneOrMany<'de> {
+    fn deserialize<D>(deserializer: D) -> Result<OneOrMany<'de>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = OneOrMany<'de>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("[] or {}")
+            }
+
+            fn visit_seq<A>(self, seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let des = serde::de::value::SeqAccessDeserializer::new(seq);
+                Ok(OneOrMany::Many(serde::Deserialize::deserialize(des)?))
+            }
+
+            fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let des = serde::de::value::MapAccessDeserializer::new(map);
+                Ok(OneOrMany::One(serde::Deserialize::deserialize(des)?))
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
 pub async fn rpc_handler(
     body: Bytes,
     app_state: web::Data<State>,
@@ -1311,29 +1351,13 @@ pub async fn rpc_handler(
     use std::future::Future;
     use std::task::Poll;
 
-    let req: Request<'_, _> = match serde_json::from_slice(&body) {
-        Ok(req) => req,
-        Err(_) => {
-            return Ok(Error::InvalidRequest(None, Some("Invalid request")).error_response());
-        }
+    // if request contains subqueries, pass it directly to validator
+    let req: OneOrMany<'_> = match serde_json::from_slice(&body) {
+        Ok(val) => val,
+        Err(_) => return Ok(Error::InvalidRequest(None, Some("Invalid request")).error_response()),
     };
 
-    if req.jsonrpc != "2.0" {
-        return Ok(Error::InvalidRequest(Some(req.id), None).error_response());
-    }
-
-    macro_rules! observe {
-        ($method:expr, $fut:expr) => {{
-            metrics().request_types($method).inc();
-            let timer = metrics()
-                .handler_time
-                .with_label_values(&[$method])
-                .start_timer();
-            let resp = $fut.await;
-            timer.observe_duration();
-            Ok(resp.unwrap_or_else(|err| err.error_response()))
-        }};
-    }
+    // apply new config (if any) before proceeding
     {
         let mut rx = app_state.config_watch.borrow_mut();
 
@@ -1351,25 +1375,50 @@ pub async fn rpc_handler(
         }
     }
 
-    let arc_state = app_state.clone().into_inner();
-    match req.method {
-        "getAccountInfo" => {
-            return observe!(req.method, arc_state.process_request::<GetAccountInfo>(req));
+    let mut id = Id::Null;
+
+    // if request contains only one query, try to serve it from cache
+    if let OneOrMany::One(req) = req {
+        if req.jsonrpc != "2.0" {
+            return Ok(Error::InvalidRequest(Some(req.id), None).error_response());
         }
-        "getProgramAccounts" => {
-            return observe!(
-                req.method,
-                arc_state.process_request::<GetProgramAccounts>(req)
-            );
+
+        macro_rules! observe {
+            ($method:expr, $fut:expr) => {{
+                metrics().request_types($method).inc();
+                let timer = metrics()
+                    .handler_time
+                    .with_label_values(&[$method])
+                    .start_timer();
+                let resp = $fut.await;
+                timer.observe_duration();
+                Ok(resp.unwrap_or_else(|err| err.error_response()))
+            }};
         }
-        method => {
-            metrics().request_types(method).inc();
+
+        let arc_state = app_state.clone().into_inner();
+        match req.method {
+            "getAccountInfo" => {
+                return observe!(req.method, arc_state.process_request::<GetAccountInfo>(req));
+            }
+            "getProgramAccounts" => {
+                return observe!(
+                    req.method,
+                    arc_state.process_request::<GetProgramAccounts>(req)
+                );
+            }
+            method => {
+                metrics().request_types(method).inc();
+                id = req.id;
+            }
         }
+    } else {
+        metrics().batch_requests.inc();
     }
 
     let client = app_state.client.clone();
     let url = app_state.rpc_url.clone();
-    let mut error = Error::Timeout(req.id.clone()).error_response();
+    let mut error = Error::Timeout(id).error_response();
 
     let stream = stream_generator::generate_stream(move |mut stream| async move {
         let mut backoff = backoff_settings(30);
