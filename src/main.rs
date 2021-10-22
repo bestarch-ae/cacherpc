@@ -17,10 +17,14 @@ use tokio::sync::{watch, Notify, Semaphore};
 use tracing::info;
 use tracing_subscriber::fmt;
 
+use mlua::{Lua, LuaOptions, StdLib};
+
 pub use cache_rpc::{metrics, pubsub, rpc, types};
 
 use pubsub::PubSubManager;
 use types::{AccountsDb, ProgramAccountsDb};
+
+const LUA_JSON: &str = include_str!("json.lua");
 
 #[derive(Debug, structopt::StructOpt)]
 #[structopt(about = "Solana RPC cache server")]
@@ -105,6 +109,11 @@ struct Options {
         default_value = "150"
     )]
     slot_distance: u32,
+    #[structopt(
+        long = "rules",
+        help = "web application firewall rules, to filter out specific requests"
+    )]
+    rules: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -215,6 +224,25 @@ async fn config_read_loop(path: PathBuf, rpc: watch::Sender<rpc::Config>) {
     }
 }
 
+fn lua(rules: &str) -> Result<Lua, mlua::Error> {
+    // if any of the lua preparation steps contain errors, then WAF will not be used
+    let lua = Lua::new_with(
+        StdLib::MATH | StdLib::STRING | StdLib::PACKAGE,
+        LuaOptions::default(),
+    )?;
+
+    let func = lua.load(LUA_JSON).into_function()?;
+
+    let _: mlua::Value<'_> = lua.load_from_function("json", func)?;
+
+    let rules = lua.load(&rules).into_function()?;
+
+    let _: mlua::Value<'_> = lua.load_from_function("waf", rules)?;
+
+    info!("loaded WAF rules");
+    Ok(lua)
+}
+
 async fn run(options: Options) -> Result<()> {
     let accounts = AccountsDb::new();
     let program_accounts = ProgramAccountsDb::new();
@@ -246,6 +274,12 @@ async fn run(options: Options) -> Result<()> {
         .map(Config::from_file)
         .transpose()?
         .unwrap_or_else(|| Config::from_options(&options));
+
+    let rules = options
+        .rules
+        .as_ref()
+        .map(std::fs::read_to_string)
+        .transpose()?;
 
     let rpc_url = options.rpc_url;
     let notify = Arc::new(Notify::new());
@@ -296,6 +330,19 @@ async fn run(options: Options) -> Result<()> {
                 let id = worker_id_counter.fetch_add(1, Ordering::SeqCst);
                 format!("rpc-{}", id)
             },
+            lua: rules
+                .as_ref()
+                .map(|rules| match lua(rules) {
+                    Ok(lua) => Some(lua),
+                    Err(e) => {
+                        eprintln!(
+                            "WAF rules were provided, but program was unable to parse them:\n{}\nFix the rules and try again.",
+                            e
+                        );
+                        std::process::exit(1);
+                    }
+                })
+                .flatten(),
         };
         let cors = Cors::default()
             .allow_any_origin()
