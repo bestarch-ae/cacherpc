@@ -11,45 +11,56 @@ use serde::{Deserialize, Serialize};
 use crate::filter::Filters;
 use crate::metrics::db_metrics as metrics;
 
-pub struct ProgramState([Option<HashSet<Arc<Pubkey>>>; 3]);
+pub struct ProgramState {
+    account_keys: [Option<HashSet<Arc<Pubkey>>>; 3],
+    slots: [u64; 3],
+}
 
 impl ProgramState {
     pub fn get(&self, commitment: Commitment) -> Option<&HashSet<Arc<Pubkey>>> {
-        (self.0)[commitment.as_idx()].as_ref()
+        self.account_keys[commitment.as_idx()].as_ref()
+    }
+
+    pub fn get_slot(&self, commitment: Commitment) -> Option<&u64> {
+        self.slots.get(commitment.as_idx())
     }
 
     fn insert(&mut self, commitment: Commitment, data: HashSet<Arc<Pubkey>>) {
-        (self.0)[commitment.as_idx()] = Some(data)
+        self.account_keys[commitment.as_idx()] = Some(data)
     }
 
-    fn add(&mut self, commitment: Commitment, data: Arc<Pubkey>) {
-        if let Some(ref mut keys) = (self.0)[commitment.as_idx()] {
+    fn add(&mut self, commitment: Commitment, data: Arc<Pubkey>, slot: Slot) {
+        if let Some(ref mut keys) = self.account_keys[commitment.as_idx()] {
             keys.insert(data);
         } else {
             let mut set = HashSet::new();
             set.insert(data);
             self.insert(commitment, set);
         }
+        self.slots[commitment.as_idx()] = slot;
     }
 
     fn remove(&mut self, commitment: Commitment, data: &Pubkey) {
-        if let Some(ref mut keys) = (self.0)[commitment.as_idx()] {
+        if let Some(ref mut keys) = self.account_keys[commitment.as_idx()] {
             keys.remove(data);
         }
     }
 
     fn take_commitment(&mut self, commitment: Commitment) -> Option<HashSet<Arc<Pubkey>>> {
-        (self.0)[commitment.as_idx()].take()
+        self.account_keys[commitment.as_idx()].take()
     }
 
     fn is_empty(&self) -> bool {
-        self.0.iter().all(Option::is_none)
+        self.account_keys.iter().all(Option::is_none)
     }
 }
 
 impl Default for ProgramState {
     fn default() -> Self {
-        ProgramState([None, None, None])
+        ProgramState {
+            account_keys: [None, None, None],
+            slots: [0; 3],
+        }
     }
 }
 
@@ -115,10 +126,11 @@ impl ProgramAccountsDb {
         data: Arc<Pubkey>,
         filter_groups: HashSet<Filters>,
         commitment: Commitment,
+        slot: Slot,
     ) {
         // add to global
         if let Some(mut entry) = self.map.get_mut(&(*key, None)) {
-            entry.add(commitment, data.clone());
+            entry.add(commitment, data.clone(), slot);
         }
 
         let has_new_or_old_filters = !filter_groups.is_empty()
@@ -139,7 +151,7 @@ impl ProgramAccountsDb {
                     }
                     // Account is new to the filter
                     Some(mut state) /* !old_groups.contains(&filter) */ => {
-                        state.add(commitment, Arc::clone(&data));
+                        state.add(commitment, Arc::clone(&data), slot);
                     }
                     None => (), // State not found
                 }
