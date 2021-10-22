@@ -525,7 +525,19 @@ impl Cacheable for GetAccountInfo {
 
     fn get_from_cache<'a>(&self, id: &Id<'a>, state: &State) -> Option<CacheResult<'a>> {
         state.accounts.get(&self.pubkey).and_then(|data| {
-            let account = data.value().get(self.commitment());
+            let mut account = data.value().get(self.commitment());
+            account = account.map(|(info, mut slot)| {
+                if slot == 0 {
+                    if let Some(info) = info {
+                        if let Some(owner) = state.program_accounts.get(&info.owner, None) {
+                            if let Some(s) = owner.value().get_slot(self.commitment()) {
+                                slot = *s;
+                            }
+                        }
+                    }
+                }
+                (info, slot)
+            });
             match account.filter(|(_, slot)| *slot != 0) {
                 Some(data) => {
                     let resp = account_response(

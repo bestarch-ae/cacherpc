@@ -910,6 +910,7 @@ impl AccountUpdateManager {
                                 key_ref.clone(),
                                 filter_groups,
                                 *commitment,
+                                slot,
                             );
 
                             // important for proper removal
