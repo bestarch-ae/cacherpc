@@ -353,6 +353,7 @@ impl State {
                 }
             };
             if !ok {
+                metrics().waf_rejections.inc();
                 return Err(Error::WAFRejection(Some(raw_request.id.clone()), err));
             }
         }

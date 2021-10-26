@@ -277,6 +277,7 @@ pub struct RpcMetrics {
     pub rpc_slot: IntGauge,
     pub request_retries: IntCounter,
     pub batch_requests: IntCounter,
+    pub waf_rejections: IntCounter,
 }
 
 impl RpcMetrics {
@@ -483,6 +484,11 @@ pub fn rpc_metrics() -> &'static RpcMetrics {
         batch_requests: register_int_counter!(
             "batch_requests",
             "Number of request which contained multiple subqueries"
+        )
+        .unwrap(),
+        waf_rejections: register_int_counter!(
+            "waf_rejection",
+            "Number of requests which were rejected due to WAF rules"
         )
         .unwrap(),
     });
