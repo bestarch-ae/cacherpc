@@ -278,8 +278,13 @@ impl State {
     }
 
     // owner is the subscription for program, if given account belongs to one
-    fn subscription_active(&self, sub: Subscription, commitment: Commitment) -> SubscriptionActive {
-        self.pubsub.subscription_active(sub, commitment)
+    fn subscription_active(
+        &self,
+        sub: Subscription,
+        commitment: Commitment,
+        owner: Option<Pubkey>,
+    ) -> SubscriptionActive {
+        self.pubsub.subscription_active(sub, commitment, owner)
     }
 
     fn is_caching_allowed(&self) -> bool {
@@ -288,6 +293,10 @@ impl State {
 
     fn subscribe(&self, sub: SubDescriptor) {
         self.pubsub.subscribe(sub.kind, sub.commitment, sub.filters);
+    }
+
+    fn unsubscribe(&self, sub: Subscription, commitment: Commitment) {
+        self.pubsub.unsubscribe(sub, commitment);
     }
 
     async fn request<T>(
@@ -350,8 +359,7 @@ impl State {
             Ok(Some(data)) => {
                 T::cache_hit_counter().inc();
                 self.reset(request.sub_descriptor());
-                // if entry is found in cache, check whether it's websocket subscription is still active
-                if request.can_use_cached_data(&self).await {
+                if request.has_active_subscription(&self).await {
                     return data;
                 } else {
                     (true, false)
@@ -430,7 +438,11 @@ impl State {
                         if this.is_caching_allowed() && request.put_into_cache(&this, data) {
                             debug!(%request, "cached for key");
                             this.map_updated.notify_waiters();
-                            this.subscribe(request.sub_descriptor());
+                            if !request.has_active_subscription(&this).await {
+                                this.subscribe(request.sub_descriptor());
+                            } else {
+                                info!(%request, "subscription skipped");
+                            }
                         }
                     }
                     Ok(Response::Error(error)) => {
@@ -463,8 +475,10 @@ trait Cacheable: Sized + 'static {
 
     fn is_cacheable(&self, state: &State) -> Result<(), UncacheableReason>;
     // method to check whether cached entry has corresponding websocket subscription
-    fn can_use_cached_data(&self, state: &State) -> SubscriptionActive;
+    fn has_active_subscription(&self, state: &State) -> SubscriptionActive;
+
     fn get_from_cache<'a>(&self, id: &Id<'a>, state: &State) -> Option<CacheResult<'a>>;
+
     fn put_into_cache(&self, state: &State, data: Self::ResponseData) -> bool;
 
     fn sub_descriptor(&self) -> SubDescriptor;
@@ -528,8 +542,17 @@ impl Cacheable for GetAccountInfo {
         state.account_info_request_limit.as_ref()
     }
 
-    fn can_use_cached_data(&self, state: &State) -> SubscriptionActive {
-        state.subscription_active(Subscription::Account(self.pubkey), self.commitment())
+    // for getAccountInfo requests, we don't need to subscribe in case if the owner program exists,
+    // and there's already an active subscription present for it
+    fn has_active_subscription(&self, state: &State) -> SubscriptionActive {
+        let owner = state.accounts.get(&self.pubkey).and_then(|data| {
+            data.value()
+                .get(self.commitment())
+                .map(|(info, _)| info)
+                .flatten()
+                .map(|acc| acc.owner)
+        });
+        state.subscription_active(Subscription::Account(self.pubkey), self.commitment(), owner)
     }
 
     fn is_cacheable(&self, state: &State) -> Result<(), UncacheableReason> {
@@ -654,8 +677,8 @@ impl Cacheable for GetProgramAccounts {
         state.program_accounts_request_limit.as_ref()
     }
 
-    fn can_use_cached_data(&self, state: &State) -> SubscriptionActive {
-        state.subscription_active(Subscription::Account(self.pubkey), self.commitment())
+    fn has_active_subscription(&self, state: &State) -> SubscriptionActive {
+        state.subscription_active(Subscription::Program(self.pubkey), self.commitment(), None)
     }
 
     fn is_cacheable(&self, state: &State) -> Result<(), UncacheableReason> {
@@ -719,6 +742,9 @@ impl Cacheable for GetProgramAccounts {
                 commitment,
             );
             keys.insert(key_ref);
+            // as we will subscribe for this program, there's no need to keep separate
+            // subscriptions for its accounts, if any
+            state.unsubscribe(Subscription::Account(pubkey), commitment);
         }
         state
             .program_accounts
