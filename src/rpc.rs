@@ -28,7 +28,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::filter::{Filter, Filters};
 use crate::metrics::rpc_metrics as metrics;
-use crate::pubsub::{PubSubManager, Subscription};
+use crate::pubsub::{PubSubManager, Subscription, SubscriptionActive};
 use crate::types::{
     AccountContext, AccountData, AccountInfo, AccountState, AccountsDb, BytesChain, Commitment,
     Encoding, ProgramAccountsDb, Pubkey, Slot, SolanaContext,
@@ -274,8 +274,8 @@ impl State {
         self.accounts.insert(key, data, commitment)
     }
 
-    fn subscription_active(&self, key: Pubkey) -> bool {
-        self.pubsub.subscription_active(key)
+    fn subscription_active(&self, sub: Subscription, commitment: Commitment) -> SubscriptionActive {
+        self.pubsub.subscription_active(sub, commitment)
     }
 
     fn subscribe(&self, sub: SubDescriptor) {
@@ -365,7 +365,12 @@ impl State {
             Ok(Some(data)) => {
                 T::cache_hit_counter().inc();
                 self.reset(request.sub_descriptor());
-                return data;
+                // if entry is found in cache, check whether it's websocket subscription is still active
+                if request.can_use_cached_data(&self).await {
+                    return data;
+                } else {
+                    (true, false)
+                }
             }
             Ok(None) => (true, true),
             Err(reason) => {
@@ -472,6 +477,8 @@ trait Cacheable: Sized + 'static {
     fn get_limit(state: &State) -> &Semaphore;
 
     fn is_cacheable(&self, state: &State) -> Result<(), UncacheableReason>;
+    // method to check whether cached entry has corresponding websocket subscription
+    fn can_use_cached_data(&self, state: &State) -> SubscriptionActive;
     fn get_from_cache<'a>(&self, id: &Id<'a>, state: &State) -> Option<CacheResult<'a>>;
     fn put_into_cache(&self, state: &State, data: Self::ResponseData) -> bool;
 
@@ -536,13 +543,15 @@ impl Cacheable for GetAccountInfo {
         state.account_info_request_limit.as_ref()
     }
 
-    fn is_cacheable(&self, state: &State) -> Result<(), UncacheableReason> {
+    fn can_use_cached_data(&self, state: &State) -> SubscriptionActive {
+        state.subscription_active(Subscription::Account(self.pubkey), self.commitment())
+    }
+
+    fn is_cacheable(&self, _state: &State) -> Result<(), UncacheableReason> {
         if self.config.encoding == Encoding::JsonParsed {
             Err(UncacheableReason::Encoding)
         } else if self.config.data_slice.is_some() {
             Err(UncacheableReason::DataSlice)
-        } else if !state.subscription_active(self.pubkey) {
-            Err(UncacheableReason::Inactive)
         } else {
             Ok(())
         }
@@ -658,15 +667,17 @@ impl Cacheable for GetProgramAccounts {
         state.program_accounts_request_limit.as_ref()
     }
 
-    fn is_cacheable(&self, state: &State) -> Result<(), UncacheableReason> {
+    fn can_use_cached_data(&self, state: &State) -> SubscriptionActive {
+        state.subscription_active(Subscription::Account(self.pubkey), self.commitment())
+    }
+
+    fn is_cacheable(&self, _state: &State) -> Result<(), UncacheableReason> {
         if self.config.encoding == Encoding::JsonParsed {
             Err(UncacheableReason::Encoding)
         } else if self.config.data_slice.is_some() {
             Err(UncacheableReason::DataSlice)
         } else if !self.valid_filters {
             Err(UncacheableReason::Filters)
-        } else if !state.subscription_active(self.pubkey) {
-            Err(UncacheableReason::Inactive)
         } else {
             Ok(())
         }
@@ -756,7 +767,6 @@ impl fmt::Display for GetProgramAccounts {
 
 enum UncacheableReason {
     Encoding,
-    Inactive,
     DataSlice,
     Filters,
 }
@@ -765,7 +775,6 @@ impl UncacheableReason {
     fn as_str(&self) -> &'static str {
         match self {
             Self::Encoding => "encoding",
-            Self::Inactive => "inactive_sub",
             Self::DataSlice => "data_slice",
             Self::Filters => "bad_filters",
         }
@@ -775,7 +784,7 @@ impl UncacheableReason {
     fn can_use_cache(&self) -> bool {
         match self {
             Self::Encoding | Self::DataSlice => true,
-            Self::Inactive | Self::Filters => false,
+            Self::Filters => false,
         }
     }
 }
