@@ -118,16 +118,16 @@ impl PubSubManager {
         let mut addrs = Vec::new();
         let config = Arc::new(config);
         for id in 0..connections {
-            let active = Arc::new(AtomicBool::new(false));
+            let connected = Arc::new(AtomicBool::new(false));
             let addr = AccountUpdateManager::init(
                 id,
                 accounts.clone(),
                 program_accounts.clone(),
-                Arc::clone(&active),
+                Arc::clone(&connected),
                 rpc_slot.clone(),
                 Arc::clone(&config),
             );
-            addrs.push((addr, active))
+            addrs.push((addr, connected))
         }
         PubSubManager(addrs)
     }
@@ -147,7 +147,7 @@ impl PubSubManager {
         self.0[idx].0.clone()
     }
 
-    pub fn websocket_active(&self, key: Pubkey) -> bool {
+    pub fn websocket_connected(&self, key: Pubkey) -> bool {
         let idx = self.get_idx_by_key(key);
         self.0[idx].1.load(Ordering::Relaxed)
     }
@@ -157,9 +157,9 @@ impl PubSubManager {
         sub: Subscription,
         commitment: Commitment,
     ) -> SubscriptionActive {
-        if self.websocket_active(sub.key()) {
-            let idx = self.get_idx_by_key(sub.key());
-            SubscriptionActive::Request(self.0[idx].0.send(IsSubActive { sub, commitment }))
+        if self.websocket_connected(sub.key()) {
+            let addr = self.get_addr_by_key(sub.key());
+            SubscriptionActive::Request(addr.send(IsSubActive { sub, commitment }))
         } else {
             SubscriptionActive::Ready(false)
         }
@@ -212,7 +212,7 @@ pub struct AccountUpdateManager {
     purge_queue: Option<DelayQueueHandle<(Subscription, Commitment)>>,
     additional_keys: ProgramFilters,
     last_received_at: Instant,
-    active: Arc<AtomicBool>,
+    connected: Arc<AtomicBool>,
     rpc_slot: Arc<AtomicU64>,
     buffer: BytesMut,
     config: Arc<Config>,
@@ -229,7 +229,7 @@ impl AccountUpdateManager {
         actor_id: u32,
         accounts: AccountsDb,
         program_accounts: ProgramAccountsDb,
-        active: Arc<AtomicBool>,
+        connected: Arc<AtomicBool>,
         rpc_slot: Arc<AtomicU64>,
         config: Arc<Config>,
     ) -> Addr<Self> {
@@ -249,7 +249,7 @@ impl AccountUpdateManager {
             program_accounts: program_accounts.clone(),
             purge_queue: None,
             additional_keys: HashMap::default(),
-            active,
+            connected,
             rpc_slot,
             last_received_at: Instant::now(),
             buffer: BytesMut::new(),
@@ -668,18 +668,20 @@ impl AccountUpdateManager {
     }
 
     fn update_status(&self) {
-        let is_active = self.id_to_sub.len() == self.subs.len() && self.connection.is_connected();
-        self.active.store(is_active, Ordering::Relaxed);
+        let connected = self.connection.is_connected();
+        let active = self.id_to_sub.len() == self.subs.len() && connected;
+
+        self.connected.store(connected, Ordering::Relaxed);
 
         metrics()
             .websocket_connected
             .with_label_values(&[&self.actor_name])
-            .set(if self.connection.is_connected() { 1 } else { 0 });
+            .set(if connected { 1 } else { 0 });
 
         metrics()
             .websocket_active
             .with_label_values(&[&self.actor_name])
-            .set(if is_active { 1 } else { 0 });
+            .set(if active { 1 } else { 0 });
     }
 
     fn process_ws_message(
