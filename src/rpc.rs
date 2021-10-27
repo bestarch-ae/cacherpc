@@ -273,6 +273,10 @@ impl State {
         self.accounts.insert(key, data, commitment)
     }
 
+    fn websocket_connected(&self, key: Pubkey) -> bool {
+        self.pubsub.websocket_connected(key)
+    }
+
     fn subscription_active(&self, sub: Subscription, commitment: Commitment) -> SubscriptionActive {
         self.pubsub.subscription_active(sub, commitment)
     }
@@ -527,11 +531,13 @@ impl Cacheable for GetAccountInfo {
         state.subscription_active(Subscription::Account(self.pubkey), self.commitment())
     }
 
-    fn is_cacheable(&self, _state: &State) -> Result<(), UncacheableReason> {
+    fn is_cacheable(&self, state: &State) -> Result<(), UncacheableReason> {
         if self.config.encoding == Encoding::JsonParsed {
             Err(UncacheableReason::Encoding)
         } else if self.config.data_slice.is_some() {
             Err(UncacheableReason::DataSlice)
+        } else if !state.websocket_connected(self.pubkey) {
+            Err(UncacheableReason::Disconnected)
         } else {
             Ok(())
         }
@@ -651,13 +657,15 @@ impl Cacheable for GetProgramAccounts {
         state.subscription_active(Subscription::Account(self.pubkey), self.commitment())
     }
 
-    fn is_cacheable(&self, _state: &State) -> Result<(), UncacheableReason> {
+    fn is_cacheable(&self, state: &State) -> Result<(), UncacheableReason> {
         if self.config.encoding == Encoding::JsonParsed {
             Err(UncacheableReason::Encoding)
         } else if self.config.data_slice.is_some() {
             Err(UncacheableReason::DataSlice)
         } else if !self.valid_filters {
             Err(UncacheableReason::Filters)
+        } else if !state.websocket_connected(self.pubkey) {
+            Err(UncacheableReason::Disconnected)
         } else {
             Ok(())
         }
@@ -749,6 +757,7 @@ enum UncacheableReason {
     Encoding,
     DataSlice,
     Filters,
+    Disconnected,
 }
 
 impl UncacheableReason {
@@ -757,6 +766,7 @@ impl UncacheableReason {
             Self::Encoding => "encoding",
             Self::DataSlice => "data_slice",
             Self::Filters => "bad_filters",
+            Self::Disconnected => "websocket_disconnected",
         }
     }
 
@@ -764,7 +774,7 @@ impl UncacheableReason {
     fn can_use_cache(&self) -> bool {
         match self {
             Self::Encoding | Self::DataSlice => true,
-            Self::Filters => false,
+            Self::Filters | Self::Disconnected => false,
         }
     }
 }
