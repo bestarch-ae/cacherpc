@@ -277,6 +277,7 @@ impl State {
         self.pubsub.websocket_connected(key)
     }
 
+    // owner is the subscription for program, if given account belongs to one
     fn subscription_active(&self, sub: Subscription, commitment: Commitment) -> SubscriptionActive {
         self.pubsub.subscription_active(sub, commitment)
     }
