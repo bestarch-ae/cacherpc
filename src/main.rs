@@ -13,8 +13,9 @@ use actix_web::{guard, web, App, HttpServer};
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use awc::Client;
+use cache_rpc::types::SemaphoreQueue;
 use lru::LruCache;
-use tokio::sync::{watch, Notify, Semaphore};
+use tokio::sync::{watch, Notify};
 use tracing::info;
 
 pub use cache_rpc::{cli, metrics, pubsub, rpc, types};
@@ -134,10 +135,14 @@ async fn run(options: cli::Options) -> Result<()> {
 
     let rpc_url = options.rpc_url;
     let notify = Arc::new(Notify::new());
-    let account_info_request_limit =
-        Arc::new(Semaphore::new(config.rpc.request_limits.account_info));
-    let program_accounts_request_limit =
-        Arc::new(Semaphore::new(config.rpc.request_limits.program_accounts));
+    let account_info_request_limit = Arc::new(SemaphoreQueue::new(
+        config.rpc.request_queue_size.account_info,
+        config.rpc.request_limits.account_info,
+    ));
+    let program_accounts_request_limit = Arc::new(SemaphoreQueue::new(
+        config.rpc.request_queue_size.program_accounts,
+        config.rpc.request_limits.program_accounts,
+    ));
     let total_connection_limit =
         2 * (config.rpc.request_limits.account_info + config.rpc.request_limits.program_accounts);
     let body_cache_size = options.body_cache_size;

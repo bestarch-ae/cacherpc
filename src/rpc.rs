@@ -23,7 +23,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::value::{to_raw_value, RawValue};
 use smallvec::SmallVec;
 use thiserror::Error;
-use tokio::sync::{watch, Notify, Semaphore};
+use tokio::sync::{watch, Notify};
 use tracing::{debug, error, info, warn};
 
 use crate::filter::{Filter, Filters};
@@ -31,7 +31,7 @@ use crate::metrics::rpc_metrics as metrics;
 use crate::pubsub::{PubSubManager, Subscription};
 use crate::types::{
     AccountContext, AccountData, AccountInfo, AccountState, AccountsDb, BytesChain, Commitment,
-    Encoding, ProgramAccountsDb, Pubkey, Slot, SolanaContext,
+    Encoding, ProgramAccountsDb, Pubkey, SemaphoreQueue, Slot, SolanaContext,
 };
 
 #[cfg(feature = "jsonparsed")]
@@ -256,8 +256,8 @@ pub struct State {
     pub pubsub: PubSubManager,
     pub rpc_url: String,
     pub map_updated: Arc<Notify>,
-    pub account_info_request_limit: Arc<Semaphore>,
-    pub program_accounts_request_limit: Arc<Semaphore>,
+    pub account_info_request_limit: Arc<SemaphoreQueue>,
+    pub program_accounts_request_limit: Arc<SemaphoreQueue>,
     pub config: Arc<ArcSwap<Config>>,
     pub config_watch: RefCell<watch::Receiver<Config>>,
     pub waf_watch: RefCell<watch::Receiver<()>>,
@@ -339,14 +339,13 @@ impl State {
         self.pubsub.subscribe(sub.kind, sub.commitment, sub.filters);
     }
 
-    async fn request<T>(
+    // clippy incorrectly assumes that lifetimes can be elided
+    #[allow(clippy::needless_lifetimes)]
+    async fn request<'a, T>(
         &self,
-        req: &Request<'_, T>,
-        limit: &Semaphore,
-    ) -> Result<
-        impl Stream<Item = Result<Bytes, awc::error::PayloadError>>,
-        awc::error::SendRequestError,
-    >
+        req: &Request<'a, T>,
+        limit: &SemaphoreQueue,
+    ) -> Result<impl Stream<Item = Result<Bytes, awc::error::PayloadError>>, Error<'a>>
     where
         T: Serialize + Debug + ?Sized,
     {
@@ -358,7 +357,17 @@ impl State {
                 .with_label_values(&[req.method])
                 .start_timer();
 
-            let _permit = limit.acquire().await;
+            let _permit = match limit.acquire().await {
+                Some(permit) => permit, // on success will move out of wait queue
+                None => {
+                    warn!(?req, "wait queue on request type has been filled up");
+                    return Err(Error::Internal(
+                        Some(req.id.clone()),
+                        Cow::from("Wait limit for RPC requests has been exhausted"),
+                    ));
+                }
+            };
+
             metrics()
                 .available_permits
                 .with_label_values(&[req.method])
@@ -384,8 +393,8 @@ impl State {
                         tokio::time::sleep(duration).await;
                     }
                     None => {
-                        warn!("request: {:?} error: {:?}", req, err);
-                        break Err(awc::error::SendRequestError::Timeout);
+                        warn!(?req, error=%err, "reporting gateway timeout");
+                        break Err(Error::Timeout(req.id.clone()));
                     }
                 },
             }
@@ -434,11 +443,7 @@ impl State {
             let notified = self.map_updated.notified();
             tokio::select! {
                 body = &mut wait_for_response => {
-                    break body.map_err(|err| {
-                        // TODO: return proper error
-                        info!(%request, ?raw_request.id, error=%err, "reporting gateway timeout");
-                        Error::Timeout(raw_request.id.clone())
-                    })?;
+                    break body?;
                 }
                 _ = notified, if can_use_cache => {
                     if let Some(data) = request.get_from_cache(&raw_request.id, &self) {
@@ -514,7 +519,7 @@ trait Cacheable: Sized + 'static {
     type ResponseData: DeserializeOwned;
 
     fn parse<'a>(request: &Request<'a, RawValue>) -> Result<Self, Error<'a>>;
-    fn get_limit(state: &State) -> &Semaphore;
+    fn get_limit(state: &State) -> &SemaphoreQueue;
 
     fn is_cacheable(&self, state: &State) -> Result<(), UncacheableReason>;
     fn get_from_cache<'a>(&self, id: &Id<'a>, state: &State) -> Option<CacheResult<'a>>;
@@ -577,7 +582,7 @@ impl Cacheable for GetAccountInfo {
         Ok(this)
     }
 
-    fn get_limit(state: &State) -> &Semaphore {
+    fn get_limit(state: &State) -> &SemaphoreQueue {
         state.account_info_request_limit.as_ref()
     }
 
@@ -699,7 +704,7 @@ impl Cacheable for GetProgramAccounts {
         })
     }
 
-    fn get_limit(state: &State) -> &Semaphore {
+    fn get_limit(state: &State) -> &SemaphoreQueue {
         state.program_accounts_request_limit.as_ref()
     }
 
@@ -1697,9 +1702,16 @@ pub struct RequestLimits {
     pub program_accounts: usize,
 }
 
+#[derive(Debug, Copy, Clone, Deserialize, PartialEq, Eq)]
+pub struct RequestQueueSize {
+    pub account_info: usize,
+    pub program_accounts: usize,
+}
+
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub request_limits: RequestLimits,
+    pub request_queue_size: RequestQueueSize,
     #[serde(default)]
     pub ignore_base58_limit: bool,
 }
@@ -1712,33 +1724,35 @@ pub async fn apply_config(app_state: &web::Data<State>, new_config: Config) {
     }
 
     let current_limits = current_config.request_limits;
+    let current_queue_size = current_config.request_queue_size;
+
     let new_limits = new_config.request_limits;
+    let new_queue_size = new_config.request_queue_size;
 
     app_state.config.store(Arc::new(new_config.clone()));
 
-    async fn apply_limit(old_limit: usize, new_limit: usize, semaphore: &Semaphore) {
-        if new_limit > old_limit {
-            semaphore.add_permits(new_limit - old_limit);
-        } else {
-            for _ in 0..old_limit - new_limit {
-                let _ = semaphore.acquire().await.map(|perm| perm.forget());
-            }
-        }
-    }
+    app_state
+        .account_info_request_limit
+        .apply_limit(current_limits.account_info, new_limits.account_info)
+        .await;
 
-    apply_limit(
-        current_limits.account_info,
-        new_limits.account_info,
-        &app_state.account_info_request_limit,
-    )
-    .await;
+    app_state
+        .program_accounts_request_limit
+        .apply_limit(current_limits.program_accounts, new_limits.program_accounts)
+        .await;
 
-    apply_limit(
-        current_limits.program_accounts,
-        new_limits.program_accounts,
-        &app_state.program_accounts_request_limit,
-    )
-    .await;
+    app_state
+        .account_info_request_limit
+        .apply_queue_size(current_queue_size.account_info, new_queue_size.account_info)
+        .await;
+
+    app_state
+        .program_accounts_request_limit
+        .apply_queue_size(
+            current_queue_size.program_accounts,
+            new_queue_size.program_accounts,
+        )
+        .await;
 
     let available_accounts = &app_state.account_info_request_limit.available_permits();
     let available_programs = &app_state.program_accounts_request_limit.available_permits();
