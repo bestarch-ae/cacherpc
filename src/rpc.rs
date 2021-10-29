@@ -278,6 +278,10 @@ impl State {
         self.pubsub.subscription_active(key)
     }
 
+    fn is_caching_allowed(&self) -> bool {
+        self.pubsub.can_subscribe()
+    }
+
     fn subscribe(&self, sub: SubDescriptor) {
         self.pubsub.subscribe(sub.kind, sub.commitment, sub.filters);
     }
@@ -438,8 +442,8 @@ impl State {
 
                 match resp {
                     Ok(Response::Result(data)) => {
-                        debug!(%request, "cached for key");
-                        if request.put_into_cache(&this, data) {
+                        if this.is_caching_allowed() && request.put_into_cache(&this, data) {
+                            debug!(%request, "cached for key");
                             this.map_updated.notify();
                             this.subscribe(request.sub_descriptor());
                         }

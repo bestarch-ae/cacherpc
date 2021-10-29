@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::fs::File;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -176,7 +176,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-#[derive(serde::Deserialize, Debug, Clone)]
+#[derive(serde::Deserialize, Debug)]
 struct Config {
     rpc: rpc::Config,
 }
@@ -204,8 +204,17 @@ impl Config {
     }
 }
 
+use tokio::signal::unix::{signal, SignalKind};
+
+async fn listen_for_subscription_limit(subscriptions_allowed: Arc<AtomicBool>) {
+    let mut stream =
+        signal(SignalKind::user_defined1()).expect("failed to register signal handler for USR1");
+    while stream.recv().await.is_some() {
+        subscriptions_allowed.fetch_xor(true, Ordering::Relaxed);
+    }
+}
+
 async fn config_read_loop(path: PathBuf, rpc: watch::Sender<rpc::Config>) {
-    use tokio::signal::unix::{signal, SignalKind};
     let mut stream = signal(SignalKind::hangup()).expect("failed to register signal handler");
 
     while stream.recv().await.is_some() {
@@ -253,17 +262,6 @@ async fn run(options: Options) -> Result<()> {
         Client::default(),
         rpc_slot.clone(),
     );
-    let pubsub = PubSubManager::init(
-        options.websocket_connections,
-        accounts.clone(),
-        program_accounts.clone(),
-        rpc_slot.clone(),
-        pubsub::Config {
-            websocket_url: options.ws_url.to_owned(),
-            ttl: options.time_to_live,
-            slot_distance: options.slot_distance,
-        },
-    );
 
     let config_file = options
         .config
@@ -274,6 +272,22 @@ async fn run(options: Options) -> Result<()> {
         .map(Config::from_file)
         .transpose()?
         .unwrap_or_else(|| Config::from_options(&options));
+
+    info!(?config, "config");
+
+    let subscriptions_allowed = Arc::new(AtomicBool::new(true));
+    let pubsub = PubSubManager::init(
+        options.websocket_connections,
+        accounts.clone(),
+        program_accounts.clone(),
+        rpc_slot.clone(),
+        pubsub::WorkerConfig {
+            websocket_url: options.ws_url.to_owned(),
+            ttl: options.time_to_live,
+            slot_distance: options.slot_distance,
+        },
+        Arc::clone(&subscriptions_allowed),
+    );
 
     let rules = options
         .rules
@@ -293,12 +307,13 @@ async fn run(options: Options) -> Result<()> {
     let worker_id_counter = Arc::new(AtomicUsize::new(0));
     let bind_addr = &options.addr;
 
-    info!(?config, "config");
-    let (sender, receiver) = watch::channel(config.rpc.clone());
+    let (rpc_tx, rpc_rx) = watch::channel(config.rpc.clone());
 
     if let Some(path) = options.config {
-        actix::spawn(config_read_loop(path, sender));
+        actix::spawn(config_read_loop(path, rpc_tx));
     }
+    // register a listener for toggling a flag to prevent new subscriptions
+    actix::spawn(listen_for_subscription_limit(subscriptions_allowed));
 
     let rpc_config = Arc::new(ArcSwap::from(Arc::new(config.rpc)));
 
@@ -323,7 +338,7 @@ async fn run(options: Options) -> Result<()> {
             map_updated: notify.clone(),
             account_info_request_limit: account_info_request_limit.clone(),
             program_accounts_request_limit: program_accounts_request_limit.clone(),
-            config_watch: RefCell::new(receiver.clone()),
+            config_watch: RefCell::new(rpc_rx.clone()),
             config: rpc_config.clone(),
             lru: RefCell::new(LruCache::new(body_cache_size)),
             worker_id: {
