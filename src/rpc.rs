@@ -334,30 +334,6 @@ impl State {
         self: Arc<Self>,
         raw_request: Request<'_, RawValue>,
     ) -> CacheResult<'_> {
-        if let Some(lua) = &self.lua {
-            let res = lua.scope(|scope| {
-                lua.globals()
-                    .set("request", scope.create_nonstatic_userdata(&raw_request)?)?;
-                lua.load("require 'waf'.request(request)")
-                    .eval::<(bool, String)>()
-            });
-
-            let (ok, err) = match res {
-                Ok(tuple) => tuple,
-                Err(e) => {
-                    tracing::error!(%e, "Error occured during WAF rules evaluation");
-                    return Err(Error::Internal(
-                        Some(raw_request.id.clone()),
-                        Cow::from("WAF internal error"),
-                    ));
-                }
-            };
-            if !ok {
-                metrics().waf_rejections.inc();
-                return Err(Error::WAFRejection(Some(raw_request.id.clone()), err));
-            }
-        }
-
         let request = T::parse(&raw_request)?;
         let (is_cacheable, can_use_cache) = match request
             .is_cacheable(&self)
@@ -1459,8 +1435,33 @@ pub async fn rpc_handler(
 
     // if request contains only one query, try to serve it from cache
     if let OneOrMany::One(req) = req {
+        id = req.id.clone();
+
+        if let Some(lua) = &app_state.lua {
+            let res = lua.scope(|scope| {
+                lua.globals()
+                    .set("request", scope.create_nonstatic_userdata(&req)?)?;
+                lua.load("require 'waf'.request(request)")
+                    .eval::<(bool, String)>()
+            });
+
+            let (ok, err) = match res {
+                Ok(tuple) => tuple,
+                Err(e) => {
+                    tracing::error!(%e, "Error occured during WAF rules evaluation");
+                    return Ok(
+                        Error::Internal(Some(id), Cow::from("WAF internal error")).error_response()
+                    );
+                }
+            };
+            if !ok {
+                info!(%err, "Request was rejected due to WAF rule violation");
+                metrics().waf_rejections.inc();
+                return Ok(Error::WAFRejection(Some(id), err).error_response());
+            }
+        }
         if req.jsonrpc != "2.0" {
-            return Ok(Error::InvalidRequest(Some(req.id), None).error_response());
+            return Ok(Error::InvalidRequest(Some(id), None).error_response());
         }
 
         macro_rules! observe {
@@ -1489,7 +1490,6 @@ pub async fn rpc_handler(
             }
             method => {
                 metrics().request_types(method).inc();
-                id = req.id;
             }
         }
     } else {
