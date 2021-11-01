@@ -97,7 +97,13 @@ impl RpcMonitor {
             .send_json(&request)
             .await
             .map_err(|err| anyhow::Error::msg(err.to_string()))?;
-        let resp = resp.json::<Flatten<Response<Resp>>>().await?;
+        let resp = match resp.json::<Flatten<Response<Resp>>>().await {
+            Ok(res) => res,
+            Err(e) => {
+                warn!(?resp, "Failed to parse JSON reponse");
+                return Err(anyhow::Error::from(e));
+            }
+        };
         match resp.inner {
             Response::Result(resp) => Ok(resp),
             Response::Error(err) => {

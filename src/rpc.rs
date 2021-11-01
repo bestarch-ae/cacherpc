@@ -838,7 +838,7 @@ pub struct RpcErrorOwned {
     code: i64,
     message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    data: Option<Box<RawValue>>,
+    data: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
