@@ -74,14 +74,17 @@ type WsSink = SinkWrite<
     >,
 >;
 
-pub struct Config {
+pub struct WorkerConfig {
     pub ttl: Duration,      // time to live
     pub slot_distance: u32, // slot distance
     pub websocket_url: String,
 }
 
 #[derive(Clone)]
-pub struct PubSubManager(Vec<(actix::Addr<AccountUpdateManager>, Arc<AtomicBool>)>);
+pub struct PubSubManager {
+    workers: Vec<(actix::Addr<AccountUpdateManager>, Arc<AtomicBool>)>,
+    subscriptions_allowed: Arc<AtomicBool>,
+}
 
 impl PubSubManager {
     pub fn init(
@@ -89,10 +92,11 @@ impl PubSubManager {
         accounts: AccountsDb,
         program_accounts: ProgramAccountsDb,
         rpc_slot: Arc<AtomicU64>,
-        config: Config,
+        worker_config: WorkerConfig,
+        subscriptions_allowed: Arc<AtomicBool>,
     ) -> Self {
-        let mut addrs = Vec::new();
-        let config = Arc::new(config);
+        let mut workers = Vec::new();
+        let config = Arc::new(worker_config);
         for id in 0..connections {
             let active = Arc::new(AtomicBool::new(false));
             let addr = AccountUpdateManager::init(
@@ -103,9 +107,12 @@ impl PubSubManager {
                 rpc_slot.clone(),
                 Arc::clone(&config),
             );
-            addrs.push((addr, active))
+            workers.push((addr, active))
         }
-        PubSubManager(addrs)
+        PubSubManager {
+            workers,
+            subscriptions_allowed,
+        }
     }
 
     fn get_idx_by_key(&self, key: Pubkey) -> usize {
@@ -115,22 +122,27 @@ impl PubSubManager {
         let mut hasher = DefaultHasher::new();
         key.hash(&mut hasher);
         let hash = hasher.finish();
-        (hash % self.0.len() as u64) as usize
+        (hash % self.workers.len() as u64) as usize
     }
 
     fn get_addr_by_key(&self, key: Pubkey) -> actix::Addr<AccountUpdateManager> {
         let idx = self.get_idx_by_key(key);
-        self.0[idx].0.clone()
+        self.workers[idx].0.clone()
     }
 
     pub fn subscription_active(&self, key: Pubkey) -> bool {
         let idx = self.get_idx_by_key(key);
-        self.0[idx].1.load(Ordering::Relaxed)
+        self.workers[idx].1.load(Ordering::Relaxed)
     }
 
     pub fn reset(&self, sub: Subscription, commitment: Commitment, filters: Option<Filters>) {
         let addr = self.get_addr_by_key(sub.key());
         addr.do_send(AccountCommand::Reset(sub, commitment, filters))
+    }
+
+    #[inline]
+    pub fn can_subscribe(&self) -> bool {
+        self.subscriptions_allowed.load(Ordering::Relaxed)
     }
 
     pub fn subscribe(&self, sub: Subscription, commitment: Commitment, filters: Option<Filters>) {
@@ -178,7 +190,7 @@ pub struct AccountUpdateManager {
     active: Arc<AtomicBool>,
     rpc_slot: Arc<AtomicU64>,
     buffer: BytesMut,
-    config: Arc<Config>,
+    config: Arc<WorkerConfig>,
 }
 
 impl std::fmt::Debug for AccountUpdateManager {
@@ -194,7 +206,7 @@ impl AccountUpdateManager {
         program_accounts: ProgramAccountsDb,
         active: Arc<AtomicBool>,
         rpc_slot: Arc<AtomicU64>,
-        config: Arc<Config>,
+        config: Arc<WorkerConfig>,
     ) -> Addr<Self> {
         let arbiter = Arbiter::new();
         let actor_name = format!("pubsub-{}", actor_id);
@@ -471,6 +483,7 @@ impl AccountUpdateManager {
         );
         self.subs.insert((sub, commitment), Meta::new());
         self.send(&request)?;
+
         self.purge_queue
             .as_ref()
             .unwrap()
