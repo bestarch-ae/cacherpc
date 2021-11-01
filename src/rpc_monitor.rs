@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use actix::fut::{ActorFuture, WrapFuture};
+use actix::fut::{ActorFutureExt, WrapFuture};
 use actix::prelude::{Actor, Addr, AsyncContext, Context, Handler, Message};
 use awc::Client;
 use serde::Serialize;

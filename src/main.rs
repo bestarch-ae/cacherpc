@@ -222,7 +222,7 @@ async fn config_read_loop(path: PathBuf, rpc: watch::Sender<rpc::Config>) {
             Ok(file) => match Config::from_file(file) {
                 Ok(config) => {
                     info!(?config, "configuration reloaded");
-                    let _ = rpc.broadcast(config.rpc);
+                    let _ = rpc.send(config.rpc);
                 }
                 Err(err) => tracing::error!(error = %err, path = ?path, "error parsing config"),
             },
@@ -326,7 +326,6 @@ async fn run(options: Options) -> Result<()> {
                     .conn_keep_alive(Duration::from_secs(60))
                     .conn_lifetime(Duration::from_secs(600))
                     .limit(total_connection_limit)
-                    .finish(),
             )
             .finish();
         let state = rpc::State {
