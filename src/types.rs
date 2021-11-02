@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use dashmap::mapref::entry::Entry;
 use dashmap::{mapref::one::Ref, DashMap};
 use either::Either;
@@ -615,7 +615,7 @@ pub struct SolanaContext {
 pub struct BytesChain {
     bytes: Vec<Bytes>,
     position: usize,
-    current_reader: Option<bytes::buf::ext::Reader<Bytes>>,
+    current_reader: Option<bytes::buf::Reader<Bytes>>,
 }
 
 impl Default for BytesChain {
@@ -640,7 +640,6 @@ impl BytesChain {
 
 impl std::io::Read for BytesChain {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        use bytes::buf::ext::BufExt;
         loop {
             if self.current_reader.is_none() {
                 if let Some(reader) = self

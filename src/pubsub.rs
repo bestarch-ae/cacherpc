@@ -7,17 +7,18 @@ use std::time::Duration;
 
 use actix::io::SinkWrite;
 use actix::prelude::{
-    Actor, ActorContext, Addr, AsyncContext, Context, Handler, Message, Running, SpawnHandle,
-    StreamHandler, Supervised, Supervisor,
+    Actor, ActorContext, ActorFutureExt, Addr, AsyncContext, Context, Handler, Message, Running,
+    SpawnHandle, Stream, StreamHandler, Supervised, Supervisor,
 };
 use actix::Arbiter;
 use actix_http::ws;
 use bytes::BytesMut;
+use futures_util::stream::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
-use tokio::stream::{Stream, StreamExt};
 use tokio::sync::mpsc;
-use tokio::time::{DelayQueue, Instant};
+use tokio::time::Instant;
+use tokio_util::time::DelayQueue;
 use tracing::{debug, error, info, warn};
 
 use crate::filter::{FilterTree, Filters};
@@ -164,7 +165,7 @@ impl Connection {
 
     fn send(&mut self, msg: ws::Message) -> Result<(), ws::Message> {
         if let Connection::Connected { sink, .. } = self {
-            sink.write(msg).map_or(Ok(()), Err)?;
+            sink.write(msg)?
         }
         Ok(())
     }
@@ -210,7 +211,7 @@ impl AccountUpdateManager {
     ) -> Addr<Self> {
         let arbiter = Arbiter::new();
         let actor_name = format!("pubsub-{}", actor_id);
-        Supervisor::start_in_arbiter(&arbiter, move |_ctx| AccountUpdateManager {
+        Supervisor::start_in_arbiter(&arbiter.handle(), move |_ctx| AccountUpdateManager {
             actor_id,
             actor_name,
             connection: Connection::Disconnected,
@@ -308,9 +309,9 @@ impl AccountUpdateManager {
 
     fn send<T: Serialize>(&mut self, request: &T) -> Result<(), serde_json::Error> {
         if self.connection.is_connected() {
-            let _ = self
-                .connection
-                .send(awc::ws::Message::Text(serde_json::to_string(request)?));
+            let _ = self.connection.send(awc::ws::Message::Text(
+                serde_json::to_string(request)?.into(),
+            ));
         } else {
             warn!(self.actor_id, "not connected");
         }
@@ -318,7 +319,7 @@ impl AccountUpdateManager {
     }
 
     fn connect(&mut self, ctx: &mut Context<Self>) {
-        use actix::fut::{ActorFuture, WrapFuture};
+        use actix::fut::WrapFuture;
         use backoff::backoff::Backoff;
 
         let websocket_url = self.config.websocket_url.clone();
@@ -368,20 +369,20 @@ impl AccountUpdateManager {
                             .websocket_reconnects
                             .with_label_values(&[&actor_name])
                             .inc();
-                        tokio::time::delay_for(delay).await;
+                        tokio::time::sleep(delay).await;
                     }
                 }
             }
         };
         let fut = fut.into_actor(self).map(|conn, actor, ctx| {
-            let (sink, stream) = futures_util::stream::StreamExt::split(conn);
+            let (sink, stream) = StreamExt::split(conn);
             let actor_id = actor.actor_id;
             let mut sink = SinkWrite::new(sink, ctx);
 
             info!(actor_id, message = "websocket sending ping");
             if sink
                 .write(ws::Message::Ping(b"check connection".as_ref().into()))
-                .is_some()
+                .is_err()
             {
                 error!(actor_id, "failed to send check msg");
                 ctx.stop();
@@ -394,7 +395,7 @@ impl AccountUpdateManager {
                 warn!(actor_id, "was connected, should not have happened");
             }
 
-            AccountUpdateManager::add_stream(stream, ctx);
+            ctx.add_stream(stream);
             info!(actor_id, message = "websocket stream added");
             metrics()
                 .websocket_connected
@@ -1122,7 +1123,9 @@ impl StreamHandler<Result<awc::ws::Frame, awc::error::WsProtocolError>> for Acco
                 Frame::Ping(data) => {
                     metrics().bytes_received.with_label_values(&[&self.actor_name]).inc_by(data.len() as u64);
                     if let Connection::Connected { sink, .. } = &mut self.connection {
-                        sink.write(awc::ws::Message::Pong(data));
+                        if sink.write(awc::ws::Message::Pong(data)).is_err() {
+                            warn!("Websocket channel is closed!");
+                        }
                     }
                 }
                 Frame::Pong(_) => {
@@ -1227,7 +1230,7 @@ impl Actor for AccountUpdateManager {
         Self::start_periodic(ctx);
         self.purge_queue = Some(handle);
 
-        AccountUpdateManager::add_stream(purge_stream, ctx);
+        ctx.add_stream(purge_stream);
 
         self.connect(ctx);
     }
@@ -1336,7 +1339,7 @@ fn delay_queue<T: Clone + std::hash::Hash + Eq>(
                 .with_label_values(&[&id])
                 .set(map.len() as i64);
             tokio::select! {
-                item = incoming.next() => {
+                item = incoming.recv() => {
                     if let Some(item) = item {
                         match item {
                             DelayQueueCommand::Insert(item, time) | DelayQueueCommand::Reset(item, time) => {

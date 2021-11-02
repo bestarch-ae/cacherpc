@@ -14,7 +14,7 @@ use awc::Client;
 use backoff::backoff::Backoff;
 use bytes::Bytes;
 use dashmap::mapref::one::Ref;
-use futures_util::stream::Stream;
+use futures_util::stream::{Stream, StreamExt};
 use lru::LruCache;
 use mlua::Lua;
 use prometheus::IntCounter;
@@ -22,7 +22,6 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::value::{to_raw_value, RawValue};
 use smallvec::SmallVec;
 use thiserror::Error;
-use tokio::stream::StreamExt;
 use tokio::sync::{watch, Notify, Semaphore};
 use tracing::{debug, error, info, warn};
 
@@ -323,7 +322,7 @@ impl State {
                 Err(err) => match backoff.next_backoff() {
                     Some(duration) => {
                         metrics().request_retries.inc();
-                        tokio::time::delay_for(duration).await;
+                        tokio::time::sleep(duration).await;
                     }
                     None => {
                         warn!("request: {:?} error: {:?}", req, err);
@@ -396,7 +395,7 @@ impl State {
 
         let mut response = HttpResponse::Ok();
         response
-            .header("x-cache-status", "miss")
+            .append_header(("x-cache-status", "miss"))
             .content_type("application/json");
 
         if is_cacheable {
@@ -420,7 +419,7 @@ impl State {
                     Ok(Response::Result(data)) => {
                         if this.is_caching_allowed() && request.put_into_cache(&this, data) {
                             debug!(%request, "cached for key");
-                            this.map_updated.notify();
+                            this.map_updated.notify_waiters();
                             this.subscribe(request.sub_descriptor());
                         }
                     }
@@ -1110,8 +1109,8 @@ fn account_response<'a, 'b>(
             .observe(body.len() as f64);
 
         return Ok(HttpResponse::Ok()
-            .header("x-cache-status", "hit")
-            .header("x-cache-type", "lru")
+            .append_header(("x-cache-status", "hit"))
+            .append_header(("x-cache-type", "lru"))
             .content_type("application/json")
             .body(body));
     }
@@ -1154,8 +1153,8 @@ fn account_response<'a, 'b>(
         .observe(body.len() as f64);
 
     Ok(HttpResponse::Ok()
-        .header("x-cache-status", "hit")
-        .header("x-cache-type", "data")
+        .append_header(("x-cache-status", "hit"))
+        .append_header(("x-cache-type", "data"))
         .content_type("application/json")
         .body(body))
 }
@@ -1351,8 +1350,8 @@ fn program_accounts_response<'a>(
         .with_label_values(&["getProgramAccounts"])
         .observe(body.len() as f64);
     Ok(HttpResponse::Ok()
-        .header("x-cache-status", "hit")
-        .header("x-cache-type", "data")
+        .append_header(("x-cache-status", "hit"))
+        .append_header(("x-cache-type", "data"))
         .content_type("application/json")
         .body(body))
 }
@@ -1421,17 +1420,17 @@ pub async fn rpc_handler(
     {
         let mut rx = app_state.config_watch.borrow_mut();
 
-        let config = futures_util::future::poll_fn(|ctx| {
-            let fut = rx.recv();
+        let changed = futures_util::future::poll_fn(|ctx| {
+            let fut = rx.changed();
             tokio::pin!(fut);
             match fut.poll(ctx) {
-                Poll::Pending => Poll::Ready(None),
-                whatever => whatever,
+                Poll::Pending => Poll::Ready(false),
+                Poll::Ready(_) => Poll::Ready(true),
             }
         })
         .await;
-        if let Some(config) = config {
-            apply_config(&app_state, config).await;
+        if changed {
+            apply_config(&app_state, rx.borrow().clone()).await;
         }
     }
 
@@ -1502,7 +1501,7 @@ pub async fn rpc_handler(
 
     let client = app_state.client.clone();
     let url = app_state.rpc_url.clone();
-    let mut error = Error::Timeout(id).error_response();
+    let error = Error::Timeout(id).error_response();
 
     let stream = stream_generator::generate_stream(move |mut stream| async move {
         let mut backoff = backoff_settings(30);
@@ -1530,12 +1529,17 @@ pub async fn rpc_handler(
                     match backoff.next_backoff() {
                         Some(duration) => {
                             metrics().request_retries.inc();
-                            tokio::time::delay_for(duration).await;
+                            tokio::time::sleep(duration).await;
                         }
                         None => {
-                            let mut error_stream = error.take_body();
+                            let mut error_stream = error.into_body();
+                            use actix_web::body::MessageBody;
                             warn!("request error: {:?}", err);
-                            while let Some(chunk) = error_stream.next().await {
+                            while let Some(chunk) = futures_util::future::poll_fn(|cx| {
+                                std::pin::Pin::new(&mut error_stream).poll_next(cx)
+                            })
+                            .await
+                            {
                                 stream
                                     .send(chunk.map_err(|_| PayloadError::Incomplete(None))) // should never error
                                     .await;
@@ -1621,7 +1625,7 @@ pub async fn apply_config(app_state: &web::Data<State>, new_config: Config) {
             semaphore.add_permits(new_limit - old_limit);
         } else {
             for _ in 0..old_limit - new_limit {
-                semaphore.acquire().await.forget();
+                let _ = semaphore.acquire().await.map(|perm| perm.forget());
             }
         }
     }
