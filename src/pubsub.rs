@@ -1123,7 +1123,9 @@ impl StreamHandler<Result<awc::ws::Frame, awc::error::WsProtocolError>> for Acco
                 Frame::Ping(data) => {
                     metrics().bytes_received.with_label_values(&[&self.actor_name]).inc_by(data.len() as u64);
                     if let Connection::Connected { sink, .. } = &mut self.connection {
-                        sink.write(awc::ws::Message::Pong(data));
+                        if sink.write(awc::ws::Message::Pong(data)).is_err() {
+                            warn!("Websocket channel is closed!");
+                        }
                     }
                 }
                 Frame::Pong(_) => {

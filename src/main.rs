@@ -371,7 +371,7 @@ async fn run(options: Options) -> Result<()> {
         });
 
         App::new()
-            .data(state)
+            .app_data(web::Data::new(state))
             .wrap(cors)
             .service(
                 web::resource("/")
