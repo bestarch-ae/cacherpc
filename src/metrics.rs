@@ -76,7 +76,7 @@ pub struct PubSubMetrics {
     pub pubsub_slot: IntGaugeVec,
     pub pubsub_program_slot: IntGaugeVec,
     pub pubsub_account_slot: IntGaugeVec,
-    pub websocket_reconnects: IntCounterVec,
+    pub ws_connect_attempt: IntCounterVec,
 }
 
 pub fn pubsub_metrics() -> &'static PubSubMetrics {
@@ -240,9 +240,9 @@ pub fn pubsub_metrics() -> &'static PubSubMetrics {
             &["connection_id"]
         )
         .unwrap(),
-        websocket_reconnects: register_int_counter_vec!(
-            "websocket_reconnects",
-            "attempts to reconnect to websocket",
+        ws_connect_attempt: register_int_counter_vec!(
+            "ws_connect_attempt",
+            "attempts to connect to websocket",
             &["connection_id"]
         )
         .unwrap(),

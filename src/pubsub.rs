@@ -345,6 +345,10 @@ impl AccountUpdateManager {
 
             loop {
                 info!(message = "connecting to websocket", url = %websocket_url, actor_id = %actor_id);
+                metrics()
+                    .ws_connect_attempt
+                    .with_label_values(&[&actor_name])
+                    .inc();
                 let res = awc::Client::builder()
                     .max_http_version(awc::http::Version::HTTP_11)
                     .timeout(Duration::from_secs(5))
@@ -364,10 +368,6 @@ impl AccountUpdateManager {
                             .unwrap_or_else(|| Duration::from_secs(1));
                         error!(message = "failed to connect, waiting", url = %websocket_url,
                                 error = ?err, actor_id = %actor_id, delay = ?delay);
-                        metrics()
-                            .websocket_reconnects
-                            .with_label_values(&[&actor_name])
-                            .inc();
                         tokio::time::delay_for(delay).await;
                     }
                 }
