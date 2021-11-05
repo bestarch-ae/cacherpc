@@ -44,6 +44,7 @@ humantime = "2.1"
 toml = "0.5"
 arc-swap = "1.4"
 mlua = { version = "0.6", features = ["luajit", "vendored"] }
+awc-uds = { version = "0.1.0", git = "https://github.com/polachok/awc-uds.git", rev = "9dafa17"}
 
 solana-account-decoder = { version = "1.8", optional = true }
 solana-sdk = { version =  "1.8", optional = true }
@@ -63,6 +64,8 @@ harness = false
 solana-account-decoder = { git = "https://github.com/polachok/solana", rev = "ec4e167b00b2fd3799b935bb7ca49775f6a4b63e" }
 solana-sdk = { git = "https://github.com/polachok/solana", rev = "ec4e167b00b2fd3799b935bb7ca49775f6a4b63e" }
 solana-program = { git = "https://github.com/polachok/solana", rev = "ec4e167b00b2fd3799b935bb7ca49775f6a4b63e" }
+actix-tls = { version = "3.0.0-beta.7", git = "https://github.com/zubr-exchange/actix-net", rev = "aa7c6db84e1748ba1301a5b9cffc16ebd4f3626e" }
+
 
 #[patch.crates-io]
 #actix-http = { git = "https://github.com/polachok/actix-web", rev = "19cd7fdbd5b79e9d78c8cb562741d7513d980b18" }
