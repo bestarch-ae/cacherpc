@@ -1365,7 +1365,17 @@ fn base58_error(id: Id<'_>) -> Error<'_> {
 
 enum OneOrMany<'a> {
     One(Request<'a, RawValue>),
-    Many(Vec<&'a RawValue>),
+    Many(Vec<Request<'a, RawValue>>),
+}
+
+impl<'a> OneOrMany<'a> {
+    pub fn iter(&self) -> impl Iterator<Item = &Request<'a, RawValue>> {
+        use either::Either;
+        match self {
+            OneOrMany::One(req) => Either::Left(std::iter::once(req)),
+            OneOrMany::Many(reqs) => Either::Right(reqs.iter()),
+        }
+    }
 }
 
 impl<'de> Deserialize<'de> for OneOrMany<'de> {
@@ -1410,11 +1420,39 @@ pub async fn rpc_handler(
     use std::future::Future;
     use std::task::Poll;
 
-    // if request contains subqueries, pass it directly to validator
     let req: OneOrMany<'_> = match serde_json::from_slice(&body) {
         Ok(val) => val,
         Err(_) => return Ok(Error::InvalidRequest(None, Some("Invalid request")).error_response()),
     };
+
+    // run WAF checks on all subquiries in request
+    if let Some(lua) = &app_state.lua {
+        for r in req.iter() {
+            let res = lua.scope(|scope| {
+                lua.globals()
+                    .set("request", scope.create_nonstatic_userdata(r)?)?;
+                lua.load("require 'waf'.request(request)")
+                    .eval::<(bool, String)>()
+            });
+
+            let (ok, err) = match res {
+                Ok(tuple) => tuple,
+                Err(e) => {
+                    tracing::error!(%e, "Error occured during WAF rules evaluation");
+                    return Ok(Error::Internal(
+                        Some(r.id.clone()),
+                        Cow::from("WAF internal error"),
+                    )
+                    .error_response());
+                }
+            };
+            if !ok {
+                info!(%err, "Request was rejected due to WAF rule violation");
+                metrics().waf_rejections.inc();
+                return Ok(Error::WAFRejection(Some(r.id.clone()), err).error_response());
+            }
+        }
+    }
 
     // apply new config (if any) before proceeding
     {
@@ -1440,29 +1478,6 @@ pub async fn rpc_handler(
     if let OneOrMany::One(req) = req {
         id = req.id.clone();
 
-        if let Some(lua) = &app_state.lua {
-            let res = lua.scope(|scope| {
-                lua.globals()
-                    .set("request", scope.create_nonstatic_userdata(&req)?)?;
-                lua.load("require 'waf'.request(request)")
-                    .eval::<(bool, String)>()
-            });
-
-            let (ok, err) = match res {
-                Ok(tuple) => tuple,
-                Err(e) => {
-                    tracing::error!(%e, "Error occured during WAF rules evaluation");
-                    return Ok(
-                        Error::Internal(Some(id), Cow::from("WAF internal error")).error_response()
-                    );
-                }
-            };
-            if !ok {
-                info!(%err, "Request was rejected due to WAF rule violation");
-                metrics().waf_rejections.inc();
-                return Ok(Error::WAFRejection(Some(id), err).error_response());
-            }
-        }
         if req.jsonrpc != "2.0" {
             return Ok(Error::InvalidRequest(Some(id), None).error_response());
         }
