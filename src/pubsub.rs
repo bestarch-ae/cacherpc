@@ -1089,14 +1089,17 @@ impl Handler<IsSubActive> for AccountUpdateManager {
     type Result = bool;
 
     fn handle(&mut self, item: IsSubActive, _: &mut Context<Self>) -> bool {
-        let owner_sub = item
+        let owner_sub_exists = item
             .owner
             .map(|sub| {
                 self.sub_to_id
                     .contains_key(&(Subscription::Program(sub), item.commitment))
             })
             .unwrap_or(false);
-        self.sub_to_id.contains_key(&(item.sub, item.commitment)) || owner_sub
+        if owner_sub_exists {
+            metrics().subscriptions_skipped.inc();
+        }
+        self.sub_to_id.contains_key(&(item.sub, item.commitment)) || owner_sub_exists
     }
 }
 
