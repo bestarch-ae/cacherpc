@@ -109,8 +109,8 @@ impl Future for SubscriptionActive {
     fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         match self.project() {
             SubscriptionActiveProject::Ready(res) => Poll::Ready(*res),
-            SubscriptionActiveProject::RequestWithOwner(ref mut req) => {
-                match Pin::new(req).poll(cx) {
+            SubscriptionActiveProject::RequestWithOwner(req) => {
+                match req.poll(cx) {
                     Poll::Pending => Poll::Pending,
                     Poll::Ready((Ok(true), _)) => {
                         metrics().subscriptions_skipped.inc(); // owner subscription exists
@@ -121,7 +121,7 @@ impl Future for SubscriptionActive {
                 }
             }
 
-            SubscriptionActiveProject::Request(ref mut req) => match Pin::new(req).poll(cx) {
+            SubscriptionActiveProject::Request(req) => match req.poll(cx) {
                 Poll::Pending => Poll::Pending,
                 Poll::Ready(Ok(value)) => Poll::Ready(value),
                 Poll::Ready(Err(_)) => Poll::Ready(false),
