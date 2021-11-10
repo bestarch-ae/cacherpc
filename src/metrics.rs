@@ -77,6 +77,7 @@ pub struct PubSubMetrics {
     pub pubsub_program_slot: IntGaugeVec,
     pub pubsub_account_slot: IntGaugeVec,
     pub websocket_reconnects: IntCounterVec,
+    pub subscriptions_skipped: IntCounter,
 }
 
 pub fn pubsub_metrics() -> &'static PubSubMetrics {
@@ -244,6 +245,11 @@ pub fn pubsub_metrics() -> &'static PubSubMetrics {
             "websocket_reconnects",
             "attempts to reconnect to websocket",
             &["connection_id"]
+        )
+        .unwrap(),
+        subscriptions_skipped: register_int_counter!(
+            "subscriptions_skipped", 
+            "Number of account subscriptions skipped, due to presence of owner-program subscription"
         )
         .unwrap(),
     });
