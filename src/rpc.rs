@@ -14,7 +14,7 @@ use awc::Client;
 use backoff::backoff::Backoff;
 use bytes::Bytes;
 use dashmap::mapref::one::Ref;
-use futures_util::stream::{Stream, StreamExt};
+use futures_util::stream::{Stream, StreamExt, TryStreamExt};
 use lru::LruCache;
 use mlua::Lua;
 use prometheus::IntCounter;
@@ -416,6 +416,12 @@ impl State {
         response
             .append_header(("x-cache-status", "miss"))
             .content_type("application/json");
+
+        let resp = resp.map_err(|err| {
+            error!(error = %err, "error while streaming response");
+            metrics().streaming_errors.inc();
+            err
+        });
 
         if is_cacheable {
             let this = Arc::clone(&self);
@@ -1604,7 +1610,13 @@ pub async fn rpc_handler(
                 .post(&url)
                 .content_type("application/json")
                 .send_body(body.clone())
-                .await;
+                .await
+                .map_err(|err| {
+                    error!(error = %err, "error while streaming response");
+                    metrics().streaming_errors.inc();
+                    err
+                });
+
             request_time.observe_duration();
             match resp {
                 Ok(mut resp) => {
