@@ -93,7 +93,7 @@ pub struct PubSubManager {
     subscriptions_allowed: Arc<AtomicBool>,
 }
 
-type IsSubActiveRequest = actix::prelude::Request<AccountUpdateManager, IsSubActive>;
+type IsSubActiveRequest = Pin<Box<actix::prelude::Request<AccountUpdateManager, IsSubActive>>>;
 pub enum SubscriptionActive {
     Ready(bool),
     RequestWithOwner(Join<IsSubActiveRequest, IsSubActiveRequest>),
@@ -104,29 +104,24 @@ impl Future for SubscriptionActive {
     type Output = bool;
 
     fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
-        let mut inner = unsafe { Pin::into_inner_unchecked(self) };
+        let mut inner = Pin::into_inner(self);
         match &mut inner {
             SubscriptionActive::Ready(res) => Poll::Ready(*res),
-            SubscriptionActive::RequestWithOwner(ref mut req) => {
-                match unsafe { Pin::new_unchecked(req) }.poll(cx) {
-                    Poll::Pending => Poll::Pending,
-                    Poll::Ready((Ok(owner_sub_exists), Ok(sub_exists))) => {
-                        if owner_sub_exists {
-                            metrics().subscriptions_skipped.inc();
-                        }
-                        Poll::Ready(owner_sub_exists || sub_exists)
-                    }
-                    _ => Poll::Ready(false),
+            SubscriptionActive::RequestWithOwner(ref mut req) => match Pin::new(req).poll(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready((Ok(true), _)) => {
+                    metrics().subscriptions_skipped.inc(); // owner subscription exists
+                    Poll::Ready(true)
                 }
-            }
+                Poll::Ready((_, Ok(true))) => Poll::Ready(true),
+                Poll::Ready(_) => Poll::Ready(false),
+            },
 
-            SubscriptionActive::Request(ref mut req) => {
-                match unsafe { Pin::new_unchecked(req) }.poll(cx) {
-                    Poll::Pending => Poll::Pending,
-                    Poll::Ready(Ok(value)) => Poll::Ready(value),
-                    Poll::Ready(Err(_)) => Poll::Ready(false),
-                }
-            }
+            SubscriptionActive::Request(ref mut req) => match Pin::new(req).poll(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Ok(value)) => Poll::Ready(value),
+                Poll::Ready(Err(_)) => Poll::Ready(false),
+            },
         }
     }
 }
@@ -193,15 +188,17 @@ impl PubSubManager {
                 .map(|key| (self.get_addr_by_key(key), key))
                 .map(|(owner_addr, key)| {
                     SubscriptionActive::RequestWithOwner(join(
-                        owner_addr.send(IsSubActive {
+                        Box::pin(owner_addr.send(IsSubActive {
                             sub: Subscription::Program(key),
                             commitment,
-                        }),
-                        addr.send(IsSubActive { sub, commitment }),
+                        })),
+                        Box::pin(addr.send(IsSubActive { sub, commitment })),
                     ))
                 })
                 .unwrap_or_else(|| {
-                    SubscriptionActive::Request(addr.send(IsSubActive { sub, commitment }))
+                    SubscriptionActive::Request(Box::pin(
+                        addr.send(IsSubActive { sub, commitment }),
+                    ))
                 })
         } else {
             SubscriptionActive::Ready(false)
@@ -1394,7 +1391,6 @@ pub enum AccountCommand {
 pub struct IsSubActive {
     sub: Subscription,
     commitment: Commitment,
-    //owner: Option<Pubkey>,
 }
 
 enum DelayQueueCommand<T> {
