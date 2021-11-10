@@ -45,9 +45,9 @@ toml = "0.5"
 arc-swap = "1.4"
 mlua = { version = "0.6", features = ["luajit", "vendored"] }
 
-solana-account-decoder = { version = "1.8", optional = true }
-solana-sdk = { version =  "1.8", optional = true }
-solana-program = { version = "1.8", optional = true }
+solana-account-decoder = { version = "=1.8.2", optional = true }
+solana-sdk = { version =  "=1.8.2", optional = true }
+solana-program = { version = "=1.8.2", optional = true }
 spl-token-v2-0 = { package = "spl-token", version = "=3.2.0", features = ["no-entrypoint"], optional = true}
 
 [dev-dependencies]
