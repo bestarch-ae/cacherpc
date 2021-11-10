@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use structopt::StructOpt;
 
-use crate::rpc;
+use crate::{control, rpc};
 
 #[derive(Debug, StructOpt)]
 #[structopt(about = "Solana RPC cache server")]
@@ -96,6 +96,12 @@ pub struct Options {
         help = "web application firewall rules, to filter out specific requests"
     )]
     pub rules: Option<PathBuf>,
+    #[structopt(
+        long = "control-socket-path",
+        help = "path to socket file, e.g. /run/cacherpc.sock",
+        default_value = control::CACHER_SOCKET_DEFAULT
+    )]
+    pub control_socket_path: PathBuf,
 }
 
 #[derive(Debug)]
@@ -117,6 +123,7 @@ impl Command {
             Self::Subscriptions { state } => match state {
                 SubscriptionsState::On => "subscriptions/on",
                 SubscriptionsState::Off => "subscriptions/off",
+                SubscriptionsState::Status => "subscriptions/status",
             },
         }
     }
@@ -126,6 +133,7 @@ impl Command {
 pub enum SubscriptionsState {
     On,
     Off,
+    Status,
 }
 
 #[derive(thiserror::Error, Debug)]

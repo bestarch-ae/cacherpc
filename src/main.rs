@@ -1,8 +1,7 @@
-use cache_rpc::control_interface::{
-    handle_command, run_control_interface, ControlState, RpcConfigSender,
-};
+use cache_rpc::control::{handle_command, run_control_interface, ControlState, RpcConfigSender};
 use either::Either;
 use std::cell::RefCell;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,7 +19,7 @@ use tracing::info;
 
 use mlua::{Lua, LuaOptions, StdLib};
 
-pub use cache_rpc::{cli_options, metrics, pubsub, rpc, types};
+pub use cache_rpc::{cli, metrics, pubsub, rpc, types};
 
 use pubsub::PubSubManager;
 use types::{AccountsDb, ProgramAccountsDb};
@@ -29,12 +28,12 @@ const LUA_JSON: &str = include_str!("json.lua");
 
 #[actix_web::main]
 async fn main() -> Result<()> {
-    let options = cli_options::Options::from_args();
+    let options = cli::Options::from_args();
     // If command was passed during application startup, then it becomes a client, and tries to
     // execute the command againts other, already running application instance
     if let Some(ref cmd) = options.command {
         let mut exit_code = 0;
-        if let Err(e) = handle_command(cmd).await {
+        if let Err(e) = handle_command(cmd, options.control_socket_path).await {
             eprintln!("Command processing error: {}", e);
             exit_code = 1;
         };
@@ -50,7 +49,7 @@ async fn main() -> Result<()> {
     let (writer, _guard) = tracing_appender::non_blocking(writer);
 
     match options.log_format {
-        cli_options::LogFormat::Json => {
+        cli::LogFormat::Json => {
             let subscriber = fmt::Subscriber::builder()
                 .with_thread_names(true)
                 .with_writer(writer)
@@ -59,7 +58,7 @@ async fn main() -> Result<()> {
                 .finish();
             tracing::subscriber::set_global_default(subscriber).unwrap();
         }
-        cli_options::LogFormat::Plain => {
+        cli::LogFormat::Plain => {
             let subscriber = fmt::Subscriber::builder().with_writer(writer).finish();
             tracing::subscriber::set_global_default(subscriber).unwrap();
         }
@@ -93,7 +92,27 @@ fn lua(rules: &str) -> Result<Lua, mlua::Error> {
     Ok(lua)
 }
 
-async fn run(options: cli_options::Options) -> Result<()> {
+async fn config_read_loop(path: PathBuf, rpc: Arc<watch::Sender<rpc::Config>>) {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut stream = signal(SignalKind::hangup()).expect("failed to register signal handler");
+
+    while stream.recv().await.is_some() {
+        match std::fs::File::open(&path) {
+            Ok(file) => match cli::Config::from_file(file) {
+                Ok(config) => {
+                    info!(?config, "configuration reloaded");
+                    let _ = rpc.send(config.rpc);
+                }
+                Err(err) => tracing::error!(error = %err, path = ?path, "error parsing config"),
+            },
+            Err(err) => {
+                tracing::error!(path = ?path, error = %err, "failed to open config");
+            }
+        }
+    }
+}
+
+async fn run(options: cli::Options) -> Result<()> {
     let accounts = AccountsDb::new();
     let program_accounts = ProgramAccountsDb::new();
 
@@ -110,9 +129,9 @@ async fn run(options: cli_options::Options) -> Result<()> {
         .map(std::fs::File::open)
         .transpose()?;
     let config = config_file
-        .map(cli_options::Config::from_file)
+        .map(cli::Config::from_file)
         .transpose()?
-        .unwrap_or_else(|| cli_options::Config::from_options(&options));
+        .unwrap_or_else(|| cli::Config::from_options(&options));
 
     info!(?config, "config");
 
@@ -150,11 +169,19 @@ async fn run(options: cli_options::Options) -> Result<()> {
 
     let (rpc_tx, rpc_rx) = watch::channel(config.rpc.clone());
 
-    let rpc_config_sender = options
-        .config
-        .map(|path| RpcConfigSender::new(rpc_tx, path));
+    let mut rpc_config_sender = None;
 
-    let control_state = ControlState::new(subscriptions_allowed, rpc_config_sender);
+    if let Some(path) = options.config {
+        let rpc_tx = Arc::new(rpc_tx);
+        actix::spawn(config_read_loop(path.clone(), Arc::clone(&rpc_tx)));
+        rpc_config_sender = Some(RpcConfigSender::new(rpc_tx, path));
+    }
+
+    let control_state = ControlState::new(
+        subscriptions_allowed,
+        rpc_config_sender,
+        options.control_socket_path,
+    );
 
     actix::spawn(run_control_interface(control_state));
 

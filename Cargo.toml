@@ -44,7 +44,7 @@ humantime = "2.1"
 toml = "0.5"
 arc-swap = "1.4"
 mlua = { version = "0.6", features = ["luajit", "vendored"] }
-awc-uds = { version = "0.1.0", git = "https://github.com/polachok/awc-uds.git", rev = "9dafa17"}
+awc-uds = { version = "0.1.0", git = "https://github.com/polachok/awc-uds.git", rev = "29c9bd2"}
 
 solana-account-decoder = { version = "1.8", optional = true }
 solana-sdk = { version =  "1.8", optional = true }

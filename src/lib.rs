@@ -1,5 +1,5 @@
-pub mod cli_options;
-pub mod control_interface;
+pub mod cli;
+pub mod control;
 pub mod filter;
 pub mod metrics;
 pub mod pubsub;

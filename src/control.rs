@@ -5,28 +5,29 @@ use std::{
 
 use actix_http::{body::AnyBody, StatusCode};
 use actix_web::{post, web, web::Data, App, HttpResponse, HttpServer, ResponseError};
-use bytes::Bytes;
 use serde::Deserialize;
 use tokio::sync::watch::Sender;
 use tracing::{info, warn};
 
 use crate::{
-    cli_options::{Command, Config},
+    cli::{Command, Config},
     rpc,
 };
 
-pub const CACHER_SOCKET: &str = "/tmp/cacher.sock";
+pub const CACHER_SOCKET_DEFAULT: &str = "/run/cacherpc.sock";
 
 #[derive(Clone)]
 pub struct ControlState {
     rpc_config_sender: Option<RpcConfigSender>,
     subscriptions_allowed: Arc<AtomicBool>,
+    socket_path: PathBuf,
 }
 
 impl ControlState {
     pub fn new(
         subscriptions_allowed: Arc<AtomicBool>,
         rpc_config_sender: Option<RpcConfigSender>,
+        socket_path: PathBuf,
     ) -> Self {
         if rpc_config_sender.is_none() {
             warn!("No configuration file was set up");
@@ -34,6 +35,7 @@ impl ControlState {
         ControlState {
             rpc_config_sender,
             subscriptions_allowed,
+            socket_path,
         }
     }
 }
@@ -45,24 +47,23 @@ pub struct RpcConfigSender {
 }
 
 impl RpcConfigSender {
-    pub fn new(tx: Sender<rpc::Config>, path: PathBuf) -> Self {
-        RpcConfigSender {
-            tx: Arc::new(tx),
-            path,
-        }
+    pub fn new(tx: Arc<Sender<rpc::Config>>, path: PathBuf) -> Self {
+        RpcConfigSender { tx, path }
     }
 }
 
 pub async fn run_control_interface(state: ControlState) {
     info!("Starting control interface");
+    let state_clone = state.clone();
     HttpServer::new(move || {
         App::new()
-            .app_data(Data::new(state.clone()))
+            .app_data(Data::new(state_clone.clone()))
             .service(subscriptions_setter)
+            .service(subscriptions_getter)
             .service(config_reloader)
     })
     .workers(1)
-    .bind_uds(CACHER_SOCKET)
+    .bind_uds(state.socket_path)
     .unwrap()
     .run()
     .await
@@ -94,7 +95,16 @@ async fn subscriptions_setter(
         .subscriptions_allowed
         .store(val, std::sync::atomic::Ordering::Relaxed);
     info!("Changed subscriptions_allowed to: {}", val);
-    Ok(HttpResponse::Ok().body(AnyBody::Bytes(Bytes::copy_from_slice(b"OK"))))
+    Ok(HttpResponse::Ok().body(AnyBody::from_slice(b"OK")))
+}
+
+#[post("/subscriptions/status")]
+async fn subscriptions_getter(state: Data<ControlState>) -> Result<HttpResponse, ControlError> {
+    let status = state
+        .subscriptions_allowed
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let response = format!("Subsriptions: {}", if status { "on" } else { "off" });
+    Ok(HttpResponse::Ok().body(AnyBody::from_slice(response.as_bytes())))
 }
 
 #[post("/config/reload")]
@@ -109,7 +119,7 @@ async fn config_reloader(state: Data<ControlState>) -> Result<HttpResponse, Cont
             .tx
             .send(config.rpc)
             .map_err(|_| ControlError::NoConfigFile)?;
-        Ok(HttpResponse::Ok().body(AnyBody::Bytes(Bytes::copy_from_slice(b"OK"))))
+        Ok(HttpResponse::Ok().body(AnyBody::from_slice(b"OK")))
     } else {
         Err(ControlError::NoConfigFile)
     }
@@ -138,12 +148,15 @@ impl ResponseError for ControlError {
     }
 }
 
-pub async fn handle_command(cmd: &Command) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn handle_command(
+    cmd: &Command,
+    socket_path: PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
     use awc::{Client, Connector};
     use awc_uds::UdsConnector;
     use std::io::Write;
     let client = Client::builder()
-        .connector(Connector::new().connector(UdsConnector::new(CACHER_SOCKET)))
+        .connector(Connector::new().connector(UdsConnector::new(socket_path)))
         .finish();
 
     let mut response = client
