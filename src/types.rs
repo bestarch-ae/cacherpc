@@ -1,10 +1,13 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use bytes::{Buf, Bytes};
 use dashmap::mapref::entry::Entry;
-use dashmap::{mapref::one::Ref, DashMap};
+use dashmap::{
+    mapref::one::{Ref, RefMut},
+    DashMap,
+};
 use either::Either;
 use serde::{Deserialize, Serialize};
 
@@ -13,193 +16,251 @@ use crate::metrics::db_metrics as metrics;
 
 use tokio::sync::{Semaphore, SemaphorePermit};
 
+type AccountSet = HashSet<Arc<Pubkey>>;
+type ProgramAccountsKey = (Pubkey, Commitment);
+
+#[derive(Default)]
 pub struct ProgramState {
-    account_keys: [Option<HashSet<Arc<Pubkey>>>; 3],
-    slots: [u64; 3],
+    pub slot: u64,
+    // account keys, that were requested using various filteres
+    filtered_keys: HashMap<Filters, AccountSet>,
+    // account keys, that were requested without any filters
+    unfiltered_keys: Option<AccountSet>,
+    observed_filters: HashMap<Pubkey, HashSet<Filters>>,
+    tracked_keys: AccountSet,
+    // set to true after first insert, should be set to false,
+    // before program removal from cache, so that resubscription
+    // for accounts of the owner program can be made
+    active: bool,
+}
+#[derive(Default, Clone)]
+pub struct ProgramAccountsDb {
+    map: Arc<DashMap<ProgramAccountsKey, ProgramState>>,
 }
 
 impl ProgramState {
-    pub fn get(&self, commitment: Commitment) -> Option<&HashSet<Arc<Pubkey>>> {
-        self.account_keys[commitment.as_idx()].as_ref()
-    }
-
-    pub fn get_slot(&self, commitment: Commitment) -> Option<&u64> {
-        self.slots.get(commitment.as_idx())
-    }
-
-    fn insert(&mut self, commitment: Commitment, data: HashSet<Arc<Pubkey>>) {
-        self.account_keys[commitment.as_idx()] = Some(data)
-    }
-
-    fn add(&mut self, commitment: Commitment, data: Arc<Pubkey>, slot: Slot) {
-        if let Some(ref mut keys) = self.account_keys[commitment.as_idx()] {
-            keys.insert(data);
+    pub fn get_account_keys(&self, filters: &Option<Filters>) -> Option<&HashSet<Arc<Pubkey>>> {
+        if let Some(filters) = filters {
+            self.filtered_keys.get(filters)
         } else {
-            let mut set = HashSet::new();
-            set.insert(data);
-            self.insert(commitment, set);
-        }
-        self.slots[commitment.as_idx()] = slot;
-    }
-
-    fn remove(&mut self, commitment: Commitment, data: &Pubkey) {
-        if let Some(ref mut keys) = self.account_keys[commitment.as_idx()] {
-            keys.remove(data);
+            self.unfiltered_keys.as_ref()
         }
     }
 
-    fn take_commitment(&mut self, commitment: Commitment) -> Option<HashSet<Arc<Pubkey>>> {
-        self.account_keys[commitment.as_idx()].take()
-    }
-
-    fn is_empty(&self) -> bool {
-        self.account_keys.iter().all(Option::is_none)
-    }
-}
-
-impl Default for ProgramState {
-    fn default() -> Self {
-        ProgramState {
-            account_keys: [None, None, None],
-            slots: [0; 3],
+    fn insert_account_keys(&mut self, filters: Option<Filters>, keys: AccountSet) {
+        let old = if let Some(filters) = filters {
+            self.filtered_keys.insert(filters, keys)
+        } else {
+            self.unfiltered_keys.replace(keys)
+        };
+        if old.is_none() {
+            metrics().program_account_entries.inc();
         }
     }
-}
 
-type ProgramAccountsKey = (Pubkey, Option<Filters>);
+    fn has_unfiltered(&self) -> bool {
+        self.unfiltered_keys.is_some()
+    }
 
-#[derive(Clone)]
-pub struct ProgramAccountsDb {
-    map: Arc<DashMap<ProgramAccountsKey, ProgramState>>,
-    observed_filters: Arc<DashMap<(Pubkey, Commitment), HashSet<Filters>>>,
-}
+    fn insert_single_key(&mut self, filters: Option<&Filters>, key: Arc<Pubkey>) {
+        if let Some(filters) = filters {
+            self.filtered_keys
+                .entry(filters.clone())
+                .or_insert_with(|| {
+                    metrics().program_account_entries.inc();
+                    AccountSet::new()
+                })
+                .insert(key);
+        } else if let Some(set) = self.unfiltered_keys.as_mut() {
+            set.insert(key);
+        }
+        // else we shouldn't insert single key, as there's no record for unfiltered request
+    }
 
-impl Default for ProgramAccountsDb {
-    fn default() -> Self {
-        Self::new()
+    // used to remove keys for given filter, or for no filters
+    fn remove_account_keys(&mut self, filters: Option<Filters>) -> Option<AccountSet> {
+        let mut res = if let Some(filters) = filters {
+            self.filtered_keys.remove(&filters)
+        } else {
+            self.unfiltered_keys.take()
+        };
+        if let Some(keys) = res.as_mut() {
+            metrics().program_account_entries.dec();
+            for key in &self.tracked_keys {
+                keys.remove(key);
+            }
+        }
+        res
+    }
+
+    fn remove_single_key(&mut self, filters: &Filters, key: &Arc<Pubkey>) {
+        let keys = self.filtered_keys.get_mut(filters);
+        if let Some(keys) = keys {
+            keys.remove(key);
+            if keys.is_empty() {
+                self.filtered_keys.remove(filters);
+                metrics().program_account_entries.dec();
+            }
+        }
+    }
+
+    pub fn tracked_keys(&self) -> &AccountSet {
+        &self.tracked_keys
     }
 }
 
 impl ProgramAccountsDb {
-    pub fn new() -> Self {
-        ProgramAccountsDb {
-            map: Arc::new(DashMap::new()),
-            observed_filters: Arc::new(DashMap::new()),
-        }
+    pub fn track_account_key(&self, program_key: ProgramAccountsKey, key_ref: Arc<Pubkey>) -> bool {
+        let mut program_state = self.map.entry(program_key).or_default();
+        // track refrerence counts, in case owner program is ever requested
+        // and put in cache, it will just unsubscribe from all those tracked
+        // account keys, to avoid subscription duplication
+        program_state.tracked_keys.insert(key_ref);
+
+        // if state is not active, then this state is actually dummy state,
+        // and no real program subscription exists, as such we can keep creating account
+        // subscriptions, as no owner program is tracking them for the owned account
+        program_state.active
     }
 
-    pub fn get(
+    pub fn untrack_account_key(&self, program_key: &ProgramAccountsKey, key_ref: Arc<Pubkey>) {
+        self.map
+            .get_mut(program_key)
+            .map(|mut state| state.tracked_keys.remove(&key_ref));
+    }
+
+    pub fn get_slot(&self, key: &ProgramAccountsKey) -> Option<Slot> {
+        self.map.get(key).map(|state| state.slot)
+    }
+
+    pub fn get_state(
         &self,
-        key: &Pubkey,
-        filters: Option<Filters>,
+        key: ProgramAccountsKey,
     ) -> Option<Ref<'_, ProgramAccountsKey, ProgramState>> {
-        if let Some(found) = self.map.get(&(*key, filters)) {
-            Some(found)
-        } else {
-            self.map.get(&(*key, None))
-        }
+        self.map.get(&key)
     }
 
     pub fn insert(
         &self,
-        key: Pubkey,
-        data: HashSet<Arc<Pubkey>>,
-        commitment: Commitment,
+        key: ProgramAccountsKey,
+        account_key_refs: AccountSet,
         filters: Option<Filters>,
-    ) {
+    ) -> RefMut<'_, ProgramAccountsKey, ProgramState> {
+        let mut state = self.map.entry(key).or_default();
         if let Some(filters) = filters.as_ref() {
-            data.iter().for_each(|key| {
-                self.observed_filters
-                    .entry((**key, commitment))
+            account_key_refs.iter().for_each(|key| {
+                state
+                    .observed_filters
+                    .entry(**key)
                     .or_default()
                     .insert(filters.clone());
             })
         }
+        state.insert_account_keys(filters, account_key_refs);
+        state.active = true;
 
-        let mut entry = self.map.entry((key, filters)).or_default();
-        entry.insert(commitment, data);
-        drop(entry);
-        metrics().program_account_entries.set(self.map.len() as i64);
+        state
+    }
+
+    pub fn remove_keys_for_filter(
+        &self,
+        key: &ProgramAccountsKey,
+        filters: Option<Filters>,
+    ) -> AccountSet {
+        self.map
+            .get_mut(key)
+            .map(|mut state| state.remove_account_keys(filters))
+            .flatten()
+            .unwrap_or_default()
+    }
+
+    // method is used to check whether we are inserting program data for the first time
+    pub fn has_active_entry(&self, key: &ProgramAccountsKey) -> bool {
+        self.map
+            .get(key)
+            .map(|state| state.active)
+            .unwrap_or_default()
+    }
+
+    pub fn get_tracked_keys(&self, key: &ProgramAccountsKey) -> Vec<Pubkey> {
+        self.map
+            .get(key)
+            .map(|state| state.tracked_keys.iter().map(|k| **k).collect())
+            .unwrap_or_default()
+    }
+
+    pub fn remove_all(&self, key: &ProgramAccountsKey) -> impl Iterator<Item = Arc<Pubkey>> {
+        let mut state = match self.map.remove(key) {
+            Some(state) => state.1,
+            None => return Either::Left(std::iter::empty()),
+        };
+
+        metrics()
+            .program_account_entries
+            .sub((state.filtered_keys.len() + state.unfiltered_keys.is_some() as usize) as i64);
+
+        let mut keys = state
+            .filtered_keys
+            .into_values()
+            .flatten()
+            .collect::<AccountSet>();
+        keys.extend(state.unfiltered_keys.into_iter().flatten());
+        let tracked_keys = std::mem::take(&mut state.tracked_keys);
+        Either::Right(
+            keys.into_iter()
+                .filter(move |key| !tracked_keys.contains(key)),
+        )
     }
 
     pub fn update_account(
         &self,
-        key: &Pubkey,
-        data: Arc<Pubkey>,
+        key: &ProgramAccountsKey,
+        acc_ref_key: Arc<Pubkey>,
         filter_groups: HashSet<Filters>,
-        commitment: Commitment,
         slot: Slot,
-    ) {
-        // add to global
-        if let Some(mut entry) = self.map.get_mut(&(*key, None)) {
-            entry.add(commitment, data.clone(), slot);
+    ) -> bool {
+        let mut can_be_removed = true;
+        let mut state = match self.map.get_mut(key) {
+            Some(state) if state.active => state,
+            _ => return can_be_removed,
+        };
+
+        // register it within unfiltered keys
+        if state.has_unfiltered() {
+            state.insert_single_key(None, Arc::clone(&acc_ref_key));
+            can_be_removed = false;
         }
 
+        // update slot for this program
+        state.slot = slot;
+
         let has_new_or_old_filters = !filter_groups.is_empty()
-            || self
+            || state
                 .observed_filters
-                .get(&(*data, commitment))
+                .get(&*acc_ref_key)
                 .map_or(false /* no set == empty */, |set| !set.is_empty());
 
         if has_new_or_old_filters {
-            let mut old_groups = self
+            let old_groups = state
                 .observed_filters
-                .entry((*data, commitment))
-                .or_default();
+                .remove(&*acc_ref_key)
+                .unwrap_or_default();
             let diff = old_groups.symmetric_difference(&filter_groups);
             for filter in diff {
-                let state = self.map.get_mut(&(*key, Some(filter.clone())));
-                match state {
+                if old_groups.contains(filter) {
                     // Account no longer matches filter
-                    Some(mut state) if old_groups.contains(filter) => {
-                        state.remove(commitment, &data);
-                    }
+                    state.remove_single_key(filter, &acc_ref_key);
+                } else {
                     // Account is new to the filter
-                    Some(mut state) /* !old_groups.contains(&filter) */ => {
-                        state.add(commitment, Arc::clone(&data), slot);
-                    }
-                    None => (), // State not found
+                    state.insert_single_key(Some(filter), Arc::clone(&acc_ref_key));
                 }
             }
-            *old_groups = filter_groups;
+            can_be_removed = can_be_removed && filter_groups.is_empty();
+            // Insert new filters for this account
+            state.observed_filters.insert(*acc_ref_key, filter_groups);
         }
-    }
 
-    pub fn remove_all(
-        &self,
-        key: &Pubkey,
-        commitment: Commitment,
-        filters: Option<Filters>,
-    ) -> impl Iterator<Item = Pubkey> {
-        let iter = if let Entry::Occupied(mut entry) = self.map.entry((*key, filters.clone())) {
-            let state = entry.get_mut();
-            let keys = state.take_commitment(commitment);
-            if state.is_empty() {
-                entry.remove();
-            } else {
-                drop(entry);
-            }
-
-            if let Some(filters) = filters {
-                keys.as_ref().into_iter().flatten().for_each(|key| {
-                    if let Some(mut set) = self.observed_filters.get_mut(&(**key, commitment)) {
-                        set.remove(&filters);
-                    }
-                })
-            }
-
-            let iter = keys.into_iter().flatten().map(|arc| {
-                let key = *arc;
-                drop(arc);
-                key
-            });
-
-            Either::Left(iter)
-        } else {
-            Either::Right(std::iter::empty())
-        };
-        metrics().program_account_entries.set(self.map.len() as i64);
-        iter
+        can_be_removed && !state.tracked_keys.contains(&acc_ref_key)
     }
 }
 
@@ -256,7 +317,7 @@ impl AccountState {
                 .account_bytes
                 .sub(old.data.as_ref().map(|info| info.data.len()).unwrap_or(0) as i64);
             old.data = data.value;
-            old.slot = data.context.slot;
+            old.slot = old.slot.max(data.context.slot);
             old.refcount.clone()
         } else {
             let refcount = Arc::new(self.key);
@@ -339,6 +400,14 @@ impl AccountsDb {
 
     fn update_slot(&self, commitment: Commitment, val: u64) {
         self.slot[commitment.as_idx()].fetch_max(val, Ordering::AcqRel);
+    }
+
+    pub fn get_owner(&self, key: &Pubkey, commitment: Commitment) -> Option<Pubkey> {
+        let state = self.map.get(key)?;
+        state
+            .get(commitment)
+            .and_then(|(info, _)| info)
+            .map(|info| info.owner)
     }
 
     #[allow(unused)]
@@ -463,8 +532,8 @@ impl From<Pubkey> for [u8; 32] {
     }
 }
 
+#[cfg(test)]
 impl Pubkey {
-    #[cfg(test)]
     fn zero() -> Self {
         Pubkey([0; 32])
     }
@@ -750,7 +819,7 @@ fn pooq() {
 
 #[test]
 fn db_refs() {
-    let programs = ProgramAccountsDb::new();
+    let programs = ProgramAccountsDb::default();
     let accounts = AccountsDb::new();
 
     let acc_ref = accounts.insert(
@@ -772,18 +841,21 @@ fn db_refs() {
 
     let mut set = HashSet::new();
     set.insert(acc_ref);
-    programs.insert(Pubkey::zero(), set, Commitment::Confirmed, None);
+
+    programs.insert((Pubkey::zero(), Commitment::Confirmed), set, None);
     assert_eq!(accounts.map.len(), 1);
     assert_eq!(programs.map.len(), 1);
 
     accounts.remove(&Pubkey::zero(), Commitment::Confirmed);
     assert_eq!(accounts.map.len(), 1);
 
-    let program_accounts = programs.remove_all(&Pubkey::zero(), Commitment::Confirmed, None);
+    let program_accounts = programs.remove_all(&(Pubkey::zero(), Commitment::Confirmed));
     assert_eq!(programs.map.len(), 0);
     assert_eq!(accounts.map.len(), 1);
 
-    for key in program_accounts {
+    for arc in program_accounts {
+        let key = *arc;
+        drop(arc);
         accounts.remove(&key, Commitment::Confirmed);
     }
     assert_eq!(accounts.map.len(), 0);

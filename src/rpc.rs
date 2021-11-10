@@ -28,7 +28,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::filter::{Filter, Filters};
 use crate::metrics::rpc_metrics as metrics;
-use crate::pubsub::{PubSubManager, Subscription};
+use crate::pubsub::{PubSubManager, Subscription, SubscriptionActive};
 use crate::types::{
     AccountContext, AccountData, AccountInfo, AccountState, AccountsDb, BytesChain, Commitment,
     Encoding, ProgramAccountsDb, Pubkey, SemaphoreQueue, Slot, SolanaContext,
@@ -323,24 +323,42 @@ impl Waf {
 }
 
 impl State {
-    fn reset(&self, sub: SubDescriptor) {
-        self.pubsub.reset(sub.kind, sub.commitment, sub.filters);
+    fn reset(&self, sub: SubDescriptor, owner: Option<Pubkey>) {
+        self.pubsub
+            .reset(sub.kind, sub.commitment, sub.filters, owner);
     }
 
     fn insert(&self, key: Pubkey, data: AccountContext, commitment: Commitment) -> Arc<Pubkey> {
         self.accounts.insert(key, data, commitment)
     }
 
-    fn subscription_active(&self, key: (Pubkey, Commitment)) -> bool {
-        self.pubsub.subscription_active(key)
+    fn websocket_connected(&self, key: (Pubkey, Commitment)) -> bool {
+        self.pubsub.websocket_connected(key)
+    }
+
+    // owner is the subscription for program, if given account belongs to one
+    fn subscription_active(
+        &self,
+        sub: Subscription,
+        commitment: Commitment,
+        owner: Option<Pubkey>,
+    ) -> SubscriptionActive {
+        self.pubsub.subscription_active(sub, commitment, owner)
     }
 
     fn is_caching_allowed(&self) -> bool {
         self.pubsub.can_subscribe()
     }
 
-    fn subscribe(&self, sub: SubDescriptor) {
-        self.pubsub.subscribe(sub.kind, sub.commitment, sub.filters);
+    fn subscribe(&self, sub: SubDescriptor, owner: Option<Pubkey>) {
+        self.pubsub
+            .subscribe(sub.kind, sub.commitment, sub.filters, owner);
+    }
+
+    // used to unsubscribe from accounts of program, after owner
+    // is inserted into cache
+    fn unsubscribe(&self, key: Pubkey, commitment: Commitment) {
+        self.pubsub.unsubscribe(key, commitment);
     }
 
     // clippy incorrectly assumes that lifetimes can be elided
@@ -416,8 +434,13 @@ impl State {
         {
             Ok(Some(data)) => {
                 T::cache_hit_counter().inc();
-                self.reset(request.sub_descriptor());
-                return data;
+                let owner = data.owner();
+                self.reset(request.sub_descriptor(), owner);
+                if request.has_active_subscription(&self, owner).await {
+                    return data.map(|data| data.response);
+                } else {
+                    (true, false)
+                }
             }
             Ok(None) => (true, true),
             Err(reason) => {
@@ -428,8 +451,8 @@ impl State {
 
                 if let Some(data) = data {
                     T::cache_hit_counter().inc();
-                    self.reset(request.sub_descriptor());
-                    return data;
+                    self.reset(request.sub_descriptor(), data.owner());
+                    return data.map(|data| data.response);
                 }
 
                 metrics()
@@ -453,8 +476,8 @@ impl State {
                     if let Some(data) = request.get_from_cache(&raw_request.id, &self) {
                         T::cache_hit_counter().inc();
                         T::cache_filled_counter().inc();
-                        self.reset(request.sub_descriptor());
-                        return data;
+                        self.reset(request.sub_descriptor(), data.owner());
+                        return data.map(|data| data.response);
                     }
                     continue;
                 }
@@ -491,10 +514,11 @@ impl State {
 
                 match resp {
                     Ok(Response::Result(data)) => {
+                        let owner = data.owner();
                         if this.is_caching_allowed() && request.put_into_cache(&this, data) {
                             debug!(%request, "cached for key");
                             this.map_updated.notify_waiters();
-                            this.subscribe(request.sub_descriptor());
+                            this.subscribe(request.sub_descriptor(), owner);
                         }
                     }
                     Ok(Response::Error(error)) => {
@@ -516,17 +540,50 @@ impl State {
     }
 }
 
+struct CachedResponse {
+    owner: Option<Pubkey>,
+    response: HttpResponse,
+}
+
 type CacheResult<'a> = Result<HttpResponse, Error<'a>>;
+
+trait HasOwner {
+    fn owner(&self) -> Option<Pubkey> {
+        None
+    }
+}
+
+impl<'a> HasOwner for Result<CachedResponse, Error<'a>> {
+    fn owner(&self) -> Option<Pubkey> {
+        self.as_ref().ok().map(|data| data.owner).flatten()
+    }
+}
+
+impl HasOwner for AccountContext {
+    fn owner(&self) -> Option<Pubkey> {
+        self.value.as_ref().map(|value| value.owner)
+    }
+}
+
+impl HasOwner for MaybeContext<Vec<AccountAndPubkey>> {}
 
 trait Cacheable: Sized + 'static {
     const REQUEST_TYPE: &'static str;
-    type ResponseData: DeserializeOwned;
+    type ResponseData: DeserializeOwned + HasOwner;
 
     fn parse<'a>(request: &Request<'a, RawValue>) -> Result<Self, Error<'a>>;
     fn get_limit(state: &State) -> &SemaphoreQueue;
 
     fn is_cacheable(&self, state: &State) -> Result<(), UncacheableReason>;
-    fn get_from_cache<'a>(&self, id: &Id<'a>, state: &State) -> Option<CacheResult<'a>>;
+    // method to check whether cached entry has corresponding websocket subscription
+    fn has_active_subscription(&self, state: &State, owner: Option<Pubkey>) -> SubscriptionActive;
+
+    fn get_from_cache<'a>(
+        &self,
+        id: &Id<'a>,
+        state: &State,
+    ) -> Option<Result<CachedResponse, Error<'a>>>;
+
     fn put_into_cache(&self, state: &State, data: Self::ResponseData) -> bool;
 
     fn sub_descriptor(&self) -> SubDescriptor;
@@ -590,33 +647,41 @@ impl Cacheable for GetAccountInfo {
         state.account_info_request_limit.as_ref()
     }
 
+    // for getAccountInfo requests, we don't need to subscribe in case if the owner program exists,
+    // and there's already an active subscription present for it
+    fn has_active_subscription(&self, state: &State, owner: Option<Pubkey>) -> SubscriptionActive {
+        state.subscription_active(Subscription::Account(self.pubkey), self.commitment(), owner)
+    }
+
     fn is_cacheable(&self, state: &State) -> Result<(), UncacheableReason> {
         if self.config.encoding == Encoding::JsonParsed {
             Err(UncacheableReason::Encoding)
         } else if self.config.data_slice.is_some() {
             Err(UncacheableReason::DataSlice)
-        } else if !state.subscription_active((self.pubkey, self.commitment())) {
-            Err(UncacheableReason::Inactive)
+        } else if !state.websocket_connected((self.pubkey, self.commitment())) {
+            Err(UncacheableReason::Disconnected)
         } else {
             Ok(())
         }
     }
 
-    fn get_from_cache<'a>(&self, id: &Id<'a>, state: &State) -> Option<CacheResult<'a>> {
+    fn get_from_cache<'a>(
+        &self,
+        id: &Id<'a>,
+        state: &State,
+    ) -> Option<Result<CachedResponse, Error<'a>>> {
         state.accounts.get(&self.pubkey).and_then(|data| {
             let mut account = data.value().get(self.commitment());
-            account = account.map(|(info, mut slot)| {
-                if slot == 0 {
-                    if let Some(info) = info {
-                        if let Some(owner) = state.program_accounts.get(&info.owner, None) {
-                            if let Some(s) = owner.value().get_slot(self.commitment()) {
-                                slot = *s;
-                            }
-                        }
-                    }
-                }
-                (info, slot)
-            });
+            let owner = account.and_then(|(info, _)| info).map(|info| info.owner);
+
+            account = match account {
+                Some((Some(info), slot)) if slot == 0 => state
+                    .program_accounts
+                    .get_slot(&(info.owner, self.commitment()))
+                    .map(|slot| (Some(info), slot)),
+                acc => acc,
+            };
+
             match account.filter(|(_, slot)| *slot != 0) {
                 Some(data) => {
                     let resp = account_response(
@@ -628,9 +693,12 @@ impl Cacheable for GetAccountInfo {
                         self.pubkey,
                     );
                     match resp {
-                        Ok(res) => Some(Ok(res)),
+                        Ok(res) => Some(Ok(CachedResponse {
+                            response: res,
+                            owner,
+                        })),
                         Err(Error::Parsing(_)) => None,
-                        e => Some(e),
+                        Err(e) => Some(Err(e)),
                     }
                 }
                 _ => None,
@@ -712,6 +780,10 @@ impl Cacheable for GetProgramAccounts {
         state.program_accounts_request_limit.as_ref()
     }
 
+    fn has_active_subscription(&self, state: &State, _owner: Option<Pubkey>) -> SubscriptionActive {
+        state.subscription_active(Subscription::Program(self.pubkey), self.commitment(), None)
+    }
+
     fn is_cacheable(&self, state: &State) -> Result<(), UncacheableReason> {
         if self.config.encoding == Encoding::JsonParsed {
             Err(UncacheableReason::Encoding)
@@ -719,14 +791,18 @@ impl Cacheable for GetProgramAccounts {
             Err(UncacheableReason::DataSlice)
         } else if !self.valid_filters {
             Err(UncacheableReason::Filters)
-        } else if !state.subscription_active((self.pubkey, self.commitment())) {
-            Err(UncacheableReason::Inactive)
+        } else if !state.websocket_connected((self.pubkey, self.commitment())) {
+            Err(UncacheableReason::Disconnected)
         } else {
             Ok(())
         }
     }
 
-    fn get_from_cache<'a>(&self, id: &Id<'a>, state: &State) -> Option<CacheResult<'a>> {
+    fn get_from_cache<'a>(
+        &self,
+        id: &Id<'a>,
+        state: &State,
+    ) -> Option<Result<CachedResponse, Error<'a>>> {
         let with_context = self.config.with_context.unwrap_or(false);
         let commitment = self.commitment();
         let filters = self.filters.as_ref();
@@ -734,15 +810,22 @@ impl Cacheable for GetProgramAccounts {
 
         state
             .program_accounts
-            .get(&self.pubkey, filters.cloned())
+            .get_state((self.pubkey, commitment))
             .and_then(|data| {
-                let accounts = data.value().get(commitment)?;
-
-                let id_ = id.clone();
-                let res =
-                    program_accounts_response(id_, accounts, config, filters, state, with_context);
+                let accounts = data.value().get_account_keys(&self.filters)?;
+                let res = program_accounts_response(
+                    id.clone(),
+                    accounts,
+                    config,
+                    filters,
+                    state,
+                    with_context,
+                );
                 match res {
-                    Ok(res) => Some(Ok(res)),
+                    Ok(res) => Some(Ok(CachedResponse {
+                        owner: None,
+                        response: res,
+                    })),
                     Err(ProgramAccountsResponseError::Base58) => {
                         Some(Err(base58_error(id.clone())))
                     }
@@ -755,11 +838,10 @@ impl Cacheable for GetProgramAccounts {
         if !self.valid_filters {
             return false;
         }
-        let filters = self.filters.as_ref();
 
         let commitment = self.commitment();
         let (slot, accounts) = data.into_slot_and_value();
-        let mut keys = HashSet::with_capacity(accounts.len());
+        let mut account_key_refs = HashSet::with_capacity(accounts.len());
         for acc in accounts {
             let AccountAndPubkey { account, pubkey } = acc;
             let key_ref = state.insert(
@@ -772,11 +854,27 @@ impl Cacheable for GetProgramAccounts {
                 },
                 commitment,
             );
-            keys.insert(key_ref);
+            account_key_refs.insert(Arc::clone(&key_ref));
         }
-        state
-            .program_accounts
-            .insert(self.pubkey, keys, commitment, filters.cloned());
+
+        let program_key = (self.pubkey, commitment);
+        let should_unsubscribe = !state.program_accounts.has_active_entry(&program_key);
+
+        let program_state =
+            state
+                .program_accounts
+                .insert(program_key, account_key_refs, self.filters.clone());
+
+        // if the cache insertion for the given program key
+        // happened for the first time, then we have to unsubscribe from all accounts, which are
+        // owned by given program, otherwise, we have already unsubscribed from them, on previous
+        // insert calls
+        if should_unsubscribe {
+            for key in program_state.tracked_keys() {
+                state.unsubscribe(**key, commitment);
+            }
+        }
+
         true
     }
 
@@ -810,18 +908,18 @@ impl fmt::Display for GetProgramAccounts {
 
 enum UncacheableReason {
     Encoding,
-    Inactive,
     DataSlice,
     Filters,
+    Disconnected,
 }
 
 impl UncacheableReason {
     fn as_str(&self) -> &'static str {
         match self {
             Self::Encoding => "encoding",
-            Self::Inactive => "inactive_sub",
             Self::DataSlice => "data_slice",
             Self::Filters => "bad_filters",
+            Self::Disconnected => "websocket_disconnected",
         }
     }
 
@@ -829,7 +927,7 @@ impl UncacheableReason {
     fn can_use_cache(&self) -> bool {
         match self {
             Self::Encoding | Self::DataSlice => true,
-            Self::Inactive | Self::Filters => false,
+            Self::Filters | Self::Disconnected => false,
         }
     }
 }
