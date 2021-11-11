@@ -77,6 +77,7 @@ pub struct PubSubMetrics {
     pub pubsub_program_slot: IntGaugeVec,
     pub pubsub_account_slot: IntGaugeVec,
     pub websocket_reconnects: IntCounterVec,
+    pub subscriptions_skipped: IntCounter,
 }
 
 pub fn pubsub_metrics() -> &'static PubSubMetrics {
@@ -246,6 +247,11 @@ pub fn pubsub_metrics() -> &'static PubSubMetrics {
             &["connection_id"]
         )
         .unwrap(),
+        subscriptions_skipped: register_int_counter!(
+            "subscriptions_skipped", 
+            "Number of account subscriptions skipped, due to presence of owner-program subscription"
+        )
+        .unwrap(),
     });
     &METRICS
 }
@@ -278,6 +284,7 @@ pub struct RpcMetrics {
     pub request_retries: IntCounter,
     pub batch_requests: IntCounter,
     pub waf_rejections: IntCounter,
+    pub streaming_errors: IntCounter,
 }
 
 impl RpcMetrics {
@@ -489,6 +496,11 @@ pub fn rpc_metrics() -> &'static RpcMetrics {
         waf_rejections: register_int_counter!(
             "waf_rejection",
             "Number of requests which were rejected due to WAF rules"
+        )
+        .unwrap(),
+        streaming_errors: register_int_counter!(
+            "streaming_errors",
+            "Number of errors while streaming response"
         )
         .unwrap(),
     });
