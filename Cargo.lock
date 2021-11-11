@@ -175,8 +175,7 @@ dependencies = [
 [[package]]
 name = "actix-tls"
 version = "3.0.0-beta.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e4af84e13e4600829858a3e68079be710d1ada461431e1e4c5ae663479ea0a3c"
+source = "git+https://github.com/zubr-exchange/actix-net?rev=aa7c6db84e1748ba1301a5b9cffc16ebd4f3626e#aa7c6db84e1748ba1301a5b9cffc16ebd4f3626e"
 dependencies = [
  "actix-codec",
  "actix-rt",
@@ -397,6 +396,17 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_urlencoded",
+]
+
+[[package]]
+name = "awc-uds"
+version = "0.1.0"
+source = "git+https://github.com/polachok/awc-uds.git?rev=29c9bd2#29c9bd24791142900a0477fcb4ce68b41e841b18"
+dependencies = [
+ "actix-rt",
+ "actix-service",
+ "actix-tls",
+ "awc",
 ]
 
 [[package]]
@@ -663,7 +673,7 @@ dependencies = [
 
 [[package]]
 name = "cache-rpc"
-version = "0.1.36"
+version = "0.1.37"
 dependencies = [
  "actix",
  "actix-codec",
@@ -673,6 +683,7 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "awc",
+ "awc-uds",
  "backoff",
  "base64 0.13.0",
  "bs58 0.4.0",
