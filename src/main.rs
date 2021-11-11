@@ -1,149 +1,46 @@
+use cache_rpc::control::{handle_command, run_control_interface, ControlState, RpcConfigSender};
+use either::Either;
 use std::cell::RefCell;
-use std::fs::File;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use structopt::StructOpt;
+use tracing_subscriber::fmt;
 
 use actix_cors::Cors;
 use actix_web::{guard, web, App, HttpServer};
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use awc::Client;
-use either::Either;
 use lru::LruCache;
-use structopt::StructOpt;
 use tokio::sync::{watch, Notify, Semaphore};
 use tracing::info;
-use tracing_subscriber::fmt;
 
 use mlua::{Lua, LuaOptions, StdLib};
 
-pub use cache_rpc::{metrics, pubsub, rpc, types};
+pub use cache_rpc::{cli, metrics, pubsub, rpc, types};
 
 use pubsub::PubSubManager;
 use types::{AccountsDb, ProgramAccountsDb};
 
 const LUA_JSON: &str = include_str!("json.lua");
 
-#[derive(Debug, structopt::StructOpt)]
-#[structopt(about = "Solana RPC cache server")]
-struct Options {
-    #[structopt(
-        short = "w",
-        long = "websocket-url",
-        default_value = "wss://solana-api.projectserum.com",
-        help = "validator or cluster PubSub endpoint"
-    )]
-    ws_url: String,
-    #[structopt(
-        short = "r",
-        long = "rpc-api-url",
-        default_value = "https://solana-api.projectserum.com",
-        help = "validator or cluster JSON-RPC endpoint"
-    )]
-    rpc_url: String,
-    #[structopt(
-        short = "l",
-        long = "listen",
-        default_value = "127.0.0.1:8080",
-        help = "cache server bind address"
-    )]
-    addr: String,
-    #[structopt(
-        short = "p",
-        long = "program-request-limit",
-        default_value = "5",
-        help = "maximum number of concurrent getProgramAccounts cache-to-validator requests"
-    )]
-    program_accounts_request_limit: usize,
-    #[structopt(
-        short = "a",
-        long = "account-request-limit",
-        default_value = "100",
-        help = "maximum number of concurrent getAccountInfo cache-to-validator requests"
-    )]
-    account_info_request_limit: usize,
-    #[structopt(
-        short = "b",
-        long = "body-cache-size",
-        default_value = "100",
-        help = "maximum amount of entries in the response cache"
-    )]
-    body_cache_size: usize,
-    #[structopt(
-        long = "log-format",
-        default_value = "plain",
-        help = "one of: 'plain', 'json'"
-    )]
-    log_format: LogFormat,
-    #[structopt(long = "log-file", help = "file path")]
-    log_file: Option<std::path::PathBuf>,
-    #[structopt(
-        short = "c",
-        long = "websocket-connections",
-        help = "number of WebSocket connections to validator",
-        default_value = "1"
-    )]
-    websocket_connections: u32,
-    #[structopt(
-        short = "t",
-        long = "time-to-live",
-        help = "time to live for cached values",
-        default_value = "10m",
-        parse(try_from_str = humantime::parse_duration)
-    )]
-    time_to_live: Duration,
-
-    #[structopt(
-        long = "ignore-base58-limit",
-        help = "ignore base58 overflowing size limit"
-    )]
-    ignore_base58: bool,
-    #[structopt(long = "config", help = "config path")]
-    config: Option<PathBuf>,
-    #[structopt(
-        long = "slot-distance",
-        short = "d",
-        help = "Health check slot distance",
-        default_value = "150"
-    )]
-    slot_distance: u32,
-    #[structopt(
-        long = "rules",
-        help = "web application firewall rules, to filter out specific requests"
-    )]
-    rules: Option<PathBuf>,
-}
-
-#[derive(Debug)]
-enum LogFormat {
-    Plain,
-    Json,
-}
-
-#[derive(thiserror::Error, Debug)]
-#[error("must be one of: \"plain\", \"json\"")]
-struct LogFormatParseError;
-
-impl std::str::FromStr for LogFormat {
-    type Err = LogFormatParseError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "plain" => Ok(LogFormat::Plain),
-            "json" => Ok(LogFormat::Json),
-            _ => Err(LogFormatParseError),
-        }
-    }
-}
-
 #[actix_web::main]
 async fn main() -> Result<()> {
-    let options = Options::from_args();
-
-    let writer = match &options.log_file {
-        Some(path) => Either::Left(
+    let options = cli::Options::from_args();
+    // If command was passed during application startup, then it becomes a client, and tries to
+    // execute the command againts other, already running application instance
+    if let Some(ref cmd) = options.command {
+        let mut exit_code = 0;
+        if let Err(e) = handle_command(cmd, options.control_socket_path).await {
+            eprintln!("Command processing error: {}", e);
+            exit_code = 1;
+        };
+        std::process::exit(exit_code);
+    }
+    let writer = match options.log_file {
+        Some(ref path) => Either::Left(
             file_reopen::File::open(path)
                 .with_context(|| format!("Can't open log file `{}`", path.display()))?,
         ),
@@ -152,7 +49,7 @@ async fn main() -> Result<()> {
     let (writer, _guard) = tracing_appender::non_blocking(writer);
 
     match options.log_format {
-        LogFormat::Json => {
+        cli::LogFormat::Json => {
             let subscriber = fmt::Subscriber::builder()
                 .with_thread_names(true)
                 .with_writer(writer)
@@ -161,7 +58,7 @@ async fn main() -> Result<()> {
                 .finish();
             tracing::subscriber::set_global_default(subscriber).unwrap();
         }
-        LogFormat::Plain => {
+        cli::LogFormat::Plain => {
             let subscriber = fmt::Subscriber::builder().with_writer(writer).finish();
             tracing::subscriber::set_global_default(subscriber).unwrap();
         }
@@ -174,63 +71,6 @@ async fn main() -> Result<()> {
 
     run(options).await?;
     Ok(())
-}
-
-#[derive(serde::Deserialize, Debug)]
-struct Config {
-    rpc: rpc::Config,
-}
-
-impl Config {
-    fn from_file(f: File) -> Result<Config> {
-        use std::io::{BufReader, Read};
-        let mut reader = BufReader::new(f);
-        let mut buf = Vec::new();
-
-        reader.read_to_end(&mut buf)?;
-        Ok(toml::from_slice(&buf)?)
-    }
-
-    fn from_options(options: &Options) -> Config {
-        Config {
-            rpc: rpc::Config {
-                request_limits: rpc::RequestLimits {
-                    account_info: options.account_info_request_limit,
-                    program_accounts: options.program_accounts_request_limit,
-                },
-                ignore_base58_limit: options.ignore_base58,
-            },
-        }
-    }
-}
-
-use tokio::signal::unix::{signal, SignalKind};
-
-async fn listen_for_subscription_limit(subscriptions_allowed: Arc<AtomicBool>) {
-    let mut stream =
-        signal(SignalKind::user_defined1()).expect("failed to register signal handler for USR1");
-    while stream.recv().await.is_some() {
-        subscriptions_allowed.fetch_xor(true, Ordering::Relaxed);
-    }
-}
-
-async fn config_read_loop(path: PathBuf, rpc: watch::Sender<rpc::Config>) {
-    let mut stream = signal(SignalKind::hangup()).expect("failed to register signal handler");
-
-    while stream.recv().await.is_some() {
-        match File::open(&path) {
-            Ok(file) => match Config::from_file(file) {
-                Ok(config) => {
-                    info!(?config, "configuration reloaded");
-                    let _ = rpc.send(config.rpc);
-                }
-                Err(err) => tracing::error!(error = %err, path = ?path, "error parsing config"),
-            },
-            Err(err) => {
-                tracing::error!(path = ?path, error = %err, "failed to open config");
-            }
-        }
-    }
 }
 
 fn lua(rules: &str) -> Result<Lua, mlua::Error> {
@@ -252,7 +92,27 @@ fn lua(rules: &str) -> Result<Lua, mlua::Error> {
     Ok(lua)
 }
 
-async fn run(options: Options) -> Result<()> {
+async fn config_read_loop(path: PathBuf, rpc: Arc<watch::Sender<rpc::Config>>) {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut stream = signal(SignalKind::hangup()).expect("failed to register signal handler");
+
+    while stream.recv().await.is_some() {
+        match std::fs::File::open(&path) {
+            Ok(file) => match cli::Config::from_file(file) {
+                Ok(config) => {
+                    info!(?config, "configuration reloaded");
+                    let _ = rpc.send(config.rpc);
+                }
+                Err(err) => tracing::error!(error = %err, path = ?path, "error parsing config"),
+            },
+            Err(err) => {
+                tracing::error!(path = ?path, error = %err, "failed to open config");
+            }
+        }
+    }
+}
+
+async fn run(options: cli::Options) -> Result<()> {
     let accounts = AccountsDb::new();
     let program_accounts = ProgramAccountsDb::new();
 
@@ -269,9 +129,9 @@ async fn run(options: Options) -> Result<()> {
         .map(std::fs::File::open)
         .transpose()?;
     let config = config_file
-        .map(Config::from_file)
+        .map(cli::Config::from_file)
         .transpose()?
-        .unwrap_or_else(|| Config::from_options(&options));
+        .unwrap_or_else(|| cli::Config::from_options(&options));
 
     info!(?config, "config");
 
@@ -309,11 +169,21 @@ async fn run(options: Options) -> Result<()> {
 
     let (rpc_tx, rpc_rx) = watch::channel(config.rpc.clone());
 
+    let mut rpc_config_sender = None;
+
     if let Some(path) = options.config {
-        actix::spawn(config_read_loop(path, rpc_tx));
+        let rpc_tx = Arc::new(rpc_tx);
+        actix::spawn(config_read_loop(path.clone(), Arc::clone(&rpc_tx)));
+        rpc_config_sender = Some(RpcConfigSender::new(rpc_tx, path));
     }
-    // register a listener for toggling a flag to prevent new subscriptions
-    actix::spawn(listen_for_subscription_limit(subscriptions_allowed));
+
+    let control_state = ControlState::new(
+        subscriptions_allowed,
+        rpc_config_sender,
+        options.control_socket_path,
+    );
+
+    actix::spawn(run_control_interface(control_state));
 
     let rpc_config = Arc::new(ArcSwap::from(Arc::new(config.rpc)));
 

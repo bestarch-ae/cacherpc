@@ -1,3 +1,5 @@
+pub mod cli;
+pub mod control;
 pub mod filter;
 pub mod metrics;
 pub mod pubsub;

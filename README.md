@@ -33,6 +33,7 @@ The server supports a number of configuration options, which are the following:
 - `--ignore-base58-limit` — flag whether to ignore base58 overflowing size limit
 - `--log-format` — the format, in which to output the logs: plain | json
 - `--rules` — path to firewall rules written in lua
+- `--control-socket-path` — path to socket file, e.g. /run/cacherpc.sock
 
 ## Features
 
