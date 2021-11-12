@@ -697,7 +697,6 @@ dependencies = [
  "lru",
  "mlua",
  "once_cell",
- "pin-project",
  "prometheus",
  "proptest",
  "rand 0.8.4",
