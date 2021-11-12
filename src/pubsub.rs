@@ -1,11 +1,8 @@
 use std::collections::{HashMap, HashSet};
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
-use std::task::Poll;
 use std::time::Duration;
 
 use actix::io::SinkWrite;
@@ -16,11 +13,7 @@ use actix::prelude::{
 use actix::Arbiter;
 use actix_http::ws;
 use bytes::BytesMut;
-use futures_util::{
-    future::{join, Join},
-    stream::StreamExt,
-};
-use pin_project::pin_project;
+use futures_util::stream::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use tokio::sync::mpsc;
@@ -94,42 +87,6 @@ pub struct PubSubManager {
     subscriptions_allowed: Arc<AtomicBool>,
 }
 
-type IsSubActiveRequest = actix::prelude::Request<AccountUpdateManager, IsSubActive>;
-#[allow(clippy::large_enum_variant)]
-#[pin_project(project = SubscriptionActiveProject)]
-pub enum SubscriptionActive {
-    Ready(bool),
-    RequestWithOwner(#[pin] Join<IsSubActiveRequest, IsSubActiveRequest>),
-    Request(#[pin] IsSubActiveRequest),
-}
-
-impl Future for SubscriptionActive {
-    type Output = bool;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
-        match self.project() {
-            SubscriptionActiveProject::Ready(res) => Poll::Ready(*res),
-            SubscriptionActiveProject::RequestWithOwner(req) => {
-                match req.poll(cx) {
-                    Poll::Pending => Poll::Pending,
-                    Poll::Ready((Ok(true), _)) => {
-                        metrics().subscriptions_skipped.inc(); // owner subscription exists
-                        Poll::Ready(true)
-                    }
-                    Poll::Ready((_, Ok(true))) => Poll::Ready(true),
-                    Poll::Ready(_) => Poll::Ready(false),
-                }
-            }
-
-            SubscriptionActiveProject::Request(req) => match req.poll(cx) {
-                Poll::Pending => Poll::Pending,
-                Poll::Ready(Ok(value)) => Poll::Ready(value),
-                Poll::Ready(Err(_)) => Poll::Ready(false),
-            },
-        }
-    }
-}
-
 impl PubSubManager {
     pub fn init(
         connections: u32,
@@ -142,16 +99,16 @@ impl PubSubManager {
         let mut workers = Vec::new();
         let config = Arc::new(worker_config);
         for id in 0..connections {
-            let connected = Arc::new(AtomicBool::new(false));
+            let active = Arc::new(AtomicBool::new(false));
             let addr = AccountUpdateManager::init(
                 id,
                 accounts.clone(),
                 program_accounts.clone(),
-                Arc::clone(&connected),
+                Arc::clone(&active),
                 rpc_slot.clone(),
                 Arc::clone(&config),
             );
-            workers.push((addr, connected))
+            workers.push((addr, active))
         }
         PubSubManager {
             workers,
@@ -174,37 +131,9 @@ impl PubSubManager {
         self.workers[idx].0.clone()
     }
 
-    pub fn websocket_connected(&self, key: Pubkey) -> bool {
+    pub fn subscription_active(&self, key: Pubkey) -> bool {
         let idx = self.get_idx_by_key(key);
         self.workers[idx].1.load(Ordering::Relaxed)
-    }
-
-    pub fn subscription_active(
-        &self,
-        sub: Subscription,
-        commitment: Commitment,
-        owner: Option<Pubkey>,
-    ) -> SubscriptionActive {
-        if self.websocket_connected(sub.key()) {
-            let addr = self.get_addr_by_key(sub.key());
-
-            owner
-                .map(|key| (self.get_addr_by_key(key), key))
-                .map(|(owner_addr, key)| {
-                    SubscriptionActive::RequestWithOwner(join(
-                        owner_addr.send(IsSubActive {
-                            sub: Subscription::Program(key),
-                            commitment,
-                        }),
-                        addr.send(IsSubActive { sub, commitment }),
-                    ))
-                })
-                .unwrap_or_else(|| {
-                    SubscriptionActive::Request(addr.send(IsSubActive { sub, commitment }))
-                })
-        } else {
-            SubscriptionActive::Ready(false)
-        }
     }
 
     pub fn reset(&self, sub: Subscription, commitment: Commitment, filters: Option<Filters>) {
@@ -220,11 +149,6 @@ impl PubSubManager {
     pub fn subscribe(&self, sub: Subscription, commitment: Commitment, filters: Option<Filters>) {
         let addr = self.get_addr_by_key(sub.key());
         addr.do_send(AccountCommand::Subscribe(sub, commitment, filters))
-    }
-
-    pub fn unsubscribe(&self, sub: Subscription, commitment: Commitment) {
-        let addr = self.get_addr_by_key(sub.key());
-        addr.do_send(AccountCommand::Purge(sub, commitment))
     }
 }
 
@@ -264,7 +188,7 @@ pub struct AccountUpdateManager {
     purge_queue: Option<DelayQueueHandle<(Subscription, Commitment)>>,
     additional_keys: ProgramFilters,
     last_received_at: Instant,
-    connected: Arc<AtomicBool>,
+    active: Arc<AtomicBool>,
     rpc_slot: Arc<AtomicU64>,
     buffer: BytesMut,
     config: Arc<WorkerConfig>,
@@ -281,7 +205,7 @@ impl AccountUpdateManager {
         actor_id: u32,
         accounts: AccountsDb,
         program_accounts: ProgramAccountsDb,
-        connected: Arc<AtomicBool>,
+        active: Arc<AtomicBool>,
         rpc_slot: Arc<AtomicU64>,
         config: Arc<WorkerConfig>,
     ) -> Addr<Self> {
@@ -301,7 +225,7 @@ impl AccountUpdateManager {
             program_accounts: program_accounts.clone(),
             purge_queue: None,
             additional_keys: HashMap::default(),
-            connected,
+            active,
             rpc_slot,
             last_received_at: Instant::now(),
             buffer: BytesMut::new(),
@@ -721,20 +645,18 @@ impl AccountUpdateManager {
     }
 
     fn update_status(&self) {
-        let connected = self.connection.is_connected();
-        let active = self.id_to_sub.len() == self.subs.len() && connected;
-
-        self.connected.store(connected, Ordering::Relaxed);
+        let is_active = self.id_to_sub.len() == self.subs.len() && self.connection.is_connected();
+        self.active.store(is_active, Ordering::Relaxed);
 
         metrics()
             .websocket_connected
             .with_label_values(&[&self.actor_name])
-            .set(if connected { 1 } else { 0 });
+            .set(if self.connection.is_connected() { 1 } else { 0 });
 
         metrics()
             .websocket_active
             .with_label_values(&[&self.actor_name])
-            .set(if active { 1 } else { 0 });
+            .set(if is_active { 1 } else { 0 });
     }
 
     fn process_ws_message(
@@ -1114,14 +1036,6 @@ impl StreamHandler<AccountCommand> for AccountUpdateManager {
     }
 }
 
-impl Handler<IsSubActive> for AccountUpdateManager {
-    type Result = bool;
-
-    fn handle(&mut self, item: IsSubActive, _: &mut Context<Self>) -> bool {
-        self.sub_to_id.contains_key(&(item.sub, item.commitment))
-    }
-}
-
 impl Handler<AccountCommand> for AccountUpdateManager {
     type Result = ();
 
@@ -1139,11 +1053,6 @@ impl Handler<AccountCommand> for AccountUpdateManager {
                     }
                 }
                 AccountCommand::Purge(sub, commitment) => {
-                    if !self.subs.contains_key(&(sub, commitment)) {
-                        // for handling cases when we might optimistically unsubscribe from program
-                        // accounts which might not be present
-                        return Ok(());
-                    }
                     metrics()
                         .commands
                         .with_label_values(&[&self.actor_name, "purge"])
@@ -1386,13 +1295,6 @@ pub enum AccountCommand {
     Subscribe(Subscription, Commitment, Option<Filters>),
     Reset(Subscription, Commitment, Option<Filters>),
     Purge(Subscription, Commitment),
-}
-
-#[derive(Message, Debug)]
-#[rtype(result = "bool")]
-pub struct IsSubActive {
-    sub: Subscription,
-    commitment: Commitment,
 }
 
 enum DelayQueueCommand<T> {
