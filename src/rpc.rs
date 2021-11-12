@@ -301,7 +301,7 @@ impl State {
 
     async fn request<T>(
         &self,
-        req: &'_ Request<'_, T>,
+        req: &Request<'_, T>,
         limit: &Semaphore,
     ) -> Result<
         impl Stream<Item = Result<Bytes, awc::error::PayloadError>>,
@@ -326,6 +326,7 @@ impl State {
             wait_time.observe_duration();
             let body = client
                 .post(&self.rpc_url)
+                .append_header(("X-Cache-Request-Method", req.method))
                 .timeout(REQUEST_TIMEOUT)
                 .send_json(&req)
                 .await;
