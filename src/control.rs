@@ -58,8 +58,7 @@ pub async fn run_control_interface(state: ControlState) {
     HttpServer::new(move || {
         App::new()
             .app_data(Data::new(state_clone.clone()))
-            .service(subscriptions_setter)
-            .service(subscriptions_getter)
+            .service(subscriptions_allowed_handler)
             .service(config_reloader)
     })
     .workers(1)
@@ -76,34 +75,27 @@ struct SubscribeAction {
 }
 
 #[post("/subscriptions/{action}")]
-async fn subscriptions_setter(
+async fn subscriptions_allowed_handler(
     path: web::Path<SubscribeAction>,
     state: Data<ControlState>,
 ) -> Result<HttpResponse, ControlError> {
     let val = match path.action.as_str() {
         "on" => true,
         "off" => false,
+        "status" => state
+            .subscriptions_allowed
+            .load(std::sync::atomic::Ordering::Relaxed),
         other => {
-            warn!(
-                "Couldn't change subscriptions_allowed, invalid action: {}",
-                other
-            );
+            warn!("Invalid action for subscriptions_allowed: {}", other);
             return Err(ControlError::BadRequest);
         }
     };
     state
         .subscriptions_allowed
         .store(val, std::sync::atomic::Ordering::Relaxed);
-    info!("Changed subscriptions_allowed to: {}", val);
-    Ok(HttpResponse::Ok().body(AnyBody::from_slice(b"OK")))
-}
+    info!("Subscriptions allowed: {}", val);
 
-#[post("/subscriptions/status")]
-async fn subscriptions_getter(state: Data<ControlState>) -> Result<HttpResponse, ControlError> {
-    let status = state
-        .subscriptions_allowed
-        .load(std::sync::atomic::Ordering::Relaxed);
-    let response = format!("Subsriptions: {}", if status { "on" } else { "off" });
+    let response = format!("Subsriptions: {}", if val { "on" } else { "off" });
     Ok(HttpResponse::Ok().body(AnyBody::from_slice(response.as_bytes())))
 }
 
