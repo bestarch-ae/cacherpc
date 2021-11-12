@@ -153,7 +153,7 @@ impl std::str::FromStr for LogFormat {
 }
 
 #[derive(thiserror::Error, Debug)]
-#[error("must be one of: \"on\", \"off\"")]
+#[error("must be one of: \"on\", \"off\", \"status\"")]
 pub struct SubscriptionsStateError;
 
 impl std::str::FromStr for SubscriptionsState {
@@ -163,6 +163,7 @@ impl std::str::FromStr for SubscriptionsState {
         match s.to_lowercase().as_str() {
             "on" => Ok(SubscriptionsState::On),
             "off" => Ok(SubscriptionsState::Off),
+            "status" => Ok(SubscriptionsState::Status),
             _ => Err(SubscriptionsStateError),
         }
     }
