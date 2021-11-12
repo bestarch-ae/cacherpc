@@ -226,6 +226,18 @@ impl PubSubManager {
         let addr = self.get_addr_by_key(sub.key());
         addr.do_send(AccountCommand::Purge(sub, commitment))
     }
+
+    pub fn persist_program_account(
+        &self,
+        owner: Pubkey,
+        commitment: Commitment,
+        account: Arc<Pubkey>,
+    ) {
+        // direct account to the same AccountUpdateManager which will be responsible for
+        // managing the subscription of it's owner program
+        let addr = self.get_addr_by_key(owner);
+        addr.do_send(AccountCommand::PersistAccount(owner, commitment, account));
+    }
 }
 
 enum Connection {
@@ -262,6 +274,8 @@ pub struct AccountUpdateManager {
     accounts: AccountsDb,
     program_accounts: ProgramAccountsDb,
     purge_queue: Option<DelayQueueHandle<(Subscription, Commitment)>>,
+    // Accounts that should persist in cache as long as their owner has active sub
+    sticky_accounts: HashMap<(Pubkey, Commitment), Vec<Arc<Pubkey>>>,
     additional_keys: ProgramFilters,
     last_received_at: Instant,
     connected: Arc<AtomicBool>,
@@ -296,6 +310,7 @@ impl AccountUpdateManager {
             inflight: HashMap::default(),
             subs: HashMap::default(),
             active_accounts: HashMap::default(),
+            sticky_accounts: HashMap::default(),
             request_id: 1,
             accounts: accounts.clone(),
             program_accounts: program_accounts.clone(),
@@ -685,6 +700,9 @@ impl AccountUpdateManager {
         info!(self.actor_id, message = "purge", key = %sub.key(), commitment = ?commitment);
         match sub {
             Subscription::Program(program_key) => {
+                // first drop sticky account keys for this program
+                self.sticky_accounts.remove(&(*program_key, commitment));
+                // then cleanup up the rest
                 let keys = self
                     .additional_keys
                     .remove(&(*program_key, commitment))
@@ -1177,6 +1195,12 @@ impl Handler<AccountCommand> for AccountUpdateManager {
                         self.reset_filter(ctx, sub, commitment, filters);
                     }
                 }
+                AccountCommand::PersistAccount(owner, commitment, account) => {
+                    self.sticky_accounts
+                        .entry((owner, commitment))
+                        .or_insert_with(Vec::new)
+                        .push(account);
+                }
             }
             Ok(())
         })()
@@ -1386,6 +1410,7 @@ pub enum AccountCommand {
     Subscribe(Subscription, Commitment, Option<Filters>),
     Reset(Subscription, Commitment, Option<Filters>),
     Purge(Subscription, Commitment),
+    PersistAccount(Pubkey, Commitment, Arc<Pubkey>), // keep account's rc around
 }
 
 #[derive(Message, Debug)]

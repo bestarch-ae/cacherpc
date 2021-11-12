@@ -298,6 +298,16 @@ impl State {
     fn unsubscribe(&self, sub: Subscription, commitment: Commitment) {
         self.pubsub.unsubscribe(sub, commitment);
     }
+    // persist account via keeping its reference above 1
+    pub fn persist_program_account(
+        &self,
+        owner: Pubkey,
+        commitment: Commitment,
+        account_rc: Arc<Pubkey>,
+    ) {
+        self.pubsub
+            .persist_program_account(owner, commitment, account_rc);
+    }
 
     async fn request<T>(
         &self,
@@ -778,10 +788,13 @@ impl Cacheable for GetProgramAccounts {
                 },
                 commitment,
             );
-            keys.insert(key_ref);
+            keys.insert(Arc::clone(&key_ref));
             // as we will subscribe for this program, there's no need to keep separate
             // subscriptions for its accounts, if any
             state.unsubscribe(Subscription::Account(pubkey), commitment);
+            // but we have to keep accounts around in cache, while owner's
+            // subscription is active, they will be dropped once subscription ends
+            state.persist_program_account(self.pubkey, commitment, key_ref);
         }
         state
             .program_accounts
