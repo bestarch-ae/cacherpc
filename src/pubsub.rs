@@ -685,12 +685,8 @@ impl AccountUpdateManager {
                 .with_label_values(&[&self.actor_name])
                 .dec();
 
-            for key in self
-                .program_accounts
-                .remove_all(&key, commitment, Some(filters))
-            {
-                self.accounts.remove(&key, commitment)
-            }
+            self.program_accounts
+                .remove_all(&key, commitment, Some(filters));
 
             ctx.cancel_future(handle);
         }
@@ -701,7 +697,7 @@ impl AccountUpdateManager {
         match sub {
             Subscription::Program(program_key) => {
                 // first drop sticky account keys for this program
-                self.sticky_accounts.remove(&(*program_key, commitment));
+                let account_refs = self.sticky_accounts.remove(&(*program_key, commitment));
                 // then cleanup up the rest
                 let keys = self
                     .additional_keys
@@ -720,17 +716,18 @@ impl AccountUpdateManager {
                             .with_label_values(&[&self.actor_name])
                             .dec();
                     }
-                    for key in self
-                        .program_accounts
-                        .remove_all(key, commitment, filter.clone())
-                    {
-                        self.accounts.remove(&key, commitment)
-                    }
+                    self.program_accounts
+                        .remove_all(key, commitment, filter.clone());
                 }
                 metrics()
                     .additional_keys_entries
                     .with_label_values(&[&self.actor_name])
                     .set(self.additional_keys.len() as i64);
+                for arc in account_refs.into_iter().flatten() {
+                    let acc = *arc;
+                    drop(arc);
+                    self.accounts.remove(&acc, commitment);
+                }
             }
             Subscription::Account(key) => {
                 self.accounts.remove(key, commitment);

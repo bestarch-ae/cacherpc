@@ -5,7 +5,6 @@ use std::sync::Arc;
 use bytes::{Buf, Bytes};
 use dashmap::mapref::entry::Entry;
 use dashmap::{mapref::one::Ref, DashMap};
-use either::Either;
 use serde::{Deserialize, Serialize};
 
 use crate::filter::Filters;
@@ -160,13 +159,8 @@ impl ProgramAccountsDb {
         }
     }
 
-    pub fn remove_all(
-        &self,
-        key: &Pubkey,
-        commitment: Commitment,
-        filters: Option<Filters>,
-    ) -> impl Iterator<Item = Pubkey> {
-        let iter = if let Entry::Occupied(mut entry) = self.map.entry((*key, filters.clone())) {
+    pub fn remove_all(&self, key: &Pubkey, commitment: Commitment, filters: Option<Filters>) {
+        if let Entry::Occupied(mut entry) = self.map.entry((*key, filters.clone())) {
             let state = entry.get_mut();
             let keys = state.take_commitment(commitment);
             if state.is_empty() {
@@ -182,19 +176,9 @@ impl ProgramAccountsDb {
                     }
                 })
             }
-
-            let iter = keys.into_iter().flatten().map(|arc| {
-                let key = *arc;
-                drop(arc);
-                key
-            });
-
-            Either::Left(iter)
-        } else {
-            Either::Right(std::iter::empty())
-        };
+            drop(keys);
+        }
         metrics().program_account_entries.set(self.map.len() as i64);
-        iter
     }
 }
 
@@ -721,13 +705,10 @@ fn db_refs() {
     accounts.remove(&Pubkey::zero(), Commitment::Confirmed);
     assert_eq!(accounts.map.len(), 1);
 
-    let program_accounts = programs.remove_all(&Pubkey::zero(), Commitment::Confirmed, None);
+    programs.remove_all(&Pubkey::zero(), Commitment::Confirmed, None);
     assert_eq!(programs.map.len(), 0);
     assert_eq!(accounts.map.len(), 1);
 
-    for key in program_accounts {
-        accounts.remove(&key, Commitment::Confirmed);
-    }
     assert_eq!(accounts.map.len(), 0);
 }
 
