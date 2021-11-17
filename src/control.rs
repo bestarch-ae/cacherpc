@@ -55,18 +55,32 @@ impl RpcConfigSender {
 pub async fn run_control_interface(state: ControlState) {
     info!("Starting control interface");
     let state_clone = state.clone();
-    HttpServer::new(move || {
+    let uds = HttpServer::new(move || {
         App::new()
             .app_data(Data::new(state_clone.clone()))
             .service(subscriptions_allowed_handler)
             .service(config_reloader)
     })
     .workers(1)
-    .bind_uds(state.socket_path)
-    .unwrap()
-    .run()
-    .await
-    .unwrap();
+    .bind_uds(&state.socket_path);
+    match uds {
+        Ok(server) => {
+            if let Err(error) = server.run().await {
+                warn!(
+                    %error,
+                    path=?state.socket_path,
+                    "Failed to run control interface server"
+                );
+            }
+        }
+        Err(error) => {
+            warn!(
+                %error,
+                path=?state.socket_path,
+                "Failed to bind control interface to UDS at given path"
+            );
+        }
+    }
 }
 
 #[derive(Deserialize, Debug)]
@@ -142,7 +156,7 @@ impl ResponseError for ControlError {
 
 pub async fn handle_command(
     cmd: &Command,
-    socket_path: PathBuf,
+    socket_path: &PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use awc::{Client, Connector};
     use awc_uds::UdsConnector;
