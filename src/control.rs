@@ -1,5 +1,5 @@
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{atomic::AtomicBool, Arc},
 };
 
@@ -156,7 +156,7 @@ impl ResponseError for ControlError {
 
 pub async fn handle_command(
     cmd: &Command,
-    socket_path: &PathBuf,
+    socket_path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use awc::{Client, Connector};
     use awc_uds::UdsConnector;
