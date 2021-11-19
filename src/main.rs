@@ -33,8 +33,12 @@ async fn main() -> Result<()> {
     // execute the command againts other, already running application instance
     if let Some(ref cmd) = options.command {
         let mut exit_code = 0;
-        if let Err(e) = handle_command(cmd, options.control_socket_path).await {
+        if let Err(e) = handle_command(cmd, &options.control_socket_path).await {
             eprintln!("Command processing error: {}", e);
+            eprintln!(
+                "Make sure control interface is running and has access to UDS at {:?}",
+                options.control_socket_path
+            );
             exit_code = 1;
         };
         std::process::exit(exit_code);
