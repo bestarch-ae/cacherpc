@@ -316,6 +316,10 @@ impl State {
                 .timeout(REQUEST_TIMEOUT)
                 .send_json(&req)
                 .await;
+            metrics()
+                .backend_requests_count
+                .with_label_values(&[req.method])
+                .inc(); // count request attempts, even failed ones
             match body {
                 Ok(resp) => {
                     break Ok(resp);
@@ -1540,6 +1544,10 @@ pub async fn rpc_handler(
                     metrics().streaming_errors.inc();
                     err
                 });
+            metrics()
+                .backend_requests_count
+                .with_label_values(&["passthrough"])
+                .inc(); // count request attempts, even failed ones
 
             request_time.observe_duration();
             match resp {
