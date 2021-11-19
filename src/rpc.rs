@@ -273,7 +273,7 @@ impl State {
         self.accounts.insert(key, data, commitment)
     }
 
-    fn subscription_active(&self, key: Pubkey) -> bool {
+    fn subscription_active(&self, key: (Pubkey, Commitment)) -> bool {
         self.pubsub.subscription_active(key)
     }
 
@@ -528,7 +528,7 @@ impl Cacheable for GetAccountInfo {
             Err(UncacheableReason::Encoding)
         } else if self.config.data_slice.is_some() {
             Err(UncacheableReason::DataSlice)
-        } else if !state.subscription_active(self.pubkey) {
+        } else if !state.subscription_active((self.pubkey, self.commitment())) {
             Err(UncacheableReason::Inactive)
         } else {
             Ok(())
@@ -652,7 +652,7 @@ impl Cacheable for GetProgramAccounts {
             Err(UncacheableReason::DataSlice)
         } else if !self.valid_filters {
             Err(UncacheableReason::Filters)
-        } else if !state.subscription_active(self.pubkey) {
+        } else if !state.subscription_active((self.pubkey, self.commitment())) {
             Err(UncacheableReason::Inactive)
         } else {
             Ok(())

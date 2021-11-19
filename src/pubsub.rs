@@ -116,7 +116,7 @@ impl PubSubManager {
         }
     }
 
-    fn get_idx_by_key(&self, key: Pubkey) -> usize {
+    fn get_idx_by_key(&self, key: (Pubkey, Commitment)) -> usize {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
@@ -126,18 +126,18 @@ impl PubSubManager {
         (hash % self.workers.len() as u64) as usize
     }
 
-    fn get_addr_by_key(&self, key: Pubkey) -> actix::Addr<AccountUpdateManager> {
+    fn get_addr_by_key(&self, key: (Pubkey, Commitment)) -> actix::Addr<AccountUpdateManager> {
         let idx = self.get_idx_by_key(key);
         self.workers[idx].0.clone()
     }
 
-    pub fn subscription_active(&self, key: Pubkey) -> bool {
+    pub fn subscription_active(&self, key: (Pubkey, Commitment)) -> bool {
         let idx = self.get_idx_by_key(key);
         self.workers[idx].1.load(Ordering::Relaxed)
     }
 
     pub fn reset(&self, sub: Subscription, commitment: Commitment, filters: Option<Filters>) {
-        let addr = self.get_addr_by_key(sub.key());
+        let addr = self.get_addr_by_key((sub.key(), commitment));
         addr.do_send(AccountCommand::Reset(sub, commitment, filters))
     }
 
@@ -147,7 +147,7 @@ impl PubSubManager {
     }
 
     pub fn subscribe(&self, sub: Subscription, commitment: Commitment, filters: Option<Filters>) {
-        let addr = self.get_addr_by_key(sub.key());
+        let addr = self.get_addr_by_key((sub.key(), commitment));
         addr.do_send(AccountCommand::Subscribe(sub, commitment, filters))
     }
 }
