@@ -708,8 +708,6 @@ fn db_refs() {
     programs.remove_all(&Pubkey::zero(), Commitment::Confirmed, None);
     assert_eq!(programs.map.len(), 0);
     assert_eq!(accounts.map.len(), 1);
-
-    assert_eq!(accounts.map.len(), 0);
 }
 
 #[test]
