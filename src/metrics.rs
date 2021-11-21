@@ -279,6 +279,7 @@ pub struct RpcMetrics {
     pub batch_requests: IntCounter,
     pub waf_rejections: IntCounter,
     pub streaming_errors: IntCounter,
+    pub backend_requests_count: IntCounterVec,
 }
 
 impl RpcMetrics {
@@ -495,6 +496,12 @@ pub fn rpc_metrics() -> &'static RpcMetrics {
         streaming_errors: register_int_counter!(
             "streaming_errors",
             "Number of errors while streaming response"
+        )
+        .unwrap(),
+        backend_requests_count: register_int_counter_vec!(
+            "backend_requests_count",
+            "Number of requests of each type, sent to validator",
+            &["type"]
         )
         .unwrap(),
     });
