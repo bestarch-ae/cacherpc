@@ -58,7 +58,7 @@ type ProgramAccountsKey = (Pubkey, Option<Filters>);
 #[derive(Clone)]
 pub struct ProgramAccountsDb {
     map: Arc<DashMap<ProgramAccountsKey, ProgramState>>,
-    observed_filters: Arc<DashMap<Pubkey, HashSet<Filters>>>,
+    observed_filters: Arc<DashMap<(Pubkey, Commitment), HashSet<Filters>>>,
 }
 
 impl Default for ProgramAccountsDb {
@@ -97,7 +97,7 @@ impl ProgramAccountsDb {
         if let Some(filters) = filters.as_ref() {
             data.iter().for_each(|key| {
                 self.observed_filters
-                    .entry(**key)
+                    .entry((**key, commitment))
                     .or_default()
                     .insert(filters.clone());
             })
@@ -124,11 +124,14 @@ impl ProgramAccountsDb {
         let has_new_or_old_filters = !filter_groups.is_empty()
             || self
                 .observed_filters
-                .get(&*data)
+                .get(&(*data, commitment))
                 .map_or(false /* no set == empty */, |set| !set.is_empty());
 
         if has_new_or_old_filters {
-            let mut old_groups = self.observed_filters.entry(*data).or_default();
+            let mut old_groups = self
+                .observed_filters
+                .entry((*data, commitment))
+                .or_default();
             let diff = old_groups.symmetric_difference(&filter_groups);
             for filter in diff {
                 let state = self.map.get_mut(&(*key, Some(filter.clone())));
@@ -165,7 +168,7 @@ impl ProgramAccountsDb {
 
             if let Some(filters) = filters {
                 keys.as_ref().into_iter().flatten().for_each(|key| {
-                    if let Some(mut set) = self.observed_filters.get_mut(&*key) {
+                    if let Some(mut set) = self.observed_filters.get_mut(&(**key, commitment)) {
                         set.remove(&filters);
                     }
                 })
