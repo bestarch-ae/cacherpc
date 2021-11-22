@@ -114,12 +114,14 @@ pub enum LogFormat {
 pub enum Command {
     Subscriptions { state: SubscriptionsState },
     ConfigReload,
+    WafReload,
 }
 
 impl Command {
     pub const fn to_url_path(&self) -> &'static str {
         match self {
             Self::ConfigReload => "config/reload",
+            Self::WafReload => "waf/reload",
             Self::Subscriptions { state } => match state {
                 SubscriptionsState::On => "subscriptions/on",
                 SubscriptionsState::Off => "subscriptions/off",
