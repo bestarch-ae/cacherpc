@@ -64,6 +64,7 @@ harness = false
 solana-account-decoder = { git = "https://github.com/polachok/solana", rev = "ec4e167b00b2fd3799b935bb7ca49775f6a4b63e" }
 solana-sdk = { git = "https://github.com/polachok/solana", rev = "ec4e167b00b2fd3799b935bb7ca49775f6a4b63e" }
 solana-program = { git = "https://github.com/polachok/solana", rev = "ec4e167b00b2fd3799b935bb7ca49775f6a4b63e" }
+mlua = { git = "https://github.com/khvzak/mlua.git", rev = "066d28f" }
 
 
 #[patch.crates-io]
