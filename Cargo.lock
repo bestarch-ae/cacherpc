@@ -681,7 +681,7 @@ dependencies = [
 
 [[package]]
 name = "cache-rpc"
-version = "0.1.38"
+version = "0.2.0"
 dependencies = [
  "actix",
  "actix-codec",
@@ -1849,8 +1849,7 @@ dependencies = [
 [[package]]
 name = "mlua"
 version = "0.6.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4235d7e740d73d7429df6f176c81b248f05c39d67264d45a7d8cecb67c227f6f"
+source = "git+https://github.com/khvzak/mlua.git?rev=066d28f#066d28f5e5e5827a584d39302dadb173fde509af"
 dependencies = [
  "bstr",
  "cc",
@@ -1859,6 +1858,7 @@ dependencies = [
  "num-traits",
  "once_cell",
  "pkg-config",
+ "rustc-hash",
 ]
 
 [[package]]
@@ -2490,6 +2490,12 @@ name = "rustc-demangle"
 version = "0.1.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7ef03e0a2b150c7a90d01faf6254c9c48a41e95fb2a8c2ac1c6f0d2b9aefc342"
+
+[[package]]
+name = "rustc-hash"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2"
 
 [[package]]
 name = "rustc_version"

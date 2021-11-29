@@ -275,7 +275,6 @@ use anyhow::Context;
 impl Waf {
     pub fn new(path: impl AsRef<Path>) -> Result<Self, anyhow::Error> {
         const LUA_JSON: &str = include_str!("json.lua");
-        // if any of the lua preparation steps contain errors, then WAF will not be used
         let lua = Lua::new_with(
             StdLib::MATH | StdLib::STRING | StdLib::PACKAGE,
             LuaOptions::default(),
@@ -294,6 +293,7 @@ impl Waf {
             lua,
             path: path.as_ref().to_path_buf(),
         };
+
         waf.reload()?;
 
         Ok(waf)
@@ -308,6 +308,10 @@ impl Waf {
             .load(&rules)
             .into_function()
             .with_context(|| "Error parsing lua file")?;
+
+        self.lua
+            .unload("waf")
+            .with_context(|| "Error unloading old WAF function")?;
         let _: mlua::Value<'_> = self
             .lua
             .load_from_function("waf", rules)
