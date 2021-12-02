@@ -201,10 +201,10 @@ impl Config {
     pub fn from_options(options: &Options) -> Config {
         let account_info_request_queue_size = options
             .account_info_request_queue_size
-            .unwrap_or_else(|| options.account_info_request_limit * 2);
+            .unwrap_or(crate::DEFAULT_GAI_QUEUE_SIZE);
         let program_accounts_request_queue_size = options
             .account_info_request_queue_size
-            .unwrap_or_else(|| options.program_accounts_request_limit * 5);
+            .unwrap_or(crate::DEFAULT_GPA_QUEUE_SIZE);
         Config {
             rpc: rpc::Config {
                 request_limits: rpc::RequestLimits {

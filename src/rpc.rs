@@ -1810,9 +1810,20 @@ pub struct RequestQueueSize {
     pub program_accounts: usize,
 }
 
+// default values effectively disable any restrictions
+impl Default for RequestQueueSize {
+    fn default() -> Self {
+        Self {
+            account_info: crate::DEFAULT_GAI_QUEUE_SIZE,
+            program_accounts: crate::DEFAULT_GPA_QUEUE_SIZE,
+        }
+    }
+}
+
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub request_limits: RequestLimits,
+    #[serde(default)]
     pub request_queue_size: RequestQueueSize,
     #[serde(default)]
     pub ignore_base58_limit: bool,
