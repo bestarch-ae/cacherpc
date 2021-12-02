@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use crate::filter::Filters;
 use crate::metrics::db_metrics as metrics;
 
+use tokio::sync::{Semaphore, SemaphorePermit};
+
 pub struct ProgramState {
     account_keys: [Option<HashSet<Arc<Pubkey>>>; 3],
     slots: [u64; 3],
@@ -638,6 +640,59 @@ impl BytesChain {
 
     pub fn push(&mut self, bytes: Bytes) {
         self.bytes.push(bytes);
+    }
+}
+
+pub struct SemaphoreQueue {
+    wait_quota: Semaphore,
+    semaphore: Semaphore,
+}
+
+impl SemaphoreQueue {
+    pub fn new(queue_size: usize, permits: usize) -> Self {
+        Self {
+            wait_quota: Semaphore::new(queue_size),
+            semaphore: Semaphore::new(permits),
+        }
+    }
+
+    pub async fn acquire(&self) -> Option<SemaphorePermit<'_>> {
+        let _queue_slot = self.wait_quota.try_acquire().ok()?;
+        let permit = self.semaphore.acquire().await.ok()?;
+
+        Some(permit)
+    }
+
+    pub fn available_permits(&self) -> usize {
+        self.semaphore.available_permits()
+    }
+
+    pub fn queue_permits(&self) -> usize {
+        self.wait_quota.available_permits()
+    }
+
+    pub async fn apply_limit(&self, old_limit: usize, new_limit: usize) {
+        if new_limit > old_limit {
+            self.semaphore.add_permits(new_limit - old_limit);
+        } else {
+            for _ in 0..old_limit - new_limit {
+                if let Ok(permit) = self.semaphore.acquire().await {
+                    permit.forget();
+                }
+            }
+        }
+    }
+
+    pub async fn apply_queue_size(&self, old_size: usize, new_size: usize) {
+        if new_size > old_size {
+            self.wait_quota.add_permits(new_size - old_size);
+        } else {
+            for _ in 0..old_size - new_size {
+                if let Ok(permit) = self.wait_quota.acquire().await {
+                    permit.forget();
+                }
+            }
+        }
     }
 }
 

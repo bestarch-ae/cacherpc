@@ -47,6 +47,18 @@ pub struct Options {
     )]
     pub account_info_request_limit: usize,
     #[structopt(
+        short = "A",
+        long = "account-request-queue-size",
+        help = "maximum number of getAccountInfo requests, that may be queued, if concurrent limit is reached"
+    )]
+    account_info_request_queue_size: Option<usize>,
+    #[structopt(
+        short = "P",
+        long = "program-request-queue-size",
+        help = "maximum number of getProgramAccounts requests, that may be queued, if concurrent limit is reached"
+    )]
+    program_accounts_request_queue_size: Option<usize>,
+    #[structopt(
         short = "b",
         long = "body-cache-size",
         default_value = "100",
@@ -187,11 +199,21 @@ impl Config {
     }
 
     pub fn from_options(options: &Options) -> Config {
+        let account_info_request_queue_size = options
+            .account_info_request_queue_size
+            .unwrap_or_else(|| options.account_info_request_limit * 2);
+        let program_accounts_request_queue_size = options
+            .account_info_request_queue_size
+            .unwrap_or_else(|| options.program_accounts_request_limit * 5);
         Config {
             rpc: rpc::Config {
                 request_limits: rpc::RequestLimits {
                     account_info: options.account_info_request_limit,
                     program_accounts: options.program_accounts_request_limit,
+                },
+                request_queue_size: rpc::RequestQueueSize {
+                    account_info: account_info_request_queue_size,
+                    program_accounts: program_accounts_request_queue_size,
                 },
                 ignore_base58_limit: options.ignore_base58,
             },
