@@ -6,3 +6,6 @@ pub mod pubsub;
 pub mod rpc;
 pub mod rpc_monitor;
 pub mod types;
+
+const DEFAULT_GAI_QUEUE_SIZE: usize = 2 << 19;
+const DEFAULT_GPA_QUEUE_SIZE: usize = 2 << 18;
