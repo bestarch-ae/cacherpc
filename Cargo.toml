@@ -1,6 +1,6 @@
 [package]
 name = "cache-rpc"
-version = "0.2.0"
+version = "0.2.1"
 authors = ["Alexander Polakov <a.polakov@iconic.vc>"]
 edition = "2018"
 license = "MIT"
@@ -43,7 +43,7 @@ either = "1.6"
 humantime = "2.1"
 toml = "0.5"
 arc-swap = "1.4"
-mlua = { version = "0.6", features = ["luajit", "vendored"] }
+mlua = { version = "0.7", features = ["luajit", "vendored"] }
 awc-uds = "0.1.0"
 pin-project = "1.0"
 
@@ -65,7 +65,6 @@ harness = false
 solana-account-decoder = { git = "https://github.com/polachok/solana", rev = "ec4e167b00b2fd3799b935bb7ca49775f6a4b63e" }
 solana-sdk = { git = "https://github.com/polachok/solana", rev = "ec4e167b00b2fd3799b935bb7ca49775f6a4b63e" }
 solana-program = { git = "https://github.com/polachok/solana", rev = "ec4e167b00b2fd3799b935bb7ca49775f6a4b63e" }
-mlua = { git = "https://github.com/khvzak/mlua.git", rev = "066d28f" }
 
 
 #[patch.crates-io]

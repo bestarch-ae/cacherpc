@@ -681,7 +681,7 @@ dependencies = [
 
 [[package]]
 name = "cache-rpc"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "actix",
  "actix-codec",
@@ -1849,8 +1849,9 @@ dependencies = [
 
 [[package]]
 name = "mlua"
-version = "0.6.6"
-source = "git+https://github.com/khvzak/mlua.git?rev=066d28f#066d28f5e5e5827a584d39302dadb173fde509af"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "871831bd7c53c48b85db47a03e5974915679a91ddd5f897dece6ce030e5191d2"
 dependencies = [
  "bstr",
  "cc",
