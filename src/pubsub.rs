@@ -1,8 +1,11 @@
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
+use std::task::Poll;
 use std::time::Duration;
 
 use actix::io::SinkWrite;
@@ -13,7 +16,11 @@ use actix::prelude::{
 use actix::Arbiter;
 use actix_http::ws;
 use bytes::BytesMut;
-use futures_util::stream::StreamExt;
+use futures_util::{
+    future::{join, Join},
+    stream::StreamExt,
+};
+use pin_project::pin_project;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use tokio::sync::mpsc;
@@ -87,6 +94,54 @@ pub struct PubSubManager {
     subscriptions_allowed: Arc<AtomicBool>,
 }
 
+impl Actor for PubSubManager {
+    type Context = Context<Self>;
+}
+
+impl Handler<PubSubSubscribe> for PubSubManager {
+    type Result = ();
+    fn handle(&mut self, msg: PubSubSubscribe, _: &mut Self::Context) -> Self::Result {
+        let sub = Subscription::Account(msg.key);
+        self.subscribe(sub, msg.commitment, None, Some(msg.owner));
+    }
+}
+
+type IsSubActiveRequest = actix::prelude::Request<AccountUpdateManager, IsSubActive>;
+#[allow(clippy::large_enum_variant)]
+#[pin_project(project = SubscriptionActiveProject)]
+pub enum SubscriptionActive {
+    Ready(bool),
+    RequestWithOwner(#[pin] Join<IsSubActiveRequest, IsSubActiveRequest>),
+    Request(#[pin] IsSubActiveRequest),
+}
+
+impl Future for SubscriptionActive {
+    type Output = bool;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        match self.project() {
+            SubscriptionActiveProject::Ready(res) => Poll::Ready(*res),
+            SubscriptionActiveProject::RequestWithOwner(req) => {
+                match req.poll(cx) {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready((Ok(true), _)) => {
+                        metrics().subscriptions_skipped.inc(); // owner subscription exists
+                        Poll::Ready(true)
+                    }
+                    Poll::Ready((_, Ok(true))) => Poll::Ready(true),
+                    Poll::Ready(_) => Poll::Ready(false),
+                }
+            }
+
+            SubscriptionActiveProject::Request(req) => match req.poll(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Ok(value)) => Poll::Ready(value),
+                Poll::Ready(Err(_)) => Poll::Ready(false),
+            },
+        }
+    }
+}
+
 impl PubSubManager {
     pub fn init(
         connections: u32,
@@ -99,21 +154,28 @@ impl PubSubManager {
         let mut workers = Vec::new();
         let config = Arc::new(worker_config);
         for id in 0..connections {
-            let active = Arc::new(AtomicBool::new(false));
+            let connected = Arc::new(AtomicBool::new(false));
             let addr = AccountUpdateManager::init(
                 id,
                 accounts.clone(),
                 program_accounts.clone(),
-                Arc::clone(&active),
+                Arc::clone(&connected),
                 rpc_slot.clone(),
                 Arc::clone(&config),
             );
-            workers.push((addr, active))
+            workers.push((addr, connected))
         }
-        PubSubManager {
+        let manager = PubSubManager {
             workers,
             subscriptions_allowed,
+        };
+        let actor = manager.clone().start();
+        // make sure all the workers, have an address of pubsub manager
+        for (w, _) in &manager.workers {
+            w.do_send(InitManager(Addr::clone(&actor)));
         }
+
+        manager
     }
 
     fn get_idx_by_key(&self, key: (Pubkey, Commitment)) -> usize {
@@ -131,14 +193,48 @@ impl PubSubManager {
         self.workers[idx].0.clone()
     }
 
-    pub fn subscription_active(&self, key: (Pubkey, Commitment)) -> bool {
+    pub fn websocket_connected(&self, key: (Pubkey, Commitment)) -> bool {
         let idx = self.get_idx_by_key(key);
         self.workers[idx].1.load(Ordering::Relaxed)
     }
 
-    pub fn reset(&self, sub: Subscription, commitment: Commitment, filters: Option<Filters>) {
+    pub fn subscription_active(
+        &self,
+        sub: Subscription,
+        commitment: Commitment,
+        owner: Option<Pubkey>,
+    ) -> SubscriptionActive {
+        if self.websocket_connected((sub.key(), commitment)) {
+            let addr = self.get_addr_by_key((sub.key(), commitment));
+
+            owner
+                .map(|key| (self.get_addr_by_key((key, commitment)), key))
+                .map(|(owner_addr, key)| {
+                    SubscriptionActive::RequestWithOwner(join(
+                        owner_addr.send(IsSubActive {
+                            sub: Subscription::Program(key),
+                            commitment,
+                        }),
+                        addr.send(IsSubActive { sub, commitment }),
+                    ))
+                })
+                .unwrap_or_else(|| {
+                    SubscriptionActive::Request(addr.send(IsSubActive { sub, commitment }))
+                })
+        } else {
+            SubscriptionActive::Ready(false)
+        }
+    }
+
+    pub fn reset(
+        &self,
+        sub: Subscription,
+        commitment: Commitment,
+        filters: Option<Filters>,
+        owner: Option<Pubkey>,
+    ) {
         let addr = self.get_addr_by_key((sub.key(), commitment));
-        addr.do_send(AccountCommand::Reset(sub, commitment, filters))
+        addr.do_send(AccountCommand::Reset(sub, commitment, filters, owner))
     }
 
     #[inline]
@@ -146,9 +242,20 @@ impl PubSubManager {
         self.subscriptions_allowed.load(Ordering::Relaxed)
     }
 
-    pub fn subscribe(&self, sub: Subscription, commitment: Commitment, filters: Option<Filters>) {
+    pub fn subscribe(
+        &self,
+        sub: Subscription,
+        commitment: Commitment,
+        filters: Option<Filters>,
+        owner: Option<Pubkey>,
+    ) {
         let addr = self.get_addr_by_key((sub.key(), commitment));
-        addr.do_send(AccountCommand::Subscribe(sub, commitment, filters))
+        addr.do_send(AccountCommand::Subscribe(sub, commitment, filters, owner))
+    }
+
+    pub fn unsubscribe(&self, key: Pubkey, commitment: Commitment) {
+        let addr = self.get_addr_by_key((key, commitment));
+        addr.do_send(AccountCommand::Unsubscribe(key, commitment))
     }
 }
 
@@ -171,7 +278,60 @@ impl Connection {
     }
 }
 
-type ProgramFilters = HashMap<(Pubkey, Commitment), FilterTree<SpawnHandle>>;
+#[derive(Default)]
+struct ProgramFilters {
+    filtered: HashMap<(Pubkey, Commitment), FilterTree<SpawnHandle>>,
+    nofilters: HashMap<(Pubkey, Commitment), SpawnHandle>,
+}
+
+impl ProgramFilters {
+    fn len(&self) -> usize {
+        self.filtered.len() + self.nofilters.len()
+    }
+
+    fn get(&self, key: &(Pubkey, Commitment)) -> Option<&FilterTree<SpawnHandle>> {
+        self.filtered.get(key)
+    }
+
+    fn insert(
+        &mut self,
+        key: (Pubkey, Commitment),
+        filters: Option<Filters>,
+        handle: SpawnHandle,
+    ) -> Option<SpawnHandle> {
+        match filters {
+            Some(filters) => self
+                .filtered
+                .entry(key)
+                .or_insert_with(FilterTree::new)
+                .insert(filters, handle),
+            None => self.nofilters.insert(key, handle),
+        }
+    }
+
+    fn remove(
+        &mut self,
+        key: &(Pubkey, Commitment),
+        filters: &Option<Filters>,
+    ) -> Option<SpawnHandle> {
+        if let Some(filters) = filters {
+            self.filtered
+                .get_mut(key)
+                .map(|entry| entry.remove(filters))
+                .flatten()
+        } else {
+            self.nofilters.remove(key)
+        }
+    }
+    fn remove_all(&mut self, key: &(Pubkey, Commitment)) -> impl Iterator<Item = SpawnHandle> {
+        self.filtered
+            .remove(key)
+            .into_iter()
+            .flatten()
+            .map(|(_, h)| h)
+            .chain(self.nofilters.remove(key).into_iter())
+    }
+}
 
 pub struct AccountUpdateManager {
     actor_id: u32,
@@ -188,10 +348,11 @@ pub struct AccountUpdateManager {
     purge_queue: Option<DelayQueueHandle<(Subscription, Commitment)>>,
     additional_keys: ProgramFilters,
     last_received_at: Instant,
-    active: Arc<AtomicBool>,
+    connected: Arc<AtomicBool>,
     rpc_slot: Arc<AtomicU64>,
     buffer: BytesMut,
     config: Arc<WorkerConfig>,
+    manager: Option<Addr<PubSubManager>>,
 }
 
 impl std::fmt::Debug for AccountUpdateManager {
@@ -205,7 +366,7 @@ impl AccountUpdateManager {
         actor_id: u32,
         accounts: AccountsDb,
         program_accounts: ProgramAccountsDb,
-        active: Arc<AtomicBool>,
+        connected: Arc<AtomicBool>,
         rpc_slot: Arc<AtomicU64>,
         config: Arc<WorkerConfig>,
     ) -> Addr<Self> {
@@ -222,14 +383,15 @@ impl AccountUpdateManager {
             active_accounts: HashMap::default(),
             request_id: 1,
             accounts: accounts.clone(),
-            program_accounts: program_accounts.clone(),
+            program_accounts,
             purge_queue: None,
-            additional_keys: HashMap::default(),
-            active,
+            additional_keys: ProgramFilters::default(),
+            connected,
             rpc_slot,
             last_received_at: Instant::now(),
             buffer: BytesMut::new(),
             config,
+            manager: None,
         })
     }
 
@@ -539,18 +701,17 @@ impl AccountUpdateManager {
         ctx: &mut Context<Self>,
         sub: Subscription,
         commitment: Commitment,
-        filters: Filters,
+        filters: Option<Filters>,
     ) {
         let key = sub.key();
+        let to_purge = filters.clone();
+        let spawn_handle = ctx.run_later(self.config.ttl, move |actor, ctx| {
+            actor.purge_filter(ctx, sub, commitment, to_purge);
+        });
+
         let handle = self
             .additional_keys
-            .entry((key, commitment))
-            .or_insert_with(FilterTree::new)
-            .insert(filters.clone(), {
-                ctx.run_later(self.config.ttl, move |actor, ctx| {
-                    actor.purge_filter(ctx, sub, commitment, filters);
-                })
-            });
+            .insert((key, commitment), filters, spawn_handle);
         metrics()
             .additional_keys_entries
             .with_label_values(&[&self.actor_name])
@@ -579,13 +740,10 @@ impl AccountUpdateManager {
         ctx: &mut Context<Self>,
         sub: Subscription,
         commitment: Commitment,
-        filters: Filters,
+        filters: Option<Filters>,
     ) {
         let key = sub.key();
-        let handle = self
-            .additional_keys
-            .get_mut(&(key, commitment))
-            .and_then(|map| map.remove(&filters));
+        let handle = self.additional_keys.remove(&(key, commitment), &filters);
 
         if let Some(handle) = handle {
             info!(key = %sub.key(), commitment = ?commitment, filter = ?filters, "purging filters");
@@ -594,14 +752,15 @@ impl AccountUpdateManager {
                 .with_label_values(&[&self.actor_name])
                 .dec();
 
-            for key in self
-                .program_accounts
-                .remove_all(&key, commitment, Some(filters))
-            {
-                self.accounts.remove(&key, commitment)
-            }
-
             ctx.cancel_future(handle);
+        }
+        let accounts_for_filter = self
+            .program_accounts
+            .remove_keys_for_filter(&(key, commitment), filters);
+        for arc in accounts_for_filter {
+            let key = *arc;
+            drop(arc);
+            self.accounts.remove(&key, commitment)
         }
     }
 
@@ -609,29 +768,27 @@ impl AccountUpdateManager {
         info!(self.actor_id, message = "purge", key = %sub.key(), commitment = ?commitment);
         match sub {
             Subscription::Program(program_key) => {
-                let keys = self
+                let filters_count = self
                     .additional_keys
-                    .remove(&(*program_key, commitment))
-                    .into_iter()
-                    .flatten()
-                    .map(|(filter, handle)| {
+                    .remove_all(&(*program_key, commitment))
+                    .map(|handle| {
                         ctx.cancel_future(handle);
-                        (program_key, Some(filter))
                     })
-                    .chain(Some((program_key, None)));
-                for (key, filter) in keys {
-                    if filter.is_some() {
-                        metrics()
-                            .filters
-                            .with_label_values(&[&self.actor_name])
-                            .dec();
-                    }
-                    for key in self
-                        .program_accounts
-                        .remove_all(key, commitment, filter.clone())
-                    {
-                        self.accounts.remove(&key, commitment)
-                    }
+                    .count();
+                metrics()
+                    .filters
+                    .with_label_values(&[&self.actor_name])
+                    .sub(filters_count as i64);
+
+                let program_key = &(*program_key, commitment);
+                let accounts_to_remove = self.program_accounts.remove_all(program_key);
+                // cleanup all child accounts, that were kept in AccountsDb,
+                // while program subscription was active
+                for arc in accounts_to_remove {
+                    let acc = *arc;
+                    // now ref in AccountsDb should be the only one left
+                    drop(arc);
+                    self.accounts.remove(&acc, commitment);
                 }
                 metrics()
                     .additional_keys_entries
@@ -639,24 +796,43 @@ impl AccountUpdateManager {
                     .set(self.additional_keys.len() as i64);
             }
             Subscription::Account(key) => {
+                let data = self
+                    .accounts
+                    .get(key)
+                    .and_then(|state| state.get_ref(commitment))
+                    .map(|acc_ref| (acc_ref, self.accounts.get_owner(key, commitment)));
+                match data {
+                    Some((acc_ref, Some(pubkey))) => {
+                        let program_key = (pubkey, commitment);
+                        self.program_accounts
+                            .untrack_account_key(&program_key, acc_ref);
+                    }
+                    Some((acc_ref, None)) => {
+                        warn!("empty account, reference exists without actual data");
+                        drop(acc_ref);
+                    }
+                    None => (),
+                }
                 self.accounts.remove(key, commitment);
             }
         }
     }
 
     fn update_status(&self) {
-        let is_active = self.id_to_sub.len() == self.subs.len() && self.connection.is_connected();
-        self.active.store(is_active, Ordering::Relaxed);
+        let connected = self.connection.is_connected();
+        let active = self.id_to_sub.len() == self.subs.len() && connected;
+
+        self.connected.store(connected, Ordering::Relaxed);
 
         metrics()
             .websocket_connected
             .with_label_values(&[&self.actor_name])
-            .set(if self.connection.is_connected() { 1 } else { 0 });
+            .set(if connected { 1 } else { 0 });
 
         metrics()
             .websocket_active
             .with_label_values(&[&self.actor_name])
-            .set(if is_active { 1 } else { 0 });
+            .set(if active { 1 } else { 0 });
     }
 
     fn process_ws_message(
@@ -713,7 +889,8 @@ impl AccountUpdateManager {
                             if sub.is_account() {
                                 self.active_accounts.remove(&(sub.key(), commitment));
                             }
-                            self.purge_key(ctx, &sub, commitment);
+                            // no need to call `purge_key` as unsubscription request can only be
+                            // called from `Purge` command, which calls it for us
                         }
                         InflightRequest::SlotSub(_) => {
                             warn!(self.actor_id, request_id = id, error = ?error, "slot subscribe failed");
@@ -796,7 +973,8 @@ impl AccountUpdateManager {
                                             .subscription_lifetime
                                             .observe(times.since_creation().as_secs_f64());
                                     }
-                                    self.purge_key(ctx, &sub, commitment);
+                                // no need to call `purge_key` as unsubscription request can only be
+                                // called from `Purge` command, which calls it for us
                                 } else {
                                     warn!(self.actor_id, sub = %sub, commitment = ?commitment, "unsubscribe for unknown subscription");
                                 }
@@ -919,17 +1097,15 @@ impl AccountUpdateManager {
                                 *commitment,
                             );
 
-                            self.program_accounts.update_account(
-                                &program_key,
-                                key_ref.clone(),
+                            let should_remove_account = self.program_accounts.update_account(
+                                &(program_key, *commitment),
+                                key_ref,
                                 filter_groups,
-                                *commitment,
                                 slot,
                             );
-
-                            // important for proper removal
-                            drop(key_ref);
-                            self.accounts.remove(&key, *commitment);
+                            if should_remove_account {
+                                self.accounts.remove(&key, *commitment);
+                            }
                         } else {
                             warn!(
                                 self.actor_id,
@@ -1036,19 +1212,61 @@ impl StreamHandler<AccountCommand> for AccountUpdateManager {
     }
 }
 
+impl Handler<IsSubActive> for AccountUpdateManager {
+    type Result = bool;
+
+    fn handle(&mut self, item: IsSubActive, _: &mut Context<Self>) -> bool {
+        self.sub_to_id.contains_key(&(item.sub, item.commitment))
+    }
+}
+
+impl Handler<InitManager> for AccountUpdateManager {
+    type Result = ();
+
+    fn handle(&mut self, item: InitManager, _: &mut Context<Self>) {
+        self.manager.replace(item.0);
+    }
+}
+
 impl Handler<AccountCommand> for AccountUpdateManager {
     type Result = ();
 
     fn handle(&mut self, item: AccountCommand, ctx: &mut Context<Self>) {
         let _ = (|| -> Result<(), serde_json::Error> {
             match item {
-                AccountCommand::Subscribe(sub, commitment, filters) => {
+                AccountCommand::Subscribe(sub, commitment, filters, owner) => {
+                    // if account owner exists
+                    if let Some(pubkey) = owner {
+                        let program_key = (pubkey, commitment);
+                        // then try to add it to tracked keys in program accounts cache
+                        let success = self
+                            .accounts
+                            .get(&sub.key())
+                            .and_then(|state| state.get_ref(commitment))
+                            .map(|acc_ref| {
+                                self.program_accounts
+                                    .track_account_key(program_key, acc_ref)
+                            })
+                            .unwrap_or_default();
+                        // if real program entry existed, `success` will be set to true,
+                        // indicating that owner program is tracking subscription for
+                        // the account, so there's no need create another one
+                        if success {
+                            info!("account subscription skipped");
+                            metrics().subscriptions_skipped.inc();
+                            self.purge_queue
+                                .as_ref()
+                                .unwrap()
+                                .insert((sub, commitment), self.config.ttl);
+                            return Ok(());
+                        }
+                    }
                     metrics()
                         .commands
                         .with_label_values(&[&self.actor_name, "subscribe"])
                         .inc();
                     self.subscribe(sub, commitment)?;
-                    if let Some(filters) = filters {
+                    if !sub.is_account() {
                         self.reset_filter(ctx, sub, commitment, filters);
                     }
                 }
@@ -1057,6 +1275,29 @@ impl Handler<AccountCommand> for AccountUpdateManager {
                         .commands
                         .with_label_values(&[&self.actor_name, "purge"])
                         .inc();
+                    // for program subscription, before we purge everything from
+                    // cache, we have to resubscribe for all of its accounts,
+                    // which had recent activity, and are stored in tracked_keys
+                    if !sub.is_account() {
+                        let program_key = (sub.key(), commitment);
+                        // we save the tracked keys, before purging the program's cache entries
+                        let tracked_keys = self.program_accounts.get_tracked_keys(&program_key);
+                        // for a program, we have to remove data from cache first, so that new
+                        // account subscriptions can create a new entry for their owner, and add
+                        // themselves to tracked accounts list
+                        self.purge_key(ctx, &sub, commitment);
+                        let manager = self
+                            .manager
+                            .as_ref()
+                            .expect("PubSub manager is not setup in worker");
+                        for key in tracked_keys {
+                            manager.do_send(PubSubSubscribe {
+                                key,
+                                commitment,
+                                owner: sub.key(),
+                            });
+                        }
+                    }
 
                     if self.connection.is_connected() {
                         self.unsubscribe(sub, commitment)?;
@@ -1065,10 +1306,24 @@ impl Handler<AccountCommand> for AccountUpdateManager {
                     }
                     if sub.is_account() {
                         self.active_accounts.remove(&(sub.key(), commitment));
+                        self.purge_key(ctx, &sub, commitment);
                     }
-                    self.purge_key(ctx, &sub, commitment);
                 }
-                AccountCommand::Reset(sub, commitment, filters) => {
+                AccountCommand::Unsubscribe(pubkey, commitment) => {
+                    metrics()
+                        .commands
+                        .with_label_values(&[&self.actor_name, "unsubsribe"])
+                        .inc();
+                    self.active_accounts.remove(&(pubkey, commitment));
+                    if self.connection.is_connected() {
+                        self.unsubscribe(Subscription::Account(pubkey), commitment)?;
+                    } else {
+                        self.subs
+                            .remove(&(Subscription::Account(pubkey), commitment));
+                    }
+                }
+
+                AccountCommand::Reset(sub, commitment, filters, owner) => {
                     metrics()
                         .commands
                         .with_label_values(&[&self.actor_name, "reset"])
@@ -1078,11 +1333,28 @@ impl Handler<AccountCommand> for AccountUpdateManager {
                             .time_until_reset
                             .observe(time.update().as_secs_f64());
                     }
+
+                    if let Some(owner_pubkey) = owner {
+                        let acc_ref = self
+                            .accounts
+                            .get(&sub.key())
+                            .and_then(|state| state.get_ref(commitment));
+                        // if owner was provided for reset, it means, that this account
+                        // subscription is being tracked by owner program, by tracking this
+                        // account's key in program's cache entry we make sure, that when the
+                        // program's subscription ends, it will resubscribe for all tracked
+                        // accounts
+                        if let Some(acc_ref) = acc_ref {
+                            self.program_accounts
+                                .track_account_key((owner_pubkey, commitment), acc_ref);
+                        }
+                    }
+
                     self.purge_queue
                         .as_ref()
                         .unwrap()
                         .reset((sub, commitment), self.config.ttl);
-                    if let Some(filters) = filters {
+                    if !sub.is_account() {
                         self.reset_filter(ctx, sub, commitment, filters);
                     }
                 }
@@ -1292,9 +1564,40 @@ impl std::fmt::Display for Subscription {
 #[derive(Message, Debug)]
 #[rtype(result = "()")]
 pub enum AccountCommand {
-    Subscribe(Subscription, Commitment, Option<Filters>),
-    Reset(Subscription, Commitment, Option<Filters>),
+    Subscribe(
+        Subscription,
+        Commitment,
+        Option<Filters>,
+        Option<Pubkey>, /*optional account owner*/
+    ),
+    Reset(
+        Subscription,
+        Commitment,
+        Option<Filters>,
+        Option<Pubkey>, /*optional account owner*/
+    ),
     Purge(Subscription, Commitment),
+    // same as purge, but doesn't remove data from cache, used only for account subscriptions
+    Unsubscribe(Pubkey, Commitment),
+}
+
+#[derive(Message, Debug)]
+#[rtype(result = "bool")]
+pub struct IsSubActive {
+    sub: Subscription,
+    commitment: Commitment,
+}
+
+#[derive(Message)]
+#[rtype(result = "()")]
+pub struct InitManager(Addr<PubSubManager>);
+
+#[derive(Message)]
+#[rtype(result = "()")]
+pub struct PubSubSubscribe {
+    key: Pubkey,
+    commitment: Commitment,
+    owner: Pubkey,
 }
 
 enum DelayQueueCommand<T> {

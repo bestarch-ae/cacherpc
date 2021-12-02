@@ -96,7 +96,7 @@ async fn config_read_loop(path: PathBuf, rpc: Arc<watch::Sender<rpc::Config>>) {
 
 async fn run(options: cli::Options) -> Result<()> {
     let accounts = AccountsDb::new();
-    let program_accounts = ProgramAccountsDb::new();
+    let program_accounts = ProgramAccountsDb::default();
 
     let rpc_slot = Arc::new(AtomicU64::new(0));
     let _rpc_monitor = cache_rpc::rpc_monitor::RpcMonitor::init(
