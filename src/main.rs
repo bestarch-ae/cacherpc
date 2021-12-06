@@ -15,7 +15,7 @@ use arc_swap::ArcSwap;
 use awc::Client;
 use cache_rpc::types::SemaphoreQueue;
 use lru::LruCache;
-use tokio::sync::{watch, Notify};
+use tokio::sync::{watch, Notify, Semaphore};
 use tracing::info;
 
 pub use cache_rpc::{cli, metrics, pubsub, rpc, types};
@@ -172,6 +172,8 @@ async fn run(options: cli::Options) -> Result<()> {
 
     let rpc_config = Arc::new(ArcSwap::from(Arc::new(config.rpc)));
 
+    let serialize_threads_limit = Arc::new(Semaphore::new(options.serialize_thread_count));
+
     HttpServer::new(move || {
         let waf = rules_path
             .as_ref()
@@ -211,6 +213,7 @@ async fn run(options: cli::Options) -> Result<()> {
             },
             waf,
             waf_watch: RefCell::new(waf_rx.clone()),
+            serialize_threads_limit: Arc::clone(&serialize_threads_limit),
         };
         let cors = Cors::default()
             .allow_any_origin()

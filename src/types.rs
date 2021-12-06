@@ -513,7 +513,7 @@ impl Default for Encoding {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountInfo {
     pub lamports: u64,
@@ -592,8 +592,7 @@ impl<'de> Deserialize<'de> for Pubkey {
     }
 }
 
-#[derive(Debug)]
-#[cfg_attr(test, derive(Clone))]
+#[derive(Debug, Clone)]
 pub struct AccountData {
     pub data: Bytes,
 }
@@ -681,7 +680,7 @@ pub struct AccountContext {
     pub value: Option<AccountInfo>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SolanaContext {
     pub slot: Slot,
 }
