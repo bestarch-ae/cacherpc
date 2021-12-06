@@ -203,7 +203,7 @@ impl Config {
             .account_info_request_queue_size
             .unwrap_or(crate::DEFAULT_GAI_QUEUE_SIZE);
         let program_accounts_request_queue_size = options
-            .account_info_request_queue_size
+            .program_accounts_request_queue_size
             .unwrap_or(crate::DEFAULT_GPA_QUEUE_SIZE);
         Config {
             rpc: rpc::Config {
