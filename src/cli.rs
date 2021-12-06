@@ -114,6 +114,12 @@ pub struct Options {
         default_value = control::CACHER_SOCKET_DEFAULT
     )]
     pub control_socket_path: PathBuf,
+    #[structopt(
+        long = "serialize-thread-count",
+        help = "maximum number of worker threads, spawned to handle response serialization",
+        default_value = "16"
+    )]
+    pub serialize_thread_count: usize,
 }
 
 #[derive(Debug)]
