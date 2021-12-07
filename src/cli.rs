@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use structopt::StructOpt;
 
-use crate::{control, rpc};
+use crate::{control, rpc::config};
 
 #[derive(Debug, StructOpt)]
 #[structopt(about = "Solana RPC cache server")]
@@ -185,7 +185,7 @@ impl std::str::FromStr for SubscriptionsState {
 
 #[derive(serde::Deserialize, Debug)]
 pub struct Config {
-    pub rpc: rpc::Config,
+    pub rpc: config::Config,
 }
 
 impl Config {
@@ -206,12 +206,12 @@ impl Config {
             .program_accounts_request_queue_size
             .unwrap_or(crate::DEFAULT_GPA_QUEUE_SIZE);
         Config {
-            rpc: rpc::Config {
-                request_limits: rpc::RequestLimits {
+            rpc: config::Config {
+                request_limits: config::RequestLimits {
                     account_info: options.account_info_request_limit,
                     program_accounts: options.program_accounts_request_limit,
                 },
-                request_queue_size: rpc::RequestQueueSize {
+                request_queue_size: config::RequestQueueSize {
                     account_info: account_info_request_queue_size,
                     program_accounts: program_accounts_request_queue_size,
                 },

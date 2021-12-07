@@ -9,8 +9,9 @@ use awc::Client;
 use serde::Serialize;
 use tracing::{debug, warn};
 
+use super::request::{Flatten, Id, Request};
+use super::response::Response;
 use crate::metrics::rpc_metrics as metrics;
-use crate::rpc::{Flatten, Id, Request, Response};
 use crate::types::Commitment;
 
 #[derive(Serialize)]
