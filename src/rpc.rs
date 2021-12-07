@@ -1293,6 +1293,10 @@ fn account_response<'a, 'b>(
             .0
             .as_ref()
             .map(|acc| {
+                metrics()
+                    .account_data_len
+                    .with_label_values(&[&app_state.worker_id])
+                    .observe(acc.data.len() as f64);
                 Ok::<_, Base58Error>(
                     acc.encode(config.encoding, config.data_slice, true, pubkey)?
                         .with_context(&ctx),
@@ -1302,6 +1306,14 @@ fn account_response<'a, 'b>(
             .map_err(|_| Error::InvalidRequest(Some(req_id.clone()),
                     Some("Encoded binary (base 58) data should be less than 128 bytes, please use Base64 encoding.")))?
             .unwrap_or_else(|| EncodedAccountContext::empty(&ctx));
+    let timer = metrics()
+        .serialization_time
+        .with_label_values(&[
+            "getAccountInfo",
+            config.encoding.as_str(),
+            &app_state.worker_id,
+        ])
+        .start_timer();
     let result = serde_json::value::to_raw_value(&result)?;
     let resp = JsonRpcResponse {
         jsonrpc: "2.0",
@@ -1309,6 +1321,7 @@ fn account_response<'a, 'b>(
         id: req_id,
     };
     let body = serde_json::to_vec(&resp)?;
+    timer.observe_duration();
     app_state
         .lru
         .borrow_mut()
@@ -1484,6 +1497,10 @@ fn program_accounts_response<'a>(
                     continue;
                 }
             }
+            metrics()
+                .account_data_len
+                .with_label_values(&[&app_state.worker_id])
+                .observe(account_len as f64);
 
             encoded_accounts.push(AccountAndPubkey {
                 account: Encode {
@@ -1516,7 +1533,17 @@ fn program_accounts_response<'a>(
         id: req_id,
     };
 
+    let timer = metrics()
+        .serialization_time
+        .with_label_values(&[
+            "getProgramAccounts",
+            config.encoding.as_str(),
+            &app_state.worker_id,
+        ])
+        .start_timer();
     let body = serde_json::to_vec(&resp)?;
+    timer.observe_duration();
+
     metrics()
         .response_size_bytes
         .with_label_values(&["getProgramAccounts"])

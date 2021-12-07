@@ -286,6 +286,8 @@ pub struct RpcMetrics {
     pub waf_rejections: IntCounter,
     pub streaming_errors: IntCounter,
     pub backend_requests_count: IntCounterVec,
+    pub serialization_time: HistogramVec,
+    pub account_data_len: HistogramVec,
 }
 
 impl RpcMetrics {
@@ -508,6 +510,36 @@ pub fn rpc_metrics() -> &'static RpcMetrics {
             "backend_requests_count",
             "Number of requests of each type, sent to validator",
             &["type"]
+        )
+        .unwrap(),
+        serialization_time: register_histogram_vec!(
+            "serialization_time",
+            "Time to perform response data serialization (secs)",
+            &["type", "encoding", "worker_id"],
+            vec![
+                0.0, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.5, 5.0, 7.5, 10.0, 15.0, 30.0,
+                50.0, 70.0, 100.0, 250.0,
+            ]
+        )
+        .unwrap(),
+        account_data_len: register_histogram_vec!(
+            "account_data_len",
+            "Length of account data in bytes, before serialization",
+            &["worker_id"],
+            vec![
+                0.,
+                128.,
+                1024.,
+                16384.,
+                65536.,
+                262_144.,
+                1_048_576.,
+                5_242_880.,
+                10_485_760.,
+                20_971_520.,
+                52_428_800.,
+                104_857_600.,
+            ]
         )
         .unwrap(),
     });
