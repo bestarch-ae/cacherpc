@@ -244,7 +244,6 @@ impl Cacheable for GetProgramAccounts {
         id: &Id<'a>,
         state: &State,
     ) -> Option<Result<CachedResponse, Error<'a>>> {
-        let with_context = self.config.with_context.unwrap_or(false);
         let commitment = self.commitment();
         let filters = self.filters.as_ref();
         let config = &self.config;
@@ -254,13 +253,20 @@ impl Cacheable for GetProgramAccounts {
             .get_state((self.pubkey, commitment))
             .and_then(|data| {
                 let accounts = data.value().get_account_keys(&self.filters)?;
+                let slot = data.value().slot;
+                let context = self.config.with_context.map(|_| slot);
+
+                // do not serve data from cache if the cached data doesn't have slot info
+                if context.is_some() && slot == 0 {
+                    return None;
+                }
                 let res = program_accounts_response(
                     id.clone(),
                     accounts,
                     config,
                     filters,
                     state,
-                    with_context,
+                    context,
                 );
                 match res {
                     Ok(res) => Some(Ok(CachedResponse {
