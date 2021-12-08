@@ -25,15 +25,35 @@ The server supports a number of configuration options, which are the following:
 - `-w, --websocket-url` — validator or cluster PubSub endpoint.
 - `-l, --listen` — cache server bind address.
 - `-a, --account-request-limit` — sets a maximum number of concurrent [getAccountInfo](https://docs.solana.com/developing/clients/jsonrpc-api#getaccountinfo) requests the cache is allowed to send to the cluster/validator.
-- `-p, --program-request-limit` — sets a maximum number of concurrent [getProgramAccounts](https://docs.solana.com/developing/clients/jsonrpc-api#getaccountinfo) requests the cache is allowed to send to the cluster/validator.
+- `-p, --program-request-limit` — sets a maximum number of concurrent [getProgramAccounts](https://docs.solana.com/developing/clients/jsonrpc-api#getaccountinfo) requests the cacher is allowed to send to the cluster/validator.
+- `-A, --account-request-queue-size` — sets a maximum number of [getAccountInfo](https://docs.solana.com/developing/clients/jsonrpc-api#getaccountinfo) requests that are allowed to wait for the permit to send the request to validator.
+- `-P, --program-request-queue-size` — sets a maximum number of [getProgramAccounts](https://docs.solana.com/developing/clients/jsonrpc-api#getaccountinfo) requests that are allowed to wait for the permit to send the request to validator.
 - `-b, --body-cache-size` — sets the maximum amount of cached responses.
 - `-c, --websocket-connections` — sets the number of websocket connections to validator
 - `-t, --time-to-live` — duration of time for which values will be kept in cache
 - `-d, --slot-distance` — sets the maximum slot distance for health check purposes
+- `--log-file` - file, which should be used for the output of generated logs
+- `--config` - limits related configuration file in TOML format
 - `--ignore-base58-limit` — flag whether to ignore base58 overflowing size limit
 - `--log-format` — the format, in which to output the logs: plain | json
 - `--rules` — path to firewall rules written in lua
 - `--control-socket-path` — path to socket file, e.g. /run/cacherpc.sock
+
+#### Commands 
+Running instance of caching server supports several commands that can be sent to
+it via unix domain socket:
+- `cache-rpc config-reload` - reload limits related configuration from file
+  (must have been started with `--config <path>` option)
+- `cache-rpc waf-reload` - reload WAF rules from lua file, (must have been started with `--rules <path>` option)
+- `cache-rpc subscriptions off` - prevent caching server from initiating new
+  subscriptions after fetching data via rpc requests
+- `cache-rpc subscriptions on` - allow caching server to initiate new
+  subscriptions after fetching data via rpc requests (default)
+- `cache-rpc subscriptions status` - print out the current status of
+  subscriptions allowance (on or off)
+
+#### Metrics
+Caching server provides various metrics, which are available in [Prometheus](https://prometheus.io/) compatible format. Metrics can be retrieved via `/metrics` HTTP endpoint.
 
 ## Features
 
@@ -44,8 +64,6 @@ In the current version caching is implemented for these methods:
 - [getProgramAccounts](https://docs.solana.com/developing/clients/jsonrpc-api#getprogramaccounts)
 
 Requests to other methods are passed through to the validator.
-
-Please note that `"encoding": "jsonParsed"` is not yet supported.
 
 #### Unlikely to be implemented
 
