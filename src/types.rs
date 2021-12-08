@@ -302,6 +302,12 @@ impl AccountState {
         }
     }
 
+    fn update_slot(&mut self, commitment: Commitment, slot: Slot) {
+        if let Some(Some(acc)) = self.data.get_mut(commitment.as_idx()) {
+            acc.slot = slot;
+        }
+    }
+
     pub fn get_ref(&self, commitment: Commitment) -> Option<Arc<Pubkey>> {
         self.data[commitment.as_idx()]
             .as_ref()
@@ -370,6 +376,12 @@ impl AccountsDb {
 
     pub fn get(&self, key: &Pubkey) -> Option<Ref<'_, Pubkey, AccountState>> {
         self.map.get(key)
+    }
+
+    pub fn update_account_slot(&self, pubkey: &Pubkey, commitment: Commitment, slot: Slot) {
+        if let Some(mut entry) = self.map.get_mut(pubkey) {
+            entry.update_slot(commitment, slot);
+        }
     }
 
     pub fn insert(&self, key: Pubkey, data: AccountContext, commitment: Commitment) -> Arc<Pubkey> {
