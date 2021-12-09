@@ -99,7 +99,7 @@ async fn run(options: cli::Options) -> Result<()> {
     let program_accounts = ProgramAccountsDb::default();
 
     let rpc_slot = Arc::new(AtomicU64::new(0));
-    let _rpc_monitor = cache_rpc::rpc_monitor::RpcMonitor::init(
+    let _rpc_monitor = cache_rpc::rpc::monitor::RpcMonitor::init(
         &options.rpc_url,
         Client::default(),
         rpc_slot.clone(),
@@ -175,7 +175,7 @@ async fn run(options: cli::Options) -> Result<()> {
     HttpServer::new(move || {
         let waf = rules_path
             .as_ref()
-            .map(rpc::Waf::new)
+            .map(rpc::state::Waf::new)
             .transpose()
             .map_err(|err| {
                 tracing::error!(error = %err, "failed to load waf rules");
@@ -193,7 +193,7 @@ async fn run(options: cli::Options) -> Result<()> {
                     .limit(total_connection_limit),
             )
             .finish();
-        let state = rpc::State {
+        let state = rpc::state::State {
             accounts: accounts.clone(),
             program_accounts: program_accounts.clone(),
             client,
@@ -229,8 +229,12 @@ async fn run(options: cli::Options) -> Result<()> {
             .wrap(cors)
             .service(
                 web::resource("/")
-                    .route(web::post().guard(content_type_guard).to(rpc::rpc_handler))
-                    .route(web::post().to(rpc::bad_content_type_handler)),
+                    .route(
+                        web::post()
+                            .guard(content_type_guard)
+                            .to(rpc::handler::rpc_handler),
+                    )
+                    .route(web::post().to(rpc::handler::bad_content_type_handler)),
             )
             .service(web::resource("/metrics").route(web::get().to(rpc::metrics_handler)))
     })
