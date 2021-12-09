@@ -40,11 +40,10 @@ pub struct ProgramAccountsDb {
 
 impl ProgramState {
     pub fn get_account_keys(&self, filters: &Option<Filters>) -> Option<&HashSet<Arc<Pubkey>>> {
-        if let Some(filters) = filters {
-            self.filtered_keys.get(filters)
-        } else {
-            self.unfiltered_keys.as_ref()
-        }
+        filters
+            .as_ref()
+            .and_then(|filters| self.filtered_keys.get(filters))
+            .or_else(|| self.unfiltered_keys.as_ref())
     }
 
     fn insert_account_keys(&mut self, filters: Option<Filters>, keys: AccountSet) {
