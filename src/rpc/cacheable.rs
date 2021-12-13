@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use prometheus::IntCounter;
 use serde::de::DeserializeOwned;
@@ -46,6 +47,8 @@ pub(super) trait Cacheable: Sized + 'static {
 
     fn parse<'a>(request: &Request<'a, RawValue>) -> Result<Self, Error<'a>>;
     fn get_limit(state: &State) -> &SemaphoreQueue;
+    fn get_timeout(state: &State) -> Duration;
+    fn get_backoff(state: &State) -> u64;
 
     fn is_cacheable(&self, state: &State) -> Result<(), UncacheableReason>;
     // method to check whether cached entry has corresponding websocket subscription
@@ -108,6 +111,14 @@ impl Cacheable for GetAccountInfo {
         })?;
         emit_request_metrics!(this.config);
         Ok(this)
+    }
+
+    fn get_timeout(state: &State) -> Duration {
+        Duration::from_secs(state.config.load().timeouts.account_info_request)
+    }
+
+    fn get_backoff(state: &State) -> u64 {
+        state.config.load().timeouts.account_info_backoff
     }
 
     fn get_limit(state: &State) -> &SemaphoreQueue {
@@ -219,6 +230,14 @@ impl Cacheable for GetProgramAccounts {
 
     fn get_limit(state: &State) -> &SemaphoreQueue {
         state.program_accounts_request_limit.as_ref()
+    }
+
+    fn get_timeout(state: &State) -> Duration {
+        Duration::from_secs(state.config.load().timeouts.program_accounts_request)
+    }
+
+    fn get_backoff(state: &State) -> u64 {
+        state.config.load().timeouts.program_accounts_backoff
     }
 
     fn has_active_subscription(&self, state: &State, _owner: Option<Pubkey>) -> SubscriptionActive {

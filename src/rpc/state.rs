@@ -31,8 +31,6 @@ use super::request::Request;
 use super::response::{Error, Response};
 use super::{backoff_settings, Config, HasOwner, LruEntry, SubDescriptor};
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-
 type CacheResult<'a> = Result<HttpResponse, Error<'a>>;
 
 pub struct State {
@@ -152,12 +150,14 @@ impl State {
         &self,
         req: &Request<'a, T>,
         limit: &SemaphoreQueue,
+        timeout: Duration,
+        backoff: u64, // total number of seconds for retries
     ) -> Result<impl Stream<Item = Result<Bytes, awc::error::PayloadError>>, Error<'a>>
     where
         T: Serialize + Debug + ?Sized,
     {
         let client = &self.client;
-        let mut backoff = backoff_settings(60);
+        let mut backoff = backoff_settings(backoff);
         loop {
             let wait_time = metrics()
                 .wait_time
@@ -182,8 +182,8 @@ impl State {
             wait_time.observe_duration();
             let body = client
                 .post(&self.rpc_url)
+                .timeout(timeout)
                 .append_header(("X-Cache-Request-Method", req.method))
-                .timeout(REQUEST_TIMEOUT)
                 .send_json(&req)
                 .await;
             metrics()
@@ -248,7 +248,12 @@ impl State {
             }
         };
 
-        let wait_for_response = self.request(&raw_request, T::get_limit(&self));
+        let wait_for_response = self.request(
+            &raw_request,
+            T::get_limit(&self),
+            T::get_timeout(&self),
+            T::get_backoff(&self),
+        );
         tokio::pin!(wait_for_response);
 
         let resp = loop {

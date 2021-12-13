@@ -171,6 +171,7 @@ async fn run(options: cli::Options) -> Result<()> {
     actix::spawn(run_control_interface(control_state));
 
     let rpc_config = Arc::new(ArcSwap::from(Arc::new(config.rpc)));
+    let timeout = options.request_timeout;
 
     HttpServer::new(move || {
         let waf = rules_path
@@ -184,7 +185,7 @@ async fn run(options: cli::Options) -> Result<()> {
             .flatten();
 
         let client = Client::builder()
-            .timeout(Duration::from_secs(60))
+            .timeout(timeout)
             .no_default_headers()
             .connector(
                 awc::Connector::new()

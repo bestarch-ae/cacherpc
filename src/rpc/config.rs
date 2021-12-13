@@ -12,6 +12,8 @@ pub struct Config {
     #[serde(default)]
     pub request_queue_size: RequestQueueSize,
     #[serde(default)]
+    pub timeouts: Timeouts,
+    #[serde(default)]
     pub ignore_base58_limit: bool,
 }
 
@@ -19,6 +21,26 @@ pub struct Config {
 pub struct RequestLimits {
     pub account_info: usize,
     pub program_accounts: usize,
+}
+
+/// Request and retry timouts in seconds for each type of request
+#[derive(Debug, Copy, Clone, Deserialize, PartialEq, Eq)]
+pub struct Timeouts {
+    pub account_info_request: u64,
+    pub program_accounts_request: u64,
+    pub account_info_backoff: u64,
+    pub program_accounts_backoff: u64,
+}
+
+impl Default for Timeouts {
+    fn default() -> Self {
+        Self {
+            account_info_request: 30,
+            program_accounts_request: 60,
+            account_info_backoff: 30,
+            program_accounts_backoff: 60,
+        }
+    }
 }
 
 #[derive(Debug, Copy, Clone, Deserialize, PartialEq, Eq)]

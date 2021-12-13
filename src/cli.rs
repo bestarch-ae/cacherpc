@@ -114,6 +114,13 @@ pub struct Options {
         default_value = control::CACHER_SOCKET_DEFAULT
     )]
     pub control_socket_path: PathBuf,
+    #[structopt(
+        long = "request-timeout",
+        help = "time duration, after which request to validator will be aborted, if no response arrives",
+        default_value = "60s",
+        parse(try_from_str = humantime::parse_duration)
+    )]
+    pub request_timeout: Duration,
 }
 
 #[derive(Debug)]
@@ -215,6 +222,7 @@ impl Config {
                     account_info: account_info_request_queue_size,
                     program_accounts: program_accounts_request_queue_size,
                 },
+                timeouts: config::Timeouts::default(),
                 ignore_base58_limit: options.ignore_base58,
             },
         }
