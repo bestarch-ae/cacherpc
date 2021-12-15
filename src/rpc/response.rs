@@ -14,7 +14,7 @@ use crate::metrics::rpc_metrics as metrics;
 use crate::rpc::request::MaybeContext;
 use crate::rpc::Slice;
 use crate::types::{
-    AccountData, AccountInfo, AccountState, Commitment, Encoding, Pubkey, SolanaContext,
+    AccountData, AccountInfo, AccountState, Commitment, Encoding, Pubkey, Slot, SolanaContext,
 };
 
 use super::{hash, LruEntry};
@@ -520,7 +520,7 @@ pub(super) fn program_accounts_response<'a>(
     config: &'_ ProgramAccountsConfig,
     filters: Option<&'a Filters>,
     app_state: &State,
-    with_context: bool,
+    context: Option<Slot>,
 ) -> Result<HttpResponse, ProgramAccountsResponseError> {
     struct Encode<'a, K> {
         inner: Ref<'a, K, AccountState>,
@@ -565,19 +565,17 @@ pub(super) fn program_accounts_response<'a>(
     let commitment = config.commitment.unwrap_or_default().commitment;
 
     let mut encoded_accounts = Vec::with_capacity(accounts.len());
-    let mut slot = 0;
     let enforce_base58_limit = !app_state.config.load().ignore_base58_limit;
 
     for key in accounts {
         if let Some(data) = app_state.accounts.get(key) {
-            let (account_info, current_slot) = match data.value().get(commitment) {
+            let (account_info, _) = match data.value().get(commitment) {
                 Some(data) => data,
                 None => {
                     warn!("data for key {}/{:?} not found", key, commitment);
                     return Err(ProgramAccountsResponseError::Inconsistency);
                 }
             };
-            slot = current_slot.max(slot); // TODO: find a better way (store last slot with account set)
 
             let account_len = account_info
                 .as_ref()
@@ -619,12 +617,13 @@ pub(super) fn program_accounts_response<'a>(
         }
     }
 
-    let value = match with_context {
-        true => MaybeContext::With {
+    let value = if let Some(slot) = context {
+        MaybeContext::With {
             context: SolanaContext { slot },
             value: encoded_accounts,
-        },
-        false => MaybeContext::Without(encoded_accounts),
+        }
+    } else {
+        MaybeContext::Without(encoded_accounts)
     };
 
     let resp = JsonRpcResponse {
