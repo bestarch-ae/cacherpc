@@ -148,7 +148,8 @@ impl Cacheable for GetAccountInfo {
         id: &Id<'a>,
         state: &State,
     ) -> Option<Result<CachedResponse, Error<'a>>> {
-        state.accounts.get(&self.pubkey).and_then(|data| {
+        let mut slot_update = None;
+        let result = state.accounts.get(&self.pubkey).and_then(|data| {
             let mut account = data.value().get(self.commitment());
             let owner = account.and_then(|(info, _)| info).map(|info| info.owner);
 
@@ -156,7 +157,13 @@ impl Cacheable for GetAccountInfo {
                 Some((Some(info), slot)) if slot == 0 => state
                     .program_accounts
                     .get_slot(&(info.owner, self.commitment()))
-                    .map(|slot| (Some(info), slot)),
+                    .map(|slot| {
+                        if slot > 0 {
+                            slot_update = Some(slot);
+                        }
+                        (Some(info), slot)
+                    }),
+
                 acc => acc,
             };
 
@@ -181,7 +188,15 @@ impl Cacheable for GetAccountInfo {
                 }
                 _ => None,
             }
-        })
+        });
+        // we have to update accounts map outside of closure, because
+        // its underlying Dashmap will deadlock otherwise
+        if let Some(slot) = slot_update {
+            state
+                .accounts
+                .update_account_slot(&self.pubkey, self.commitment(), slot);
+        }
+        result
     }
 
     fn put_into_cache(&self, state: &State, data: Self::ResponseData) -> bool {
