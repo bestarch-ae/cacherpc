@@ -288,7 +288,7 @@ impl Cacheable for GetProgramAccounts {
             .and_then(|data| {
                 let accounts = data.value().get_account_keys(&self.filters)?;
                 let slot = data.value().slot;
-                let context = self.config.with_context.map(|_| slot);
+                let context = self.config.with_context.unwrap_or_default().then(|| slot);
 
                 // do not serve data from cache if the cached data doesn't have slot info
                 if context.is_some() && slot == 0 {
