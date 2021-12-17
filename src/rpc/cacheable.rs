@@ -60,7 +60,12 @@ pub(super) trait Cacheable: Sized + 'static {
         state: &State,
     ) -> Option<Result<CachedResponse, Error<'a>>>;
 
-    fn put_into_cache(&self, state: &State, data: Self::ResponseData) -> bool;
+    fn put_into_cache(
+        &self,
+        state: &State,
+        data: Self::ResponseData,
+        overwrite: bool, // indicates whether the cache entry should be overwritten if it already exists
+    ) -> bool;
 
     fn sub_descriptor(&self) -> SubDescriptor;
 
@@ -199,8 +204,8 @@ impl Cacheable for GetAccountInfo {
         result
     }
 
-    fn put_into_cache(&self, state: &State, data: Self::ResponseData) -> bool {
-        state.insert(self.pubkey, data, self.commitment());
+    fn put_into_cache(&self, state: &State, data: Self::ResponseData, _: bool) -> bool {
+        state.insert(self.pubkey, data, self.commitment(), true);
         true
     }
 
@@ -315,13 +320,14 @@ impl Cacheable for GetProgramAccounts {
             })
     }
 
-    fn put_into_cache(&self, state: &State, data: Self::ResponseData) -> bool {
+    fn put_into_cache(&self, state: &State, data: Self::ResponseData, overwrite: bool) -> bool {
         if !self.valid_filters {
             return false;
         }
 
         let commitment = self.commitment();
         let (slot, accounts) = data.into_slot_and_value();
+        let slot = slot.unwrap_or(0);
         let mut account_key_refs = HashSet::with_capacity(accounts.len());
         for acc in accounts {
             let AccountAndPubkey { account, pubkey } = acc;
@@ -329,11 +335,10 @@ impl Cacheable for GetProgramAccounts {
                 pubkey,
                 AccountContext {
                     value: Some(account),
-                    context: SolanaContext {
-                        slot: slot.unwrap_or(0),
-                    },
+                    context: SolanaContext { slot },
                 },
                 commitment,
+                overwrite,
             );
             account_key_refs.insert(Arc::clone(&key_ref));
         }
@@ -341,10 +346,12 @@ impl Cacheable for GetProgramAccounts {
         let program_key = (self.pubkey, commitment);
         let should_unsubscribe = !state.program_accounts.has_active_entry(&program_key);
 
-        let program_state =
-            state
-                .program_accounts
-                .insert(program_key, account_key_refs, self.filters.clone());
+        let program_state = state.program_accounts.insert(
+            program_key,
+            account_key_refs,
+            self.filters.clone(),
+            slot,
+        );
 
         // if the cache insertion for the given program key
         // happened for the first time, then we have to unsubscribe from all accounts, which are

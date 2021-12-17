@@ -111,8 +111,14 @@ impl State {
             .reset(sub.kind, sub.commitment, sub.filters, owner);
     }
 
-    pub fn insert(&self, key: Pubkey, data: AccountContext, commitment: Commitment) -> Arc<Pubkey> {
-        self.accounts.insert(key, data, commitment)
+    pub fn insert(
+        &self,
+        key: Pubkey,
+        data: AccountContext,
+        commitment: Commitment,
+        overwrite: bool,
+    ) -> Arc<Pubkey> {
+        self.accounts.insert(key, data, commitment, overwrite)
     }
 
     pub fn websocket_connected(&self, key: (Pubkey, Commitment)) -> bool {
@@ -286,6 +292,9 @@ impl State {
         });
 
         if is_cacheable {
+            // If gPA already has active subscription, then we shouldn't overwrite existing account
+            // entries. For gAI, if we had active subscription, then we wouldn't even make it here
+            let overwrite = !request.has_active_subscription(&self, None).await;
             let this = Arc::clone(&self);
             let stream = stream_generator::generate_try_stream(move |mut stream| async move {
                 let mut bytes_chain = BytesChain::new();
@@ -305,7 +314,9 @@ impl State {
                 match resp {
                     Ok(Response::Result(data)) => {
                         let owner = data.owner();
-                        if this.is_caching_allowed() && request.put_into_cache(&this, data) {
+                        if this.is_caching_allowed()
+                            && request.put_into_cache(&this, data, overwrite)
+                        {
                             debug!(%request, "cached for key");
                             this.map_updated.notify_waiters();
                             this.subscribe(request.sub_descriptor(), owner);

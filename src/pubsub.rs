@@ -1014,8 +1014,9 @@ impl AccountUpdateManager {
                         let params: Params = serde_json::from_str(params.get())?;
                         let slot = params.result.context.slot;
                         if let Some((sub, commitment)) = self.id_to_sub.get(&params.subscription) {
-                            //info!(key = %sub.key(), "received account notification");
-                            self.accounts.insert(sub.key(), params.result, *commitment);
+                            // overwrite account entry in cache
+                            self.accounts
+                                .insert(sub.key(), params.result, *commitment, true);
                         } else {
                             warn!(
                                 self.actor_id,
@@ -1088,6 +1089,7 @@ impl AccountUpdateManager {
                                     None => HashSet::new(),
                                 };
 
+                            // overwrite account entry in cache
                             let key_ref = self.accounts.insert(
                                 key,
                                 AccountContext {
@@ -1095,6 +1097,7 @@ impl AccountUpdateManager {
                                     context: params.result.context,
                                 },
                                 *commitment,
+                                true,
                             );
 
                             let should_remove_account = self.program_accounts.update_account(
