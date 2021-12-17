@@ -144,6 +144,7 @@ impl ProgramAccountsDb {
         key: ProgramAccountsKey,
         account_key_refs: AccountSet,
         filters: Option<Filters>,
+        slot: Slot,
     ) -> RefMut<'_, ProgramAccountsKey, ProgramState> {
         let mut state = self.map.entry(key).or_default();
         if let Some(filters) = filters.as_ref() {
@@ -157,6 +158,9 @@ impl ProgramAccountsDb {
         }
         state.insert_account_keys(filters, account_key_refs);
         state.active = true;
+        if state.slot == 0 {
+            state.slot = slot;
+        }
 
         state
     }
@@ -384,7 +388,33 @@ impl AccountsDb {
         }
     }
 
-    pub fn insert(&self, key: Pubkey, data: AccountContext, commitment: Commitment) -> Arc<Pubkey> {
+    // In case if account exists in cache, sometimes its preferable not to overwrite it with new
+    // data, as new data may actually be older than the one which is currently present in cache
+    // Possible scenarios:
+    // 1. gAI is made, and account is put into cache, then gPA is made, containing the same account
+    //    for the first time, then it's ok to overwrite the contents of cache, as program
+    //    subscription will bring account up to date eventually
+    // 2. gPA is made with one filter, and the results are inserted in cache and subscription is
+    //    created, then the same gPA is made with different filter, which has some of the accounts
+    //    in common with the first one, then those accounts actually might have newer data in cache
+    //    already (due to websocket activity), so we shouldn't overwrite them
+    // `overwrite` flag is used to indicate in what situation the `insert` method was invoked
+    pub fn insert(
+        &self,
+        key: Pubkey,
+        data: AccountContext,
+        commitment: Commitment,
+        overwrite: bool,
+    ) -> Arc<Pubkey> {
+        // check whether entry exists, and return it if shouldn't overwrite it
+        let ref_key = (!overwrite)
+            .then(|| self.map.get(&key))
+            .flatten()
+            .and_then(|v| v.get_ref(commitment));
+        if let Some(key) = ref_key {
+            return key;
+        }
+
         let mut entry = self.map.entry(key).or_insert(AccountState {
             key,
             data: [None, None, None],
@@ -846,6 +876,7 @@ fn db_refs() {
             }),
         },
         Commitment::Confirmed,
+        true,
     );
 
     assert_eq!(accounts.map.len(), 1);
@@ -853,7 +884,7 @@ fn db_refs() {
     let mut set = HashSet::new();
     set.insert(acc_ref);
 
-    programs.insert((Pubkey::zero(), Commitment::Confirmed), set, None);
+    programs.insert((Pubkey::zero(), Commitment::Confirmed), set, None, 0);
     assert_eq!(accounts.map.len(), 1);
     assert_eq!(programs.map.len(), 1);
 
@@ -889,6 +920,7 @@ fn accounts_insert_remove() {
             }),
         },
         Commitment::Confirmed,
+        true,
     );
 
     assert_eq!(accounts.map.len(), 1);
@@ -906,6 +938,7 @@ fn accounts_insert_remove() {
             }),
         },
         Commitment::Confirmed,
+        true,
     );
     assert_eq!(accounts.map.len(), 1);
     drop(acc_ref);
