@@ -224,10 +224,10 @@ impl State {
             .map(|_| request.get_from_cache(&raw_request.id, &self))
         {
             Ok(Some(data)) => {
-                T::cache_hit_counter().inc();
                 let owner = data.owner();
                 self.reset(request.sub_descriptor(), owner);
                 if request.has_active_subscription(&self, owner).await {
+                    T::cache_hit_counter().inc();
                     return data.map(|data| data.response);
                 } else {
                     (true, false)
