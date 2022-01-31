@@ -1,3 +1,4 @@
+use actix_web::http::header;
 use cache_rpc::control::{handle_command, run_control_interface, ControlState, RpcConfigSender};
 use either::Either;
 use std::cell::RefCell;
@@ -219,9 +220,8 @@ async fn run(options: cli::Options) -> Result<()> {
             .allowed_header(actix_web::http::header::CONTENT_TYPE);
 
         let content_type_guard = guard::fn_guard(move |req| {
-            req.headers()
-                .get("content-type")
-                .map(move |header| header.as_bytes().starts_with(b"application/json"))
+            req.header::<header::ContentType>()
+                .map(move |header| header == header::ContentType::json())
                 .unwrap_or(false)
         });
 

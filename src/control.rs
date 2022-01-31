@@ -3,7 +3,7 @@ use std::{
     sync::{atomic::AtomicBool, Arc},
 };
 
-use actix_http::{body::AnyBody, StatusCode};
+use actix_http::{body::BoxBody, StatusCode};
 use actix_web::{post, web, web::Data, App, HttpResponse, HttpServer, ResponseError};
 use serde::Deserialize;
 use tokio::sync::watch::Sender;
@@ -114,7 +114,7 @@ async fn subscriptions_allowed_handler(
     info!("Subscriptions allowed: {}", val);
 
     let response = format!("Subsriptions: {}", if val { "on" } else { "off" });
-    Ok(HttpResponse::Ok().body(AnyBody::from_slice(response.as_bytes())))
+    Ok(HttpResponse::Ok().body(response.into_bytes()))
 }
 
 #[post("/config/reload")]
@@ -129,7 +129,7 @@ async fn config_reloader(state: Data<ControlState>) -> Result<HttpResponse, Cont
             .tx
             .send(config.rpc)
             .map_err(|_| ControlError::NoConfigFile)?;
-        Ok(HttpResponse::Ok().body(AnyBody::from_slice(b"OK")))
+        Ok(HttpResponse::Ok().body(b"OK".as_ref()))
     } else {
         Err(ControlError::NoConfigFile)
     }
@@ -138,7 +138,7 @@ async fn config_reloader(state: Data<ControlState>) -> Result<HttpResponse, Cont
 #[post("/waf/reload")]
 async fn waf_reloader(state: Data<ControlState>) -> Result<HttpResponse, ControlError> {
     state.waf_tx.send(()).map_err(|_| ControlError::NoWAFFile)?;
-    Ok(HttpResponse::Ok().body(AnyBody::from_slice(b"OK")))
+    Ok(HttpResponse::Ok().body(b"OK".as_ref()))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -157,13 +157,14 @@ impl ResponseError for ControlError {
     fn error_response(&self) -> HttpResponse {
         match self {
             ControlError::BadRequest => HttpResponse::new(StatusCode::BAD_REQUEST)
-                .set_body(AnyBody::from_slice(b"Request not supported")),
+                .set_body(BoxBody::new(b"Request not supported".as_ref())),
             ControlError::NoConfigFile => HttpResponse::new(StatusCode::NOT_FOUND)
-                .set_body(AnyBody::from_slice(b"Configuration file is not set up")),
+                .set_body(BoxBody::new(b"Configuration file is not set up".as_ref())),
             ControlError::NoWAFFile => HttpResponse::new(StatusCode::NOT_FOUND)
-                .set_body(AnyBody::from_slice(b"WAF file is not set up")),
-            ControlError::BadConfigFile => HttpResponse::new(StatusCode::CONFLICT)
-                .set_body(AnyBody::from_slice(b"Configuration file couldn't be read")),
+                .set_body(BoxBody::new(b"WAF file is not set up".as_ref())),
+            ControlError::BadConfigFile => HttpResponse::new(StatusCode::CONFLICT).set_body(
+                BoxBody::new(b"Configuration file couldn't be read".as_ref()),
+            ),
         }
     }
 }

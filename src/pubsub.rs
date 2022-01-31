@@ -1318,12 +1318,13 @@ impl Handler<AccountCommand> for AccountUpdateManager {
                         .with_label_values(&[&self.actor_name, "unsubsribe"])
                         .inc();
                     self.active_accounts.remove(&(pubkey, commitment));
+                    let sub = Subscription::Account(pubkey);
                     if self.connection.is_connected() {
-                        self.unsubscribe(Subscription::Account(pubkey), commitment)?;
+                        self.unsubscribe(sub, commitment)?;
                     } else {
-                        self.subs
-                            .remove(&(Subscription::Account(pubkey), commitment));
+                        self.subs.remove(&(sub, commitment));
                     }
+                    self.purge_key(ctx, &sub, commitment);
                 }
 
                 AccountCommand::Reset(sub, commitment, filters, owner) => {

@@ -1,6 +1,6 @@
 [package]
 name = "cache-rpc"
-version = "0.2.6"
+version = "0.2.7"
 authors = ["Alexander Polakov <a.polakov@iconic.vc>"]
 edition = "2018"
 license = "MIT"
@@ -8,13 +8,13 @@ license = "MIT"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-actix-web = "4.0.0-beta.10"
+actix-web = "4.0.0-beta.21"
 actix = "0.12"
 actix-codec = "0.4"
-actix-cors = "0.6.0-beta.3"
-actix-http = "3.0.0-beta.11"
+actix-cors = "0.6.0-beta.8"
+actix-http = "3.0.0-beta.19"
 tokio = { version = "1.0", features = ["sync", "time", "macros"] }
-tokio-util = { version = "0.6", features = ["time"] }
+tokio-util = { version = "0.6.9", features = ["time"] }
 bytes = "1.0"
 serde = "1.0"
 serde_json = { version = "1.0", features = ["raw_value"] }
@@ -29,7 +29,7 @@ tracing-appender = { version = "0.1" }
 tracing-futures = "0.2"
 structopt = "0.3"
 base64 = "0.13"
-zstd = "0.7"
+zstd = "0.9"
 smallvec = { version = "1.6", features = ["serde", "union"] }
 thiserror = "1.0"
 anyhow = "1.0"
@@ -44,12 +44,12 @@ humantime = "2.1"
 toml = "0.5"
 arc-swap = "1.4"
 mlua = { version = "0.7", features = ["luajit", "vendored"] }
-awc-uds = "0.1.0"
+awc-uds = "0.1.1"
 pin-project = "1.0"
 
-solana-account-decoder = { version = "=1.8.2", optional = true }
-solana-sdk = { version =  "=1.8.2", optional = true }
-solana-program = { version = "=1.8.2", optional = true }
+solana-account-decoder = { version = "=1.9.5", optional = true }
+solana-sdk = { version =  "=1.9.5", optional = true }
+solana-program = { version = "=1.9.5", optional = true }
 spl-token-v2-0 = { package = "spl-token", version = "=3.2.0", features = ["no-entrypoint"], optional = true}
 
 [dev-dependencies]
@@ -61,15 +61,9 @@ rand = "0.8"
 name = "filters_bench"
 harness = false
 
-[patch.crates-io]
-solana-account-decoder = { git = "https://github.com/polachok/solana", rev = "ec4e167b00b2fd3799b935bb7ca49775f6a4b63e" }
-solana-sdk = { git = "https://github.com/polachok/solana", rev = "ec4e167b00b2fd3799b935bb7ca49775f6a4b63e" }
-solana-program = { git = "https://github.com/polachok/solana", rev = "ec4e167b00b2fd3799b935bb7ca49775f6a4b63e" }
-
-
-#[patch.crates-io]
-#actix-http = { git = "https://github.com/polachok/actix-web", rev = "19cd7fdbd5b79e9d78c8cb562741d7513d980b18" }
-#actix = { git = "https://github.com/polachok/actix", rev = "58e5309310cccd38ce9b75141547a67610454759" }
+#solana-account-decoder = { git = "https://github.com/polachok/solana", rev = "ec4e167b00b2fd3799b935bb7ca49775f6a4b63e" }
+#solana-sdk = { git = "https://github.com/polachok/solana", rev = "ec4e167b00b2fd3799b935bb7ca49775f6a4b63e" }
+#solana-program = { git = "https://github.com/polachok/solana", rev = "ec4e167b00b2fd3799b935bb7ca49775f6a4b63e" }
 
 [features]
 default = ["jsonparsed"]
