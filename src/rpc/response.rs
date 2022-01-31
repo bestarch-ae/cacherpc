@@ -655,9 +655,9 @@ pub(super) fn program_accounts_response<'a>(
 
 #[cfg(feature = "jsonparsed")]
 fn get_mint_decimals(mint: &SolanaPubkey) -> Result<u8, &'static str> {
-    use solana_account_decoder::parse_token::spl_token_v2_0_native_mint;
+    use solana_account_decoder::parse_token::spl_token_native_mint;
 
-    if mint == &spl_token_v2_0_native_mint() {
+    if mint == &spl_token_native_mint() {
         Ok(spl_token_v2_0::native_mint::DECIMALS)
     } else {
         Err("Invalid param: mint is not native")
