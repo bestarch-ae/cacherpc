@@ -110,6 +110,8 @@ pub async fn rpc_handler(
 
     let mut id = Id::Null;
 
+    // extra header for passthrough requests
+    let mut request_header = None;
     // if request contains only one query, try to serve it from cache
     if let OneOrMany::One(req) = req {
         id = req.id.clone();
@@ -144,6 +146,7 @@ pub async fn rpc_handler(
             }
             method => {
                 metrics().request_types(method).inc();
+                request_header = Some(("X-Cache-Request-Method", method.to_string()));
             }
         }
     } else {
@@ -159,16 +162,15 @@ pub async fn rpc_handler(
         let total = metrics().passthrough_total_time.start_timer();
         loop {
             let request_time = metrics().passthrough_request_time.start_timer();
-            let resp = client
-                .post(&url)
-                .content_type("application/json")
-                .send_body(body.clone())
-                .await
-                .map_err(|err| {
-                    error!(error = %err, "error while streaming response");
-                    metrics().streaming_errors.inc();
-                    err
-                });
+            let mut request = client.post(&url).content_type("application/json");
+            if let Some(header) = request_header.as_ref() {
+                request = request.append_header(header.clone());
+            }
+            let resp = request.send_body(body.clone()).await.map_err(|err| {
+                error!(error = %err, "error while streaming response");
+                metrics().streaming_errors.inc();
+                err
+            });
             metrics()
                 .backend_requests_count
                 .with_label_values(&["passthrough"])
