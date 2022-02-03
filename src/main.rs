@@ -221,7 +221,9 @@ async fn run(options: cli::Options) -> Result<()> {
 
         let content_type_guard = guard::fn_guard(move |req| {
             req.header::<header::ContentType>()
-                .map(move |header| header == header::ContentType::json())
+                .map(move |header| {
+                    header.type_() == mime::APPLICATION && header.subtype() == mime::JSON
+                })
                 .unwrap_or(false)
         });
 
