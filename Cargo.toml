@@ -1,6 +1,6 @@
 [package]
 name = "cache-rpc"
-version = "0.2.8"
+version = "0.2.9"
 authors = ["Alexander Polakov <a.polakov@iconic.vc>"]
 edition = "2018"
 license = "MIT"
