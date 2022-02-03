@@ -663,7 +663,7 @@ dependencies = [
 
 [[package]]
 name = "cache-rpc"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "actix",
  "actix-codec",
@@ -685,6 +685,7 @@ dependencies = [
  "futures-util",
  "humantime",
  "lru",
+ "mime",
  "mlua",
  "once_cell",
  "pin-project",
