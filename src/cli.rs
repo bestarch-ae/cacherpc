@@ -235,16 +235,9 @@ impl Config {
     }
 }
 
-fn parse_identity(value: &str) -> Result<String, anyhow::Error> {
-    if let Ok(s) = std::fs::read_to_string(value) {
-        let vec: Vec<u8> = serde_json::from_str(&s)?;
-        if vec.len() != 64 {
-            return Err(anyhow::anyhow!("invalid keypair file provided"));
-        }
-        return Ok(bs58::encode(&vec[32..]).into_string());
-    }
+fn parse_identity(value: &str) -> Result<String, &'static str> {
     match bs58::decode(value).into_vec() {
         Ok(vec) if vec.len() == 32 => Ok(value.into()),
-        _ => Err(anyhow::anyhow!("invalid identity key was provided")),
+        _ => Err("invalid identity key was provided"),
     }
 }
