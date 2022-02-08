@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize, Serializer};
 use smallvec::{smallvec, SmallVec};
 
 use crate::types::AccountData;
@@ -19,11 +19,11 @@ type Pattern = SmallVec<[u8; 128]>;
 // This is ok since memcmp with empty pattern normalizes to "always true"
 const RESERVED_RANGE: Range = (usize::MAX, usize::MAX);
 
-#[derive(Deserialize, Debug, Hash, Eq, PartialEq, Clone, Ord, PartialOrd)]
+#[derive(Deserialize, Debug, Hash, Eq, PartialEq, Clone, Ord, PartialOrd, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Memcmp {
     pub offset: usize,
-    #[serde(deserialize_with = "decode_base58")]
+    #[serde(deserialize_with = "decode_base58", serialize_with = "encode_base58")]
     pub bytes: Pattern,
 }
 
@@ -41,7 +41,7 @@ impl Memcmp {
     }
 }
 
-#[derive(Deserialize, Debug, Hash, Eq, PartialEq, Clone, Ord, PartialOrd)]
+#[derive(Deserialize, Debug, Hash, Eq, PartialEq, Clone, Ord, PartialOrd, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Filter {
     DataSize(u64),
@@ -86,4 +86,12 @@ where
         }
     }
     de.deserialize_str(Base58Visitor)
+}
+
+fn encode_base58<S>(p: &Pattern, seralizer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let encoded = bs58::encode(p).into_string();
+    seralizer.serialize_str(&encoded)
 }

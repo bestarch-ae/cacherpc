@@ -53,9 +53,9 @@ pub(super) trait Cacheable: Sized + 'static {
     fn has_active_subscription(&self, state: &State, owner: Option<Pubkey>) -> SubscriptionActive;
 
     fn get_from_cache<'a>(
-        &self,
+        &mut self, // gPA may modify internal state of the request object
         id: &Id<'a>,
-        state: &State,
+        state: Arc<State>, // gPA may spawn a future to fetch extra accounts using State
     ) -> Option<Result<CachedResponse, Error<'a>>>;
 
     fn put_into_cache(
@@ -147,9 +147,9 @@ impl Cacheable for GetAccountInfo {
     }
 
     fn get_from_cache<'a>(
-        &self,
+        &mut self,
         id: &Id<'a>,
-        state: &State,
+        state: Arc<State>,
     ) -> Option<Result<CachedResponse, Error<'a>>> {
         let mut slot_update = None;
         let result = state.accounts.get(&self.pubkey).and_then(|data| {
@@ -176,7 +176,7 @@ impl Cacheable for GetAccountInfo {
                         id.clone(),
                         self.config_hash,
                         data,
-                        state,
+                        &state,
                         &self.config,
                         self.pubkey,
                     );
@@ -277,45 +277,64 @@ impl Cacheable for GetProgramAccounts {
     }
 
     fn get_from_cache<'a>(
-        &self,
+        &mut self,
         id: &Id<'a>,
-        state: &State,
+        state: Arc<State>,
     ) -> Option<Result<CachedResponse, Error<'a>>> {
-        let commitment = self.commitment();
+        let program_state = state
+            .program_accounts
+            .get_state((self.pubkey, self.commitment()))?;
+
+        let slot = program_state.value().slot;
+        let context = self.config.with_context.unwrap_or_default().then(|| slot);
+
+        // do not serve data from cache if the cached data doesn't have slot info
+        if context.is_some() && slot == 0 {
+            return None;
+        }
         let filters = self.filters.as_ref();
         let config = &self.config;
-
-        state
-            .program_accounts
-            .get_state((self.pubkey, commitment))
-            .and_then(|data| {
-                let accounts = data.value().get_account_keys(&self.filters)?;
-                let slot = data.value().slot;
-                let context = self.config.with_context.unwrap_or_default().then(|| slot);
-
-                // do not serve data from cache if the cached data doesn't have slot info
-                if context.is_some() && slot == 0 {
-                    return None;
-                }
+        match program_state.value().get_account_keys(&self.filters) {
+            Ok(cached) => {
                 let res = program_accounts_response(
                     id.clone(),
-                    accounts,
+                    cached.accounts,
                     config,
                     filters,
-                    state,
+                    &state,
                     context,
                 );
                 match res {
-                    Ok(res) => Some(Ok(CachedResponse {
-                        owner: None,
-                        response: res,
-                    })),
+                    Ok(res) => {
+                        // if found data is not for the given filter, but rather
+                        // for superset of it, then we should update request's
+                        // filters, so that proper filter will be reset for pubsub
+                        if cached.should_overwrite {
+                            self.filters = cached.filter_overwrite;
+                        }
+                        Some(Ok(CachedResponse {
+                            owner: None,
+                            response: res,
+                        }))
+                    }
                     Err(ProgramAccountsResponseError::Base58) => {
                         Some(Err(base58_error(id.clone())))
                     }
-                    Err(_) => None, // ?: Why?????
+                    Err(_) => None,
                 }
-            })
+            }
+            Err(Some(filters)) => {
+                // superset filter was found, fetch accounts for it,
+                // so that future cache misses will be prevented
+                drop(program_state);
+                let mut cloned_gpa = self.clone();
+                cloned_gpa.filters = Some(filters);
+                // fetch account asynchronously, so that we don't block client request
+                actix::spawn(state.fetch_program_accounts(cloned_gpa));
+                None
+            }
+            Err(None) => None,
+        }
     }
 
     fn put_into_cache(&self, state: &State, data: Self::ResponseData, overwrite: bool) -> bool {

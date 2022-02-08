@@ -28,7 +28,7 @@ use crate::types::{
 };
 
 use super::cacheable::Cacheable;
-use super::request::Request;
+use super::request::{GetProgramAccounts, Id, Request};
 use super::response::{Error, Response};
 use super::{backoff_settings, Config, HasOwner, LruEntry, SubDescriptor};
 
@@ -216,14 +216,103 @@ impl State {
         }
     }
 
+    pub(super) async fn fetch_program_accounts(self: Arc<Self>, gpa: GetProgramAccounts) {
+        let params = serde_json::json!([gpa.pubkey, {
+            "commitment": gpa.commitment(),
+            "encoding": gpa.config.encoding,
+            "filters": gpa.filters,
+            "withContext": true
+        }]);
+
+        let request = Request {
+            jsonrpc: "2.0",
+            // JSON-RPC doesn't prevent us from reusing the id, so we can just hardcode it for this particular case
+            id: Id::Num(42),
+            method: GetProgramAccounts::REQUEST_TYPE,
+            params: Some(&params),
+        };
+        let limit = GetProgramAccounts::get_limit(&self);
+        let timeout = GetProgramAccounts::get_timeout(&self);
+
+        metrics().self_initiated_gpa.inc();
+
+        let wait_time = metrics()
+            .wait_time
+            .with_label_values(&[GetProgramAccounts::REQUEST_TYPE])
+            .start_timer();
+
+        let _permit = match limit.acquire().await {
+            Some(permit) => permit, // on success will move out of wait queue
+            None => {
+                warn!("wait queue on request type has been filled up");
+                return;
+            }
+        };
+
+        metrics()
+            .available_permits
+            .with_label_values(&[GetProgramAccounts::REQUEST_TYPE])
+            .observe(limit.available_permits() as f64);
+        wait_time.observe_duration();
+        let body = self
+            .client
+            .post(&self.rpc_url)
+            .timeout(timeout)
+            .append_header(("X-Cache-Request-Method", GetProgramAccounts::REQUEST_TYPE))
+            .send_json(&request)
+            .await;
+        metrics()
+            .backend_requests_count
+            .with_label_values(&[GetProgramAccounts::REQUEST_TYPE])
+            .inc(); // count request attempts, even failed ones
+        let result = match body {
+            Ok(mut resp) => match resp.body().await {
+                Ok(body) => body,
+                Err(error) => {
+                    warn!(?request, %error, "coudn't fetch program accounts");
+                    return;
+                }
+            },
+            Err(err) => {
+                warn!(?request, error=%err, "reporting gateway timeout on gpa request");
+                return;
+            }
+        };
+
+        let resp = serde_json::from_slice(result.as_ref()).map(
+            |wrap: Flatten<Response<<GetProgramAccounts as Cacheable>::ResponseData>>| wrap.inner,
+        );
+
+        match resp {
+            Ok(Response::Result(data)) => {
+                if gpa.put_into_cache(&self, data, false) {
+                    info!(request=%gpa, "cached self initiated gpa");
+                    self.subscribe(gpa.sub_descriptor(), None);
+                } else {
+                    warn!(request=%gpa, "coundn't cache self initiated gpa, invalid filters");
+                }
+            }
+            Ok(Response::Error(error)) => {
+                metrics()
+                    .backend_errors
+                    .with_label_values(&[GetProgramAccounts::REQUEST_TYPE])
+                    .inc();
+                warn!(request=%gpa, ?error, "coundn't cache self initiated gpa, error occured");
+            }
+            Err(error) => {
+                error!(request=%gpa, %error, "error deserializing gPA response, cannot cache");
+            }
+        }
+    }
+
     pub(super) async fn process_request<T: Cacheable + fmt::Display>(
         self: Arc<Self>,
         raw_request: Request<'_, RawValue>,
     ) -> CacheResult<'_> {
-        let request = T::parse(&raw_request)?;
+        let mut request = T::parse(&raw_request)?;
         let (is_cacheable, can_use_cache) = match request
             .is_cacheable(&self)
-            .map(|_| request.get_from_cache(&raw_request.id, &self))
+            .map(|_| request.get_from_cache(&raw_request.id, Arc::clone(&self)))
         {
             Ok(Some(data)) => {
                 let owner = data.owner();
@@ -239,7 +328,7 @@ impl State {
             Err(reason) => {
                 let data = reason
                     .can_use_cache()
-                    .then(|| request.get_from_cache(&raw_request.id, &self))
+                    .then(|| request.get_from_cache(&raw_request.id, Arc::clone(&self)))
                     .flatten();
 
                 if let Some(data) = data {
@@ -271,7 +360,7 @@ impl State {
                     break body?;
                 }
                 _ = notified, if can_use_cache => {
-                    if let Some(data) = request.get_from_cache(&raw_request.id, &self) {
+                    if let Some(data) = request.get_from_cache(&raw_request.id, Arc::clone(&self)) {
                         T::cache_hit_counter().inc();
                         T::cache_filled_counter().inc();
                         self.reset(request.sub_descriptor(), data.owner());
