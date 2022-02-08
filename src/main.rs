@@ -174,6 +174,7 @@ async fn run(options: cli::Options) -> Result<()> {
     let rpc_config = Arc::new(ArcSwap::from(Arc::new(config.rpc)));
     let timeout = options.request_timeout;
 
+    let identity = options.identity;
     HttpServer::new(move || {
         let waf = rules_path
             .as_ref()
@@ -213,6 +214,7 @@ async fn run(options: cli::Options) -> Result<()> {
             },
             waf,
             waf_watch: RefCell::new(waf_rx.clone()),
+            identity: identity.clone(),
         };
         let cors = Cors::default()
             .allow_any_origin()

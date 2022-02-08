@@ -121,6 +121,12 @@ pub struct Options {
         parse(try_from_str = humantime::parse_duration)
     )]
     pub request_timeout: Duration,
+    #[structopt(
+        long = "identity",
+        help = "public key of cacherpc, that should be sent to getIdentity requests",
+        parse(try_from_str = parse_identity)
+    )]
+    pub identity: Option<String>,
 }
 
 #[derive(Debug)]
@@ -226,5 +232,19 @@ impl Config {
                 ignore_base58_limit: options.ignore_base58,
             },
         }
+    }
+}
+
+fn parse_identity(value: &str) -> Result<String, anyhow::Error> {
+    if let Ok(s) = std::fs::read_to_string(value) {
+        let vec: Vec<u8> = serde_json::from_str(&s)?;
+        if vec.len() != 64 {
+            return Err(anyhow::anyhow!("invalid keypair file provided"));
+        }
+        return Ok(bs58::encode(&vec[32..]).into_string());
+    }
+    match bs58::decode(value).into_vec() {
+        Ok(vec) if vec.len() == 32 => Ok(value.into()),
+        _ => Err(anyhow::anyhow!("invalid identity key was provided")),
     }
 }

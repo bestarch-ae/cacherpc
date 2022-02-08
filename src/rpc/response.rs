@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use actix_web::{HttpResponse, ResponseError};
@@ -424,6 +424,24 @@ impl<'a> HasOwner for Result<CachedResponse, Error<'a>> {
     fn owner(&self) -> Option<Pubkey> {
         self.as_ref().ok().map(|data| data.owner).flatten()
     }
+}
+
+pub(super) fn identity_response<'a, 'b>(req_id: Id<'a>, identity: &'b str) -> HttpResponse {
+    let mut map = HashMap::new();
+    map.insert("identity", identity);
+    let resp = JsonRpcResponse {
+        jsonrpc: "2.0",
+        result: map,
+        id: req_id,
+    };
+
+    let body = serde_json::to_vec(&resp).expect("couldn't serialize identity");
+
+    return HttpResponse::Ok()
+        .append_header(("x-cache-status", "hit"))
+        .append_header(("x-cache-type", "lru"))
+        .content_type("application/json")
+        .body(body);
 }
 
 pub(super) fn account_response<'a, 'b>(
