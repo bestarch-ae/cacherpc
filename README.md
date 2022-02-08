@@ -41,6 +41,7 @@ The server supports a number of configuration options, which are the following:
   default is 60 seconds. Timeouts for `getAccountinfo` and `getProgramAccounts`
   requests are configured separately via configuration file.
 - `--rules` — path to firewall rules written in lua
+- `--identity` — optional identity key for cacherpc service, should be base58 encoded public key 
 - `--control-socket-path` — path to socket file, e.g. /run/cacherpc.sock
 
 #### Configuration file

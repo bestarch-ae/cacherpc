@@ -11,6 +11,7 @@ use tracing::{error, info, warn};
 
 use crate::metrics::rpc_metrics as metrics;
 use crate::rpc::request::{GetAccountInfo, GetProgramAccounts};
+use crate::rpc::response::identity_response;
 
 use super::request::{Id, Request};
 use super::response::Error;
@@ -143,6 +144,15 @@ pub async fn rpc_handler(
                     req.method,
                     arc_state.process_request::<GetProgramAccounts>(req)
                 );
+            }
+            "getIdentity" if app_state.identity.is_some() => {
+                return Ok(identity_response(
+                    req.id,
+                    app_state
+                        .identity
+                        .as_ref()
+                        .expect("no identity, shouldn't happen"),
+                ));
             }
             method => {
                 metrics().request_types(method).inc();

@@ -426,6 +426,25 @@ impl<'a> HasOwner for Result<CachedResponse, Error<'a>> {
     }
 }
 
+pub(super) fn identity_response(req_id: Id<'_>, identity: &str) -> HttpResponse {
+    #[derive(Serialize)]
+    struct Identity<'a> {
+        identity: &'a str,
+    }
+    let result = Identity { identity };
+    let resp = JsonRpcResponse {
+        jsonrpc: "2.0",
+        result,
+        id: req_id,
+    };
+
+    let body = serde_json::to_vec(&resp).expect("couldn't serialize identity");
+
+    return HttpResponse::Ok()
+        .content_type("application/json")
+        .body(body);
+}
+
 pub(super) fn account_response<'a, 'b>(
     req_id: Id<'a>,
     request_hash: u64,

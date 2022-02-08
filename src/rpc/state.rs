@@ -48,6 +48,7 @@ pub struct State {
     pub lru: RefCell<LruCache<u64, LruEntry>>,
     pub worker_id: String,
     pub waf: Option<Waf>,
+    pub identity: Option<String>,
 }
 
 pub struct Waf {
