@@ -3,14 +3,18 @@ use std::{
     sync::{atomic::AtomicBool, Arc},
 };
 
+use actix::Addr;
 use actix_http::{body::BoxBody, StatusCode};
 use actix_web::{post, web, web::Data, App, HttpResponse, HttpServer, ResponseError};
 use serde::Deserialize;
 use tokio::sync::watch::Sender;
 use tracing::{info, warn};
 
-use crate::cli::{Command, Config};
-use crate::rpc;
+use crate::{cli::ForceReconnectSubCmd, pubsub::manager::WsReconnectInstruction, rpc};
+use crate::{
+    cli::{Command, Config},
+    pubsub::manager::PubSubManager,
+};
 
 pub const CACHER_SOCKET_DEFAULT: &str = "/run/cacherpc.sock";
 
@@ -20,6 +24,7 @@ pub struct ControlState {
     subscriptions_allowed: Arc<AtomicBool>,
     socket_path: PathBuf,
     waf_tx: Arc<Sender<()>>,
+    pubsub: Addr<PubSubManager>,
 }
 
 impl ControlState {
@@ -28,6 +33,7 @@ impl ControlState {
         rpc_config_sender: Option<RpcConfigSender>,
         socket_path: PathBuf,
         waf_tx: Sender<()>,
+        pubsub: Addr<PubSubManager>,
     ) -> Self {
         if rpc_config_sender.is_none() {
             warn!("No configuration file was set up");
@@ -39,6 +45,7 @@ impl ControlState {
             subscriptions_allowed,
             socket_path,
             waf_tx,
+            pubsub,
         }
     }
 }
@@ -63,6 +70,7 @@ pub async fn run_control_interface(state: ControlState) {
             .app_data(Data::new(state_clone.clone()))
             .service(subscriptions_allowed_handler)
             .service(config_reloader)
+            .service(force_ws_reconnect)
             .service(waf_reloader)
     })
     .workers(1)
@@ -141,6 +149,18 @@ async fn waf_reloader(state: Data<ControlState>) -> Result<HttpResponse, Control
     Ok(HttpResponse::Ok().body(b"OK".as_ref()))
 }
 
+#[post("/force/reconnect")]
+async fn force_ws_reconnect(
+    body: web::Json<WsReconnectInstruction>,
+    state: Data<ControlState>,
+) -> Result<HttpResponse, ControlError> {
+    let instruction = body.into_inner();
+    match state.pubsub.send(instruction).await {
+        Ok(res) => Ok(HttpResponse::Ok().body(res.into_bytes())),
+        Err(_) => Err(ControlError::PubSubNotRunning),
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 enum ControlError {
     #[error("Bad request")]
@@ -151,6 +171,8 @@ enum ControlError {
     NoWAFFile,
     #[error("Configuration file cannot be read")]
     BadConfigFile,
+    #[error("PubSubManager is not running")]
+    PubSubNotRunning,
 }
 
 impl ResponseError for ControlError {
@@ -164,6 +186,9 @@ impl ResponseError for ControlError {
                 .set_body(BoxBody::new(b"WAF file is not set up".as_ref())),
             ControlError::BadConfigFile => HttpResponse::new(StatusCode::CONFLICT).set_body(
                 BoxBody::new(b"Configuration file couldn't be read".as_ref()),
+            ),
+            ControlError::PubSubNotRunning => HttpResponse::new(StatusCode::NOT_FOUND).set_body(
+                BoxBody::new(b"Websocket connections manager is not running".as_ref()),
             ),
         }
     }
@@ -180,10 +205,34 @@ pub async fn handle_command(
         .connector(Connector::new().connector(UdsConnector::new(socket_path)))
         .finish();
 
-    let mut response = client
-        .post(format!("http://localhost/{}", cmd.to_url_path()))
-        .send()
-        .await?;
+    let mut response = match cmd {
+        Command::ForceReconnect {
+            subcmd,
+            delay,
+            interval,
+        } => {
+            let body = match subcmd {
+                ForceReconnectSubCmd::Init => WsReconnectInstruction::Init {
+                    delay: delay.expect("control: no delay was provided"),
+                    interval: interval.expect("control: no interval was provided"),
+                },
+                ForceReconnectSubCmd::Status => WsReconnectInstruction::Status,
+                ForceReconnectSubCmd::Abort => WsReconnectInstruction::Abort,
+            };
+            let body = serde_json::to_vec(&body)?;
+            client
+                .post(format!("http://localhost/{}", cmd.to_url_path()))
+                .content_type("application/json")
+                .send_body(body)
+                .await?
+        }
+        _ => {
+            client
+                .post(format!("http://localhost/{}", cmd.to_url_path()))
+                .send()
+                .await?
+        }
+    };
     std::io::stdout()
         .write_all(&response.body().await?)
         .unwrap();

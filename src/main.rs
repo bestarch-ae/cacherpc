@@ -119,7 +119,7 @@ async fn run(options: cli::Options) -> Result<()> {
     info!(?config, "config");
 
     let subscriptions_allowed = Arc::new(AtomicBool::new(true));
-    let pubsub = PubSubManager::init(
+    let (pubsub, pubsub_actor) = PubSubManager::init(
         options.websocket_connections,
         accounts.clone(),
         program_accounts.clone(),
@@ -167,6 +167,7 @@ async fn run(options: cli::Options) -> Result<()> {
         rpc_config_sender,
         options.control_socket_path,
         waf_tx,
+        pubsub_actor,
     );
 
     actix::spawn(run_control_interface(control_state));

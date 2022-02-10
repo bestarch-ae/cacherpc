@@ -137,9 +137,18 @@ pub enum LogFormat {
 
 #[derive(Debug, StructOpt)]
 pub enum Command {
-    Subscriptions { state: SubscriptionsState },
+    Subscriptions {
+        state: SubscriptionsState,
+    },
     ConfigReload,
     WafReload,
+    ForceReconnect {
+        subcmd: ForceReconnectSubCmd,
+        #[structopt(required_if("subcmd", "init"))]
+        delay: Option<u64>,
+        #[structopt(required_if("subcmd", "init"))]
+        interval: Option<u64>,
+    },
 }
 
 impl Command {
@@ -152,6 +161,7 @@ impl Command {
                 SubscriptionsState::Off => "subscriptions/off",
                 SubscriptionsState::Status => "subscriptions/status",
             },
+            Self::ForceReconnect { .. } => "force/reconnect",
         }
     }
 }
@@ -175,6 +185,30 @@ impl std::str::FromStr for LogFormat {
             "plain" => Ok(LogFormat::Plain),
             "json" => Ok(LogFormat::Json),
             _ => Err(LogFormatParseError),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum ForceReconnectSubCmd {
+    Init,
+    Status,
+    Abort,
+}
+
+#[derive(thiserror::Error, Debug)]
+#[error("must be one of: \"init\", \"status\", \"abort\"")]
+pub struct ForceReconnectSubCmdError;
+
+impl std::str::FromStr for ForceReconnectSubCmd {
+    type Err = ForceReconnectSubCmdError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "init" => Ok(ForceReconnectSubCmd::Init),
+            "status" => Ok(ForceReconnectSubCmd::Status),
+            "abort" => Ok(ForceReconnectSubCmd::Abort),
+            _ => Err(ForceReconnectSubCmdError),
         }
     }
 }

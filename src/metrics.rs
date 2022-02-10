@@ -78,6 +78,8 @@ pub struct PubSubMetrics {
     pub pubsub_account_slot: IntGaugeVec,
     pub websocket_reconnects: IntCounterVec,
     pub subscriptions_skipped: IntCounter,
+    pub forced_reconnections_remaining: IntGauge,
+    pub forced_reconnections_finished: IntGauge,
 }
 
 pub fn pubsub_metrics() -> &'static PubSubMetrics {
@@ -250,6 +252,16 @@ pub fn pubsub_metrics() -> &'static PubSubMetrics {
         subscriptions_skipped: register_int_counter!(
             "subscriptions_skipped", 
             "Number of account subscriptions skipped, due to presence of owner-program subscription"
+        )
+        .unwrap(),
+        forced_reconnections_remaining: register_int_gauge!(
+            "forced_reconnections_remaining",
+            "Number of forced WS reconnection, that hasn't been performed yet"
+        )
+        .unwrap(),
+        forced_reconnections_finished: register_int_gauge!(
+            "forced_reconnections_finished",
+            "Number of forced WS reconnection, that has been already performed"
         )
         .unwrap(),
     });
