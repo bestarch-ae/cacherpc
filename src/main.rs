@@ -21,7 +21,7 @@ use tracing::info;
 
 pub use cache_rpc::{cli, metrics, pubsub, rpc, types};
 
-use pubsub::PubSubManager;
+use pubsub::manager::PubSubManager;
 use types::{AccountsDb, ProgramAccountsDb};
 
 #[actix_web::main]
@@ -124,7 +124,7 @@ async fn run(options: cli::Options) -> Result<()> {
         accounts.clone(),
         program_accounts.clone(),
         rpc_slot.clone(),
-        pubsub::WorkerConfig {
+        pubsub::manager::WorkerConfig {
             websocket_url: options.ws_url.to_owned(),
             ttl: options.time_to_live,
             slot_distance: options.slot_distance,

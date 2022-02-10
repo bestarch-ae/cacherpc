@@ -20,7 +20,8 @@ use tokio::sync::{watch, Notify};
 use tracing::{debug, error, info, warn};
 
 use crate::metrics::rpc_metrics as metrics;
-use crate::pubsub::{PubSubManager, Subscription, SubscriptionActive};
+use crate::pubsub::manager::PubSubManager;
+use crate::pubsub::subscription::{Subscription, SubscriptionActive};
 use crate::rpc::request::Flatten;
 use crate::types::{
     AccountContext, AccountsDb, BytesChain, Commitment, ProgramAccountsDb, Pubkey, SemaphoreQueue,
