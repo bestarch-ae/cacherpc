@@ -7,7 +7,7 @@ use serde_json::value::RawValue;
 
 use crate::filter::Filters;
 use crate::metrics::rpc_metrics as metrics;
-use crate::pubsub::Subscription;
+use crate::pubsub::subscription::Subscription;
 use crate::types::{AccountContext, Commitment, Pubkey};
 
 #[derive(Debug, Deserialize, Serialize, Copy, Clone)]

@@ -7,12 +7,10 @@ use serde::de::DeserializeOwned;
 use serde_json::value::RawValue;
 
 use crate::metrics::rpc_metrics as metrics;
+use crate::pubsub::subscription::{Subscription, SubscriptionActive};
 use crate::rpc::request::{parse_params, MaybeFilters, ProgramAccountsConfig};
 use crate::types::SolanaContext;
-use crate::{
-    pubsub::{Subscription, SubscriptionActive},
-    types::{AccountContext, Commitment, Encoding, Pubkey, SemaphoreQueue},
-};
+use crate::types::{AccountContext, Commitment, Encoding, Pubkey, SemaphoreQueue};
 
 use super::request::{AccountAndPubkey, MaybeContext};
 use super::response::ProgramAccountsResponseError;
