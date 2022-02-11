@@ -28,6 +28,7 @@ pub(super) struct GetAccountInfo {
     pub(super) config_hash: u64,
 }
 
+#[derive(Clone)]
 pub(super) struct GetProgramAccounts {
     pub(super) pubkey: Pubkey,
     pub(super) config: ProgramAccountsConfig,
@@ -65,7 +66,7 @@ pub(super) struct AccountInfoConfig {
     pub(super) data_slice: Option<Slice>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 pub(super) struct ProgramAccountsConfig {
     #[serde(default = "Encoding::default")]
     pub(super) encoding: Encoding,
@@ -78,7 +79,7 @@ pub(super) struct ProgramAccountsConfig {
     pub(super) with_context: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(from = "SmallVec<[Filter; 3]>")]
 pub(super) enum MaybeFilters {
     Valid(Filters),

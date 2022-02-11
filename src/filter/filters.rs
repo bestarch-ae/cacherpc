@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{ser::SerializeSeq, Deserialize, Serialize};
 use smallvec::SmallVec;
 use thiserror::Error;
 
@@ -79,6 +79,55 @@ impl Filters {
         })
     }
 
+    #[inline]
+    pub(crate) fn memcmp_len(&self) -> usize {
+        self.memcmp.len()
+    }
+
+    /// Check whether one filter (self), will include all the
+    /// data of other filter, because it's less restrictive
+    #[inline]
+    pub fn is_proper_superset_of(&self, other: &Self) -> bool {
+        match self.memcmp.len() {
+            // if memcmp is empty, then check whether dataSize equals, if
+            // they do, then self will include all the data of other filter
+            0 => self.data_size == other.data_size,
+            // if memcmp has just one element, then we should check
+            // whether it's contained within the other's memcmp
+            1 => {
+                self.data_size == other.data_size
+                    && self
+                        .memcmp
+                        .first()
+                        .map(|mmcp| other.memcmp.contains(mmcp))
+                        .unwrap_or_default()
+            }
+            // if the filter has 2 or more memcmp, then it's impossible
+            // that it's a proper superset of the any other filter
+            _ => false,
+        }
+    }
+
+    /// Check whether two filters have an intersection, i.e. filter which will include,
+    /// the union of the data of both filters (because it's less restrictive)
+    pub fn intersection(&self, other: &Self) -> Option<Self> {
+        if self.data_size != other.data_size {
+            return None;
+        }
+        for m in self.memcmp.iter() {
+            if other.memcmp.contains(m) {
+                // return the first memcmp that is contained within both filters
+                let mut memcmp = SmallVec::<[Memcmp; 2]>::new();
+                memcmp.push(m.clone());
+                return Some(Self {
+                    data_size: self.data_size,
+                    memcmp,
+                });
+            }
+        }
+        None
+    }
+
     pub fn matches(&self, data: &AccountData) -> bool {
         if self
             .data_size
@@ -88,6 +137,34 @@ impl Filters {
         }
 
         self.memcmp.iter().all(|memcmp| memcmp.matches(data))
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        let mut len = 0;
+        if self.data_size.is_some() {
+            len += 1;
+        }
+        len += self.memcmp.len();
+        len
+    }
+}
+
+impl Serialize for Filters {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut seq = serializer.serialize_seq(Some(self.len()))?;
+        if let Some(ds) = self.data_size {
+            let filter = Filter::DataSize(ds);
+            seq.serialize_element(&filter)?;
+        }
+        for m in &self.memcmp {
+            let filter = Filter::Memcmp(m.clone());
+            seq.serialize_element(&filter)?;
+        }
+        seq.end()
     }
 }
 

@@ -22,7 +22,7 @@ type ProgramAccountsKey = (Pubkey, Commitment);
 #[derive(Default)]
 pub struct ProgramState {
     pub slot: u64,
-    // account keys, that were requested using various filteres
+    // account keys, that were requested using various filters
     filtered_keys: HashMap<Filters, AccountSet>,
     // account keys, that were requested without any filters
     unfiltered_keys: Option<AccountSet>,
@@ -33,17 +33,95 @@ pub struct ProgramState {
     // for accounts of the owner program can be made
     active: bool,
 }
+
 #[derive(Default, Clone)]
 pub struct ProgramAccountsDb {
     map: Arc<DashMap<ProgramAccountsKey, ProgramState>>,
 }
 
+/// Wrapper container type, that holds cached
+/// account keys for the given filter, also it
+/// contains information, regarding whether the
+/// keys were found for the filter itself or its
+/// superset, in which case it also contains the
+/// superfilter, which should be used further on
+pub struct CachedAccountsForFilter<'a> {
+    /// Cached account keys
+    pub accounts: &'a HashSet<Arc<Pubkey>>,
+    /// Filter which maps to superset of the data
+    /// which the original filter would map to
+    pub filter_overwrite: Option<Filters>,
+    /// Whether filter_overwrite should be used,
+    /// i.e. indicates whether the accounts were
+    /// found for the original filter or its superset
+    pub should_overwrite: bool,
+}
+
 impl ProgramState {
-    pub fn get_account_keys(&self, filters: &Option<Filters>) -> Option<&HashSet<Arc<Pubkey>>> {
-        filters
+    #[inline]
+    pub fn get_account_keys(
+        &self,
+        filters: &Option<Filters>,
+    ) -> Result<CachedAccountsForFilter<'_>, Option<Filters>> {
+        let keys = filters
             .as_ref()
-            .and_then(|filters| self.filtered_keys.get(filters))
-            .or_else(|| self.unfiltered_keys.as_ref())
+            .and_then(|filters| self.filtered_keys.get(filters));
+        if let Some(keys) = keys {
+            let result = CachedAccountsForFilter {
+                accounts: keys,
+                filter_overwrite: None,
+                should_overwrite: false,
+            };
+            return Ok(result);
+        }
+        if let Some(keys) = self.unfiltered_keys.as_ref() {
+            let result = CachedAccountsForFilter {
+                accounts: keys,
+                filter_overwrite: None,
+                // if accounts weren't found for filter, but cache contained
+                // all the accounts for the givent program, then we should
+                // indicate that by setting should_overwrite to true
+                should_overwrite: filters.is_some(),
+            };
+            return Ok(result);
+        }
+        if let Some(filters) = filters {
+            self.get_superset(filters)
+        } else {
+            Err(None)
+        }
+    }
+
+    /// Try to find a superset of the given filters,
+    /// if it cannot be found, try to find which new
+    /// filter would be a superset of existing filters
+    /// along with this one, so it can be fetched for
+    /// further usage, to prevent cache misses
+    #[inline]
+    fn get_superset(
+        &self,
+        filters: &Filters,
+    ) -> Result<CachedAccountsForFilter<'_>, Option<Filters>> {
+        let mut intersection = None;
+        for k in self.filtered_keys.keys() {
+            if k.memcmp_len() < 2 && k.is_proper_superset_of(filters) {
+                let filtered = self
+                    .filtered_keys
+                    .get(k)
+                    .expect("no key present for checked filter, shouldn't happen");
+                let result = CachedAccountsForFilter {
+                    accounts: filtered,
+                    filter_overwrite: Some(k.clone()),
+                    should_overwrite: true,
+                };
+                return Ok(result);
+            } else if k.memcmp_len() == 2 {
+                if let Some(f) = k.intersection(filters) {
+                    intersection = Some(f);
+                }
+            }
+        }
+        Err(intersection)
     }
 
     fn insert_account_keys(&mut self, filters: Option<Filters>, keys: AccountSet) {
@@ -57,6 +135,7 @@ impl ProgramState {
         }
     }
 
+    #[inline]
     fn has_unfiltered(&self) -> bool {
         self.unfiltered_keys.is_some()
     }
@@ -103,6 +182,7 @@ impl ProgramState {
         }
     }
 
+    #[inline]
     pub fn tracked_keys(&self) -> &AccountSet {
         &self.tracked_keys
     }
@@ -111,7 +191,7 @@ impl ProgramState {
 impl ProgramAccountsDb {
     pub fn track_account_key(&self, program_key: ProgramAccountsKey, key_ref: Arc<Pubkey>) -> bool {
         let mut program_state = self.map.entry(program_key).or_default();
-        // track refrerence counts, in case owner program is ever requested
+        // track reference counts, in case owner program is ever requested
         // and put in cache, it will just unsubscribe from all those tracked
         // account keys, to avoid subscription duplication
         program_state.tracked_keys.insert(key_ref);

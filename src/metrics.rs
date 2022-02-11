@@ -288,6 +288,7 @@ pub struct RpcMetrics {
     pub backend_requests_count: IntCounterVec,
     pub serialization_time: HistogramVec,
     pub account_data_len: HistogramVec,
+    pub self_initiated_gpa: IntCounter,
 }
 
 impl RpcMetrics {
@@ -540,6 +541,11 @@ pub fn rpc_metrics() -> &'static RpcMetrics {
                 52_428_800.,
                 104_857_600.,
             ]
+        )
+        .unwrap(),
+        self_initiated_gpa: register_int_counter!(
+            "self_initiated_gpa",
+            "Number of getProgramAccounts requests, which were initiated by cacherpc itself"
         )
         .unwrap(),
     });
