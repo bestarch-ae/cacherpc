@@ -6,14 +6,17 @@ use std::{
 use actix::Addr;
 use actix_http::{body::BoxBody, StatusCode};
 use actix_web::{post, web, web::Data, App, HttpResponse, HttpServer, ResponseError};
-use serde::Deserialize;
 use tokio::sync::watch::Sender;
 use tracing::{info, warn};
 
-use crate::{cli::ForceReconnectSubCmd, pubsub::manager::WsReconnectInstruction, rpc};
 use crate::{
     cli::{Command, Config},
     pubsub::manager::PubSubManager,
+};
+use crate::{
+    cli::{ForceReconnectSubCmd, StateSubCmd},
+    pubsub::manager::WsReconnectInstruction,
+    rpc,
 };
 
 pub const CACHER_SOCKET_DEFAULT: &str = "/run/cacherpc.sock";
@@ -25,6 +28,7 @@ pub struct ControlState {
     socket_path: PathBuf,
     waf_tx: Arc<Sender<()>>,
     pubsub: Addr<PubSubManager>,
+    wide_filters: Arc<AtomicBool>,
 }
 
 impl ControlState {
@@ -34,6 +38,7 @@ impl ControlState {
         socket_path: PathBuf,
         waf_tx: Sender<()>,
         pubsub: Addr<PubSubManager>,
+        wide_filters: Arc<AtomicBool>,
     ) -> Self {
         if rpc_config_sender.is_none() {
             warn!("No configuration file was set up");
@@ -46,6 +51,7 @@ impl ControlState {
             socket_path,
             waf_tx,
             pubsub,
+            wide_filters,
         }
     }
 }
@@ -69,6 +75,7 @@ pub async fn run_control_interface(state: ControlState) {
         App::new()
             .app_data(Data::new(state_clone.clone()))
             .service(subscriptions_allowed_handler)
+            .service(wide_filters_handler)
             .service(config_reloader)
             .service(force_ws_reconnect)
             .service(waf_reloader)
@@ -95,26 +102,17 @@ pub async fn run_control_interface(state: ControlState) {
     }
 }
 
-#[derive(Deserialize, Debug)]
-struct SubscribeAction {
-    action: String,
-}
-
 #[post("/subscriptions/{action}")]
 async fn subscriptions_allowed_handler(
-    path: web::Path<SubscribeAction>,
+    path: web::Path<StateSubCmd>,
     state: Data<ControlState>,
 ) -> Result<HttpResponse, ControlError> {
-    let val = match path.action.as_str() {
-        "on" => true,
-        "off" => false,
-        "status" => state
+    let val = match path.into_inner() {
+        StateSubCmd::On => true,
+        StateSubCmd::Off => false,
+        StateSubCmd::Status => state
             .subscriptions_allowed
             .load(std::sync::atomic::Ordering::Relaxed),
-        other => {
-            warn!("Invalid action for subscriptions_allowed: {}", other);
-            return Err(ControlError::BadRequest);
-        }
     };
     state
         .subscriptions_allowed
@@ -122,6 +120,30 @@ async fn subscriptions_allowed_handler(
     info!("Subscriptions allowed: {}", val);
 
     let response = format!("Subsriptions: {}", if val { "on" } else { "off" });
+    Ok(HttpResponse::Ok().body(response.into_bytes()))
+}
+
+#[post("/wide/filters/{action}")]
+async fn wide_filters_handler(
+    path: web::Path<StateSubCmd>,
+    state: Data<ControlState>,
+) -> Result<HttpResponse, ControlError> {
+    let val = match path.into_inner() {
+        StateSubCmd::On => true,
+        StateSubCmd::Off => false,
+        StateSubCmd::Status => state
+            .wide_filters
+            .load(std::sync::atomic::Ordering::Relaxed),
+    };
+    state
+        .wide_filters
+        .store(val, std::sync::atomic::Ordering::Relaxed);
+    info!("Wide filters fetching enabled: {}", val);
+
+    let response = format!(
+        "Wide filters has been turned: {}",
+        if val { "on" } else { "off" }
+    );
     Ok(HttpResponse::Ok().body(response.into_bytes()))
 }
 
@@ -163,6 +185,7 @@ async fn force_ws_reconnect(
 
 #[derive(Debug, thiserror::Error)]
 enum ControlError {
+    #[allow(unused)]
     #[error("Bad request")]
     BadRequest,
     #[error("No configuration file is set up")]

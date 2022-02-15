@@ -1,5 +1,6 @@
 use anyhow::Result;
 use humantime;
+use serde::Deserialize;
 use std::path::PathBuf;
 use std::time::Duration;
 use structopt::StructOpt;
@@ -138,7 +139,7 @@ pub enum LogFormat {
 #[derive(Debug, StructOpt)]
 pub enum Command {
     Subscriptions {
-        state: SubscriptionsState,
+        subcmd: StateSubCmd,
     },
     ConfigReload,
     WafReload,
@@ -149,6 +150,9 @@ pub enum Command {
         #[structopt(required_if("subcmd", "init"))]
         interval: Option<u64>,
     },
+    WideFilters {
+        subcmd: StateSubCmd,
+    },
 }
 
 impl Command {
@@ -156,18 +160,24 @@ impl Command {
         match self {
             Self::ConfigReload => "config/reload",
             Self::WafReload => "waf/reload",
-            Self::Subscriptions { state } => match state {
-                SubscriptionsState::On => "subscriptions/on",
-                SubscriptionsState::Off => "subscriptions/off",
-                SubscriptionsState::Status => "subscriptions/status",
+            Self::Subscriptions { subcmd } => match subcmd {
+                StateSubCmd::On => "subscriptions/on",
+                StateSubCmd::Off => "subscriptions/off",
+                StateSubCmd::Status => "subscriptions/status",
             },
             Self::ForceReconnect { .. } => "force/reconnect",
+            Self::WideFilters { subcmd } => match subcmd {
+                StateSubCmd::On => "wide/filters/on",
+                StateSubCmd::Off => "wide/filters/off",
+                StateSubCmd::Status => "wide/filters/status",
+            },
         }
     }
 }
 
-#[derive(Debug)]
-pub enum SubscriptionsState {
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StateSubCmd {
     On,
     Off,
     Status,
@@ -215,17 +225,17 @@ impl std::str::FromStr for ForceReconnectSubCmd {
 
 #[derive(thiserror::Error, Debug)]
 #[error("must be one of: \"on\", \"off\", \"status\"")]
-pub struct SubscriptionsStateError;
+pub struct StateSubCmdError;
 
-impl std::str::FromStr for SubscriptionsState {
-    type Err = SubscriptionsStateError;
+impl std::str::FromStr for StateSubCmd {
+    type Err = StateSubCmdError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "on" => Ok(SubscriptionsState::On),
-            "off" => Ok(SubscriptionsState::Off),
-            "status" => Ok(SubscriptionsState::Status),
-            _ => Err(SubscriptionsStateError),
+            "on" => Ok(StateSubCmd::On),
+            "off" => Ok(StateSubCmd::Off),
+            "status" => Ok(StateSubCmd::Status),
+            _ => Err(StateSubCmdError),
         }
     }
 }

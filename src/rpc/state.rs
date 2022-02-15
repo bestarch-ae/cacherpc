@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::fmt::{self, Debug};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -50,6 +51,7 @@ pub struct State {
     pub worker_id: String,
     pub waf: Option<Waf>,
     pub identity: Option<String>,
+    pub fetch_wide_filters: Arc<AtomicBool>,
 }
 
 pub struct Waf {

@@ -162,12 +162,15 @@ async fn run(options: cli::Options) -> Result<()> {
 
     let (waf_tx, waf_rx) = watch::channel(());
 
+    let fetch_wide_filters = Arc::default(); // by default will be set to false
+
     let control_state = ControlState::new(
         subscriptions_allowed,
         rpc_config_sender,
         options.control_socket_path,
         waf_tx,
         pubsub_actor,
+        Arc::clone(&fetch_wide_filters),
     );
 
     actix::spawn(run_control_interface(control_state));
@@ -216,6 +219,7 @@ async fn run(options: cli::Options) -> Result<()> {
             waf,
             waf_watch: RefCell::new(waf_rx.clone()),
             identity: identity.clone(),
+            fetch_wide_filters: Arc::clone(&fetch_wide_filters),
         };
         let cors = Cors::default()
             .allow_any_origin()
