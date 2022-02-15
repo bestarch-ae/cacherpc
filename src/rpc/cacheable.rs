@@ -294,6 +294,9 @@ impl Cacheable for GetProgramAccounts {
         }
         let filters = self.filters.as_ref();
         let config = &self.config;
+        let wide_filters = state
+            .fetch_wide_filters
+            .load(std::sync::atomic::Ordering::Relaxed);
         match program_state.value().get_account_keys(&self.filters) {
             Ok(cached) => {
                 let res = program_accounts_response(
@@ -323,7 +326,7 @@ impl Cacheable for GetProgramAccounts {
                     Err(_) => None,
                 }
             }
-            Err(Some(filters)) => {
+            Err(Some(filters)) if wide_filters => {
                 // superset filter was found, fetch accounts for it,
                 // so that future cache misses will be prevented
                 drop(program_state);
@@ -333,7 +336,7 @@ impl Cacheable for GetProgramAccounts {
                 actix::spawn(state.fetch_program_accounts(cloned_gpa));
                 None
             }
-            Err(None) => None,
+            _ => None,
         }
     }
 
