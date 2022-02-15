@@ -80,8 +80,7 @@ impl AccountUpdateManager {
                 if let Some((req, _time)) = self.inflight.remove(&id) {
                     match req {
                         InflightRequest::Sub(sub, commitment) => {
-                            warn
-                                !(self.actor_id, request_id = id, error = ?error, key = %sub.key(), commitment = ?commitment, "subscribe failed");
+                            warn!(self.actor_id, request_id = id, error = ?error, key = %sub.key(), commitment = ?commitment, "subscribe failed");
                             metrics()
                                 .subscribe_errors
                                 .with_label_values(&[&self.actor_name])
@@ -98,8 +97,8 @@ impl AccountUpdateManager {
                                 .unsubscribe_errors
                                 .with_label_values(&[&self.actor_name])
                                 .inc();
-                            // it's unclear if we're subscribed now or not, so remove subscription
-                            // *and* key to resubscribe later
+                            // it's unclear if we're subscribed now or not, so
+                            // remove subscription *and* key to resubscribe later
                             if let Some(id) = self.sub_to_id.remove(&(sub, commitment)) {
                                 self.id_to_sub.remove(&id);
                             }
@@ -407,8 +406,7 @@ impl StreamHandler<Result<awc::ws::Frame, awc::error::WsProtocolError>> for Acco
             match item {
                 Frame::Ping(data) => {
                     metrics().bytes_received.with_label_values(&[&self.actor_name]).inc_by(data.len() as u64);
-                    if let Connection
-                        ::Connected { sink, .. } = &mut self.connection {
+                    if let Connection::Connected { sink, .. } = &mut self.connection {
                         if sink.write(awc::ws::Message::Pong(data)).is_err() {
                             warn!("Websocket channel is closed!");
                         }
@@ -499,9 +497,10 @@ impl StreamHandler<Result<awc::ws::Frame, awc::error::WsProtocolError>> for Acco
         }
     }
 
-    fn finished(&mut self, ctx: &mut Context<Self>) {
+    fn finished(&mut self, _: &mut Context<Self>) {
         info!(self.actor_id, "websocket stream finished");
-        ctx.stop();
+        // no need to restart actor here, as there's a lot of other
+        // ways to detect stream termination and restart actor
     }
 }
 

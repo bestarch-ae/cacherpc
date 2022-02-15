@@ -27,7 +27,7 @@ use self::autocmd::AccountCommand;
 use self::ws::{Connection, InflightRequest};
 
 use super::delay::delay_queue;
-use super::manager::{InitManager, WorkerConfig};
+use super::manager::{ForceReconnect, InitManager, WorkerConfig};
 use super::subscription::Subscription;
 use super::{delay::DelayQueueHandle, manager::PubSubManager};
 
@@ -265,6 +265,10 @@ impl AccountUpdateManager {
         Ok(())
     }
 
+    // Attempts to create a new connection to websocket server, if connection already exists,
+    // then under normal circumstance, does nothing and just returns. If forced to recreate
+    // connection, then the old connection (if exists) is left untouched, until a new one can be
+    // created, and only after that the old connection is closed.
     fn connect(&mut self, ctx: &mut Context<Self>) {
         use actix::fut::WrapFuture;
         use backoff::backoff::Backoff;
@@ -337,12 +341,17 @@ impl AccountUpdateManager {
             };
             info!(actor_id, message = "websocket ping sent");
 
-            let old = std::mem::replace(&mut actor.connection, Connection::Connected { sink });
+            ctx.add_stream(stream);
+
+            let mut old = std::mem::replace(&mut actor.connection, Connection::Connected { sink });
             if old.is_connected() {
-                warn!(actor_id, "was connected, should not have happened");
+                warn!(actor_id, "old connection is still alive, closing");
+
+                if let Err(error) = old.send(awc::ws::Message::Close(None)) {
+                    warn!(?error, actor_id, "couldn't close websocket connection");
+                }
             }
 
-            ctx.add_stream(stream);
             info!(actor_id, message = "websocket stream added");
             metrics()
                 .websocket_connected
@@ -403,6 +412,7 @@ impl AccountUpdateManager {
             Subscription::Account(key) => (key, "accountSubscribe"),
             Subscription::Program(key) => (key, "programSubscribe"),
         };
+
         info!(
             self.actor_id,
             message = "subscribe to",
@@ -670,6 +680,15 @@ impl Handler<InitManager> for AccountUpdateManager {
 
     fn handle(&mut self, item: InitManager, _: &mut Context<Self>) {
         self.manager.replace(item.0);
+    }
+}
+
+impl Handler<ForceReconnect> for AccountUpdateManager {
+    type Result = ();
+
+    fn handle(&mut self, _: ForceReconnect, ctx: &mut Self::Context) -> Self::Result {
+        // will restart actor, and reestablish connection along with resetting cache
+        ctx.stop();
     }
 }
 
