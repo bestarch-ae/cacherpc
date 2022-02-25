@@ -422,7 +422,7 @@ impl<'a> ErrorResponse<'a> {
 
 impl<'a> HasOwner for Result<CachedResponse, Error<'a>> {
     fn owner(&self) -> Option<Pubkey> {
-        self.as_ref().ok().map(|data| data.owner).flatten()
+        self.as_ref().ok().and_then(|data| data.owner)
     }
 }
 

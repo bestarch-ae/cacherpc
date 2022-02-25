@@ -17,7 +17,7 @@ pub fn version() -> &'static str {
                     pkg_version,
                     option_env!("CI_COMMIT_SHA")
                         .map(|sha| format!("-{}", sha))
-                        .unwrap_or_else(String::new)
+                        .unwrap_or_default()
                 )
             })
     });
