@@ -17,7 +17,7 @@ use lru::LruCache;
 use mlua::{Lua, LuaOptions, StdLib};
 use serde::Serialize;
 use serde_json::value::RawValue;
-use tokio::sync::{watch, Notify};
+use tokio::sync::{watch, Notify, Semaphore};
 use tracing::{debug, error, info, warn};
 
 use crate::metrics::rpc_metrics as metrics;
@@ -44,6 +44,7 @@ pub struct State {
     pub map_updated: Arc<Notify>,
     pub account_info_request_limit: Arc<SemaphoreQueue>,
     pub program_accounts_request_limit: Arc<SemaphoreQueue>,
+    pub self_initiated_gpa_limit: Arc<Semaphore>,
     pub config: Arc<ArcSwap<Config>>,
     pub config_watch: RefCell<watch::Receiver<Config>>,
     pub waf_watch: RefCell<watch::Receiver<()>>,
@@ -233,7 +234,7 @@ impl State {
             method: GetProgramAccounts::REQUEST_TYPE,
             params: Some(&params),
         };
-        let limit = GetProgramAccounts::get_limit(&self);
+        let limit = &self.self_initiated_gpa_limit;
         let timeout = GetProgramAccounts::get_timeout(&self);
 
         metrics().self_initiated_gpa.inc();
@@ -244,9 +245,9 @@ impl State {
             .start_timer();
 
         let _permit = match limit.acquire().await {
-            Some(permit) => permit, // on success will move out of wait queue
-            None => {
-                warn!("wait queue on request type has been filled up");
+            Ok(permit) => permit, // on success will move out of wait queue
+            Err(error) => {
+                warn!(%error, "cannot get into queue for self initiated gpa");
                 return;
             }
         };

@@ -41,6 +41,12 @@ pub struct Options {
     )]
     pub program_accounts_request_limit: usize,
     #[structopt(
+        long = "self-init-gpa-limit",
+        default_value = "1",
+        help = "maximum number of concurrent cacherpc initiated getProgramAccounts requests"
+    )]
+    pub self_initiated_gpa_limit: usize,
+    #[structopt(
         short = "a",
         long = "account-request-limit",
         default_value = "100",
@@ -267,6 +273,7 @@ impl Config {
                 request_limits: config::RequestLimits {
                     account_info: options.account_info_request_limit,
                     program_accounts: options.program_accounts_request_limit,
+                    self_initiated_gpa: options.self_initiated_gpa_limit,
                 },
                 request_queue_size: config::RequestQueueSize {
                     account_info: account_info_request_queue_size,

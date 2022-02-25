@@ -21,6 +21,7 @@ pub struct Config {
 pub struct RequestLimits {
     pub account_info: usize,
     pub program_accounts: usize,
+    pub self_initiated_gpa: usize,
 }
 
 /// Request and retry timouts in seconds for each type of request

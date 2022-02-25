@@ -16,7 +16,7 @@ use arc_swap::ArcSwap;
 use awc::Client;
 use cache_rpc::types::SemaphoreQueue;
 use lru::LruCache;
-use tokio::sync::{watch, Notify};
+use tokio::sync::{watch, Notify, Semaphore};
 use tracing::info;
 
 pub use cache_rpc::{cli, metrics, pubsub, rpc, types};
@@ -144,6 +144,7 @@ async fn run(options: cli::Options) -> Result<()> {
         config.rpc.request_queue_size.program_accounts,
         config.rpc.request_limits.program_accounts,
     ));
+    let self_initiated_gpa_limit = Arc::new(Semaphore::new(1));
     let total_connection_limit =
         2 * (config.rpc.request_limits.account_info + config.rpc.request_limits.program_accounts);
     let body_cache_size = options.body_cache_size;
@@ -209,6 +210,7 @@ async fn run(options: cli::Options) -> Result<()> {
             map_updated: notify.clone(),
             account_info_request_limit: account_info_request_limit.clone(),
             program_accounts_request_limit: program_accounts_request_limit.clone(),
+            self_initiated_gpa_limit: self_initiated_gpa_limit.clone(),
             config_watch: RefCell::new(rpc_rx.clone()),
             config: rpc_config.clone(),
             lru: RefCell::new(LruCache::new(body_cache_size)),

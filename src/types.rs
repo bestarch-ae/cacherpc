@@ -252,8 +252,7 @@ impl ProgramAccountsDb {
     ) -> AccountSet {
         self.map
             .get_mut(key)
-            .map(|mut state| state.remove_account_keys(filters))
-            .flatten()
+            .and_then(|mut state| state.remove_account_keys(filters))
             .unwrap_or_default()
     }
 
