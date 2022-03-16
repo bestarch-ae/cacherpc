@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 
 use actix_http::error::PayloadError;
+use actix_web::web::Header;
 use actix_web::{web, HttpResponse, ResponseError};
 use backoff::backoff::Backoff;
 use bytes::Bytes;
@@ -10,10 +11,10 @@ use serde_json::value::RawValue;
 use tracing::{error, info, warn};
 
 use crate::metrics::rpc_metrics as metrics;
-use crate::rpc::request::{GetAccountInfo, GetProgramAccounts};
+use crate::rpc::request::{generate_request_id, GetAccountInfo, GetProgramAccounts};
 use crate::rpc::response::identity_response;
 
-use super::request::{Id, Request};
+use super::request::{Id, Request, XRequestId};
 use super::response::Error;
 use super::state::State;
 use super::{backoff_settings, config};
@@ -69,6 +70,7 @@ impl<'de> Deserialize<'de> for OneOrMany<'de> {
 }
 
 pub async fn rpc_handler(
+    xrid: Header<XRequestId>,
     body: Bytes,
     app_state: web::Data<State>,
 ) -> Result<HttpResponse, Error<'static>> {
@@ -110,6 +112,7 @@ pub async fn rpc_handler(
     }
 
     let mut id = Id::Null;
+    let xrid = xrid.into_inner();
 
     // extra header for passthrough requests
     let mut request_header = None;
@@ -137,12 +140,15 @@ pub async fn rpc_handler(
         let arc_state = app_state.clone().into_inner();
         match req.method {
             "getAccountInfo" => {
-                return observe!(req.method, arc_state.process_request::<GetAccountInfo>(req));
+                return observe!(
+                    req.method,
+                    arc_state.process_request::<GetAccountInfo>(req, xrid)
+                );
             }
             "getProgramAccounts" => {
                 return observe!(
                     req.method,
-                    arc_state.process_request::<GetProgramAccounts>(req)
+                    arc_state.process_request::<GetProgramAccounts>(req, xrid)
                 );
             }
             "getIdentity" if app_state.identity.is_some() => {
@@ -176,6 +182,12 @@ pub async fn rpc_handler(
             if let Some(header) = request_header.as_ref() {
                 request = request.append_header(header.clone());
             }
+            request = if let Some(header) = xrid.0.as_ref() {
+                request.append_header(("X-Request-ID", header.as_str()))
+            } else {
+                request.append_header(("X-Request-ID", generate_request_id().as_ref()))
+            };
+            println!("REQ: {:?}", request);
             let resp = request.send_body(body.clone()).await.map_err(|err| {
                 error!(error = %err, "error while streaming response");
                 metrics().streaming_errors.inc();
@@ -231,7 +243,7 @@ pub async fn rpc_handler(
         .streaming(Box::pin(stream)))
 }
 
-pub fn bad_content_type_handler() -> HttpResponse {
+pub async fn bad_content_type_handler() -> HttpResponse {
     HttpResponse::UnsupportedMediaType()
         .body("Supplied content type is not allowed. Content-Type: application/json is required")
 }
@@ -247,6 +259,7 @@ pub async fn metrics_handler(
         .max_permits
         .with_label_values(&["getAccountInfo"])
         .set(current_limits.account_info as i64);
+
     metrics()
         .max_permits
         .with_label_values(&["getProgramAccounts"])

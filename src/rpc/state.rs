@@ -29,7 +29,7 @@ use crate::types::{
 };
 
 use super::cacheable::Cacheable;
-use super::request::{GetProgramAccounts, Id, Request};
+use super::request::{generate_request_id, GetProgramAccounts, Id, Request, XRequestId};
 use super::response::{Error, Response};
 use super::{backoff_settings, Config, HasOwner, LruEntry, SubDescriptor};
 
@@ -162,6 +162,7 @@ impl State {
         limit: &SemaphoreQueue,
         timeout: Duration,
         backoff: u64, // total number of seconds for retries
+        xrid: XRequestId,
     ) -> Result<impl Stream<Item = Result<Bytes, awc::error::PayloadError>>, Error<'a>>
     where
         T: Serialize + Debug + ?Sized,
@@ -190,17 +191,20 @@ impl State {
                 .with_label_values(&[req.method])
                 .observe(limit.available_permits() as f64);
             wait_time.observe_duration();
-            let body = client
+            let mut request = client
                 .post(&self.rpc_url)
                 .timeout(timeout)
-                .append_header(("X-Cache-Request-Method", req.method))
-                .send_json(&req)
-                .await;
+                .append_header(("X-Cache-Request-Method", req.method));
+            request = if let Some(header) = xrid.0.as_ref() {
+                request.append_header(("X-Request-ID", header.as_str()))
+            } else {
+                request.append_header(("X-Request-ID", generate_request_id().as_ref()))
+            };
             metrics()
                 .backend_requests_count
                 .with_label_values(&[req.method])
                 .inc(); // count request attempts, even failed ones
-            match body {
+            match request.send_json(&req).await {
                 Ok(resp) => {
                     break Ok(resp);
                 }
@@ -310,6 +314,7 @@ impl State {
     pub(super) async fn process_request<T: Cacheable + fmt::Display>(
         self: Arc<Self>,
         raw_request: Request<'_, RawValue>,
+        xrid: XRequestId,
     ) -> CacheResult<'_> {
         let mut request = T::parse(&raw_request)?;
         let (is_cacheable, can_use_cache) = match request
@@ -352,6 +357,7 @@ impl State {
             T::get_limit(&self),
             T::get_timeout(&self),
             T::get_backoff(&self),
+            xrid,
         );
         tokio::pin!(wait_for_response);
 

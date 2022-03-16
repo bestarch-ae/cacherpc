@@ -1,3 +1,4 @@
+use actix_http::header::{Header, HeaderName, HeaderValue, InvalidHeaderValue, TryIntoHeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use smallvec::SmallVec;
@@ -35,6 +36,8 @@ pub(super) struct GetProgramAccounts {
     pub(super) filters: Option<Filters>,
     pub(super) valid_filters: bool,
 }
+
+pub struct XRequestId(pub Option<String>);
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(untagged)]
@@ -143,6 +146,30 @@ impl Default for AccountInfoConfig {
     }
 }
 
+impl TryIntoHeaderValue for XRequestId {
+    type Error = InvalidHeaderValue;
+    fn try_into_value(self) -> Result<actix_http::header::HeaderValue, Self::Error> {
+        self.0
+            .map(|s| HeaderValue::from_str(&s))
+            .unwrap_or_else(|| HeaderValue::from_str(""))
+    }
+}
+
+const X_REQUEST_ID_NAME: &str = "X-Request-ID";
+impl Header for XRequestId {
+    fn name() -> HeaderName {
+        HeaderName::from_static(X_REQUEST_ID_NAME)
+    }
+
+    fn parse<M: actix_http::HttpMessage>(msg: &M) -> Result<Self, actix_http::error::ParseError> {
+        let v = msg.headers().get(X_REQUEST_ID_NAME);
+        v.and_then(|v| v.to_str().ok())
+            .map(|s| Self(Some(s.to_string())))
+            .or(Some(Self(None)))
+            .ok_or(actix_http::error::ParseError::Header)
+    }
+}
+
 impl<'a, 'b> mlua::UserData for &'b Request<'a, RawValue> {
     fn add_fields<'lua, F: mlua::UserDataFields<'lua, Self>>(fields: &mut F) {
         fields.add_field_method_get("jsonrpc", |_, this| Ok(this.jsonrpc));
@@ -236,4 +263,17 @@ pub(super) fn parse_params<'a, T: Default + Deserialize<'a>>(
     };
 
     Ok((pubkey, config, request_hash))
+}
+
+#[inline]
+pub(super) fn generate_request_id() -> [u8; 32] {
+    const HEX_DIGITS: &[u8; 22] = b"0123456789abcdefABCDEF";
+    use rand::seq::SliceRandom;
+    let mut id = [0_u8; 32];
+    let mut rng = rand::thread_rng();
+    let closure = || HEX_DIGITS.choose(&mut rng).copied();
+    for (i, b) in std::iter::from_fn(closure).take(32).enumerate() {
+        id[i] = b;
+    }
+    id
 }
