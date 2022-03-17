@@ -267,11 +267,9 @@ pub(super) fn parse_params<'a, T: Default + Deserialize<'a>>(
 pub(super) fn generate_request_id() -> String {
     const HEX_DIGITS: &[u8; 22] = b"0123456789abcdefABCDEF";
     use rand::seq::SliceRandom;
-    let mut id = vec![0_u8; 32];
     let mut rng = rand::thread_rng();
-    let closure = || HEX_DIGITS.choose(&mut rng).copied();
-    for (i, b) in std::iter::from_fn(closure).take(32).enumerate() {
-        id[i] = b;
-    }
-    String::from_utf8(id).unwrap()
+
+    (0..32)
+        .map(|_| *HEX_DIGITS.choose(&mut rng).unwrap() as char)
+        .collect()
 }
