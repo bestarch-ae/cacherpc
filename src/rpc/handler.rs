@@ -11,7 +11,7 @@ use serde_json::value::RawValue;
 use tracing::{error, info, warn};
 
 use crate::metrics::rpc_metrics as metrics;
-use crate::rpc::request::{generate_request_id, GetAccountInfo, GetProgramAccounts};
+use crate::rpc::request::{GetAccountInfo, GetProgramAccounts};
 use crate::rpc::response::identity_response;
 
 use super::request::{Id, Request, XRequestId};
@@ -182,12 +182,7 @@ pub async fn rpc_handler(
             if let Some(header) = request_header.as_ref() {
                 request = request.append_header(header.clone());
             }
-            request = if let Some(header) = xrid.0.as_ref() {
-                request.append_header(("X-Request-ID", header.as_str()))
-            } else {
-                request.append_header(("X-Request-ID", generate_request_id().as_ref()))
-            };
-            println!("REQ: {:?}", request);
+            request = request.append_header(("X-Request-ID", xrid.0.as_str()));
             let resp = request.send_body(body.clone()).await.map_err(|err| {
                 error!(error = %err, "error while streaming response");
                 metrics().streaming_errors.inc();
