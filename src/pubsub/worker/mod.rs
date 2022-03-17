@@ -130,8 +130,7 @@ impl ProgramFilters {
         if let Some(filters) = filters {
             self.filtered
                 .get_mut(key)
-                .map(|entry| entry.remove(filters))
-                .flatten()
+                .and_then(|entry| entry.remove(filters))
         } else {
             self.nofilters.remove(key)
         }
