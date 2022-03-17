@@ -17,6 +17,7 @@ use crate::types::{
     AccountData, AccountInfo, AccountState, Commitment, Encoding, Pubkey, Slot, SolanaContext,
 };
 
+use super::request::XRequestId;
 use super::{hash, LruEntry};
 use super::{
     request::{AccountInfoConfig, Id, ProgramAccountsConfig},
@@ -452,6 +453,7 @@ pub(super) fn account_response<'a, 'b>(
     app_state: &State,
     config: &AccountInfoConfig,
     pubkey: Pubkey,
+    xrid: &XRequestId,
 ) -> Result<HttpResponse, Error<'a>> {
     let request_and_slot_hash = hash((request_hash, acc.1));
     if let Some(result) = app_state.lru.borrow_mut().get(&request_and_slot_hash) {
@@ -529,6 +531,7 @@ pub(super) fn account_response<'a, 'b>(
     Ok(HttpResponse::Ok()
         .append_header(("x-cache-status", "hit"))
         .append_header(("x-cache-type", "data"))
+        .append_header(("X-Request-ID", xrid.0.as_str()))
         .content_type("application/json")
         .body(body))
 }
@@ -540,6 +543,7 @@ pub(super) fn program_accounts_response<'a>(
     filters: Option<&'a Filters>,
     app_state: &State,
     context: Option<Slot>,
+    xrid: &XRequestId,
 ) -> Result<HttpResponse, ProgramAccountsResponseError> {
     struct Encode<'a, K> {
         inner: Ref<'a, K, AccountState>,
@@ -668,6 +672,7 @@ pub(super) fn program_accounts_response<'a>(
     Ok(HttpResponse::Ok()
         .append_header(("x-cache-status", "hit"))
         .append_header(("x-cache-type", "data"))
+        .append_header(("X-Request-ID", xrid.0.as_str()))
         .content_type("application/json")
         .body(body))
 }

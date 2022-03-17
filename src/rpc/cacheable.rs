@@ -12,7 +12,7 @@ use crate::rpc::request::{parse_params, MaybeFilters, ProgramAccountsConfig};
 use crate::types::SolanaContext;
 use crate::types::{AccountContext, Commitment, Encoding, Pubkey, SemaphoreQueue};
 
-use super::request::{AccountAndPubkey, MaybeContext};
+use super::request::{AccountAndPubkey, MaybeContext, XRequestId};
 use super::response::ProgramAccountsResponseError;
 use super::{
     request::{GetAccountInfo, GetProgramAccounts, Id, Request},
@@ -56,6 +56,7 @@ pub(super) trait Cacheable: Sized + 'static {
         &mut self, // gPA may modify internal state of the request object
         id: &Id<'a>,
         state: Arc<State>, // gPA may spawn a future to fetch extra accounts using State
+        xrid: &XRequestId,
     ) -> Option<Result<CachedResponse, Error<'a>>>;
 
     fn put_into_cache(
@@ -150,6 +151,7 @@ impl Cacheable for GetAccountInfo {
         &mut self,
         id: &Id<'a>,
         state: Arc<State>,
+        xrid: &XRequestId,
     ) -> Option<Result<CachedResponse, Error<'a>>> {
         let mut slot_update = None;
         let result = state.accounts.get(&self.pubkey).and_then(|data| {
@@ -179,6 +181,7 @@ impl Cacheable for GetAccountInfo {
                         &state,
                         &self.config,
                         self.pubkey,
+                        xrid,
                     );
                     match resp {
                         Ok(res) => Some(Ok(CachedResponse {
@@ -280,6 +283,7 @@ impl Cacheable for GetProgramAccounts {
         &mut self,
         id: &Id<'a>,
         state: Arc<State>,
+        xrid: &XRequestId,
     ) -> Option<Result<CachedResponse, Error<'a>>> {
         let program_state = state
             .program_accounts
@@ -306,6 +310,7 @@ impl Cacheable for GetProgramAccounts {
                     filters,
                     &state,
                     context,
+                    xrid,
                 );
                 match res {
                     Ok(res) => {
