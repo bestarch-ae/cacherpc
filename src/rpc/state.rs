@@ -29,7 +29,7 @@ use crate::types::{
 };
 
 use super::cacheable::Cacheable;
-use super::request::{generate_request_id, GetProgramAccounts, Id, Request, XRequestId};
+use super::request::{GetProgramAccounts, Id, Request, XRequestId};
 use super::response::{Error, Response};
 use super::{backoff_settings, Config, HasOwner, LruEntry, SubDescriptor};
 
@@ -162,7 +162,7 @@ impl State {
         limit: &SemaphoreQueue,
         timeout: Duration,
         backoff: u64, // total number of seconds for retries
-        xrid: XRequestId,
+        xrid: &XRequestId,
     ) -> Result<impl Stream<Item = Result<Bytes, awc::error::PayloadError>>, Error<'a>>
     where
         T: Serialize + Debug + ?Sized,
@@ -191,15 +191,11 @@ impl State {
                 .with_label_values(&[req.method])
                 .observe(limit.available_permits() as f64);
             wait_time.observe_duration();
-            let mut request = client
+            let request = client
                 .post(&self.rpc_url)
                 .timeout(timeout)
-                .append_header(("X-Cache-Request-Method", req.method));
-            request = if let Some(header) = xrid.0.as_ref() {
-                request.append_header(("X-Request-ID", header.as_str()))
-            } else {
-                request.append_header(("X-Request-ID", generate_request_id().as_ref()))
-            };
+                .append_header(("X-Cache-Request-Method", req.method))
+                .append_header(("X-Request-ID", xrid.0.as_str()));
             metrics()
                 .backend_requests_count
                 .with_label_values(&[req.method])
@@ -319,7 +315,7 @@ impl State {
         let mut request = T::parse(&raw_request)?;
         let (is_cacheable, can_use_cache) = match request
             .is_cacheable(&self)
-            .map(|_| request.get_from_cache(&raw_request.id, Arc::clone(&self)))
+            .map(|_| request.get_from_cache(&raw_request.id, Arc::clone(&self), &xrid))
         {
             Ok(Some(data)) => {
                 let owner = data.owner();
@@ -335,7 +331,7 @@ impl State {
             Err(reason) => {
                 let data = reason
                     .can_use_cache()
-                    .then(|| request.get_from_cache(&raw_request.id, Arc::clone(&self)))
+                    .then(|| request.get_from_cache(&raw_request.id, Arc::clone(&self), &xrid))
                     .flatten();
 
                 if let Some(data) = data {
@@ -357,7 +353,7 @@ impl State {
             T::get_limit(&self),
             T::get_timeout(&self),
             T::get_backoff(&self),
-            xrid,
+            &xrid,
         );
         tokio::pin!(wait_for_response);
 
@@ -368,7 +364,7 @@ impl State {
                     break body?;
                 }
                 _ = notified, if can_use_cache => {
-                    if let Some(data) = request.get_from_cache(&raw_request.id, Arc::clone(&self)) {
+                    if let Some(data) = request.get_from_cache(&raw_request.id, Arc::clone(&self), &xrid) {
                         T::cache_hit_counter().inc();
                         T::cache_filled_counter().inc();
                         self.reset(request.sub_descriptor(), data.owner());
@@ -382,6 +378,7 @@ impl State {
         let mut response = HttpResponse::Ok();
         response
             .append_header(("x-cache-status", "miss"))
+            .append_header(("X-Request-ID", xrid.0.as_str()))
             .content_type("application/json");
 
         let resp = resp.map_err(|err| {

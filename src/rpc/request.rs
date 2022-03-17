@@ -37,7 +37,7 @@ pub(super) struct GetProgramAccounts {
     pub(super) valid_filters: bool,
 }
 
-pub struct XRequestId(pub Option<String>);
+pub struct XRequestId(pub String);
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(untagged)]
@@ -149,9 +149,7 @@ impl Default for AccountInfoConfig {
 impl TryIntoHeaderValue for XRequestId {
     type Error = InvalidHeaderValue;
     fn try_into_value(self) -> Result<actix_http::header::HeaderValue, Self::Error> {
-        self.0
-            .map(|s| HeaderValue::from_str(&s))
-            .unwrap_or_else(|| HeaderValue::from_str(""))
+        HeaderValue::from_str(&self.0)
     }
 }
 
@@ -163,10 +161,10 @@ impl Header for XRequestId {
 
     fn parse<M: actix_http::HttpMessage>(msg: &M) -> Result<Self, actix_http::error::ParseError> {
         let v = msg.headers().get(X_REQUEST_ID_NAME);
-        v.and_then(|v| v.to_str().ok())
-            .map(|s| Self(Some(s.to_string())))
-            .or(Some(Self(None)))
-            .ok_or(actix_http::error::ParseError::Header)
+        let id = v
+            .and_then(|v| v.to_str().map(ToOwned::to_owned).ok())
+            .unwrap_or_else(generate_request_id);
+        Ok(Self(id))
     }
 }
 
@@ -266,14 +264,14 @@ pub(super) fn parse_params<'a, T: Default + Deserialize<'a>>(
 }
 
 #[inline]
-pub(super) fn generate_request_id() -> [u8; 32] {
+pub(super) fn generate_request_id() -> String {
     const HEX_DIGITS: &[u8; 22] = b"0123456789abcdefABCDEF";
     use rand::seq::SliceRandom;
-    let mut id = [0_u8; 32];
+    let mut id = vec![0_u8; 32];
     let mut rng = rand::thread_rng();
     let closure = || HEX_DIGITS.choose(&mut rng).copied();
     for (i, b) in std::iter::from_fn(closure).take(32).enumerate() {
         id[i] = b;
     }
-    id
+    String::from_utf8(id).unwrap()
 }
