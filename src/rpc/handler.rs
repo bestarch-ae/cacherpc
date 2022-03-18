@@ -184,6 +184,7 @@ pub async fn rpc_handler(
                 request = request.append_header(header.clone());
             }
             request = request.append_header(("X-Request-ID", xreqid.as_str()));
+
             let resp = request.send_body(body.clone()).await.map_err(|err| {
                 error!(error = %err, "error while streaming response");
                 metrics().streaming_errors.inc();
