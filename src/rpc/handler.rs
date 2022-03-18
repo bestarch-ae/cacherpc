@@ -173,6 +173,7 @@ pub async fn rpc_handler(
     let url = app_state.rpc_url.clone();
     let error = Error::Timeout(id).error_response();
 
+    let xreqid = xrid.0.clone();
     let stream = stream_generator::generate_stream(move |mut stream| async move {
         let mut backoff = backoff_settings(30);
         let total = metrics().passthrough_total_time.start_timer();
@@ -182,7 +183,7 @@ pub async fn rpc_handler(
             if let Some(header) = request_header.as_ref() {
                 request = request.append_header(header.clone());
             }
-            request = request.append_header(("X-Request-ID", xrid.0.as_str()));
+            request = request.append_header(("X-Request-ID", xreqid.as_str()));
             let resp = request.send_body(body.clone()).await.map_err(|err| {
                 error!(error = %err, "error while streaming response");
                 metrics().streaming_errors.inc();
@@ -235,6 +236,7 @@ pub async fn rpc_handler(
 
     Ok(HttpResponse::Ok()
         .content_type("application/json")
+        .append_header(("X-Request-ID", xrid.0.as_str()))
         .streaming(Box::pin(stream)))
 }
 
