@@ -474,6 +474,7 @@ pub(super) fn account_response<'a, 'b>(
         return Ok(HttpResponse::Ok()
             .append_header(("x-cache-status", "hit"))
             .append_header(("x-cache-type", "lru"))
+            .append_header(("X-Request-ID", xrid.0.as_str()))
             .content_type("application/json")
             .body(body));
     }

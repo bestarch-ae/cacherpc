@@ -649,7 +649,7 @@ dependencies = [
 
 [[package]]
 name = "cache-rpc"
-version = "0.2.13"
+version = "0.2.14"
 dependencies = [
  "actix",
  "actix-codec 0.5.0",
