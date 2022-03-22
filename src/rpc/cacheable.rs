@@ -326,7 +326,7 @@ impl Cacheable for GetProgramAccounts {
                         }))
                     }
                     Err(ProgramAccountsResponseError::Base58) => {
-                        Some(Err(base58_error(id.clone())))
+                        Some(Err(base58_error(id.clone(), xrid.clone())))
                     }
                     Err(_) => None,
                 }
@@ -407,9 +407,10 @@ impl Cacheable for GetProgramAccounts {
     }
 }
 
-fn base58_error(id: Id<'_>) -> Error<'_> {
+fn base58_error(id: Id<'_>, xrid: XRequestId) -> Error<'_> {
     Error::InvalidRequest(
         Some(id),
         Some("Encoded binary (base 58) data should be less than 128 bytes, please use Base64 encoding."),
+        xrid
     )
 }

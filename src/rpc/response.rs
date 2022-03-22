@@ -47,9 +47,9 @@ struct Base58Error;
 #[derive(Debug, ThisError)]
 pub enum Error<'a> {
     #[error("invalid request")]
-    InvalidRequest(Option<Id<'a>>, Option<&'a str>),
+    InvalidRequest(Option<Id<'a>>, Option<&'a str>, XRequestId),
     #[error("waf rejection error")]
-    WAFRejection(Option<Id<'a>>, String),
+    WAFRejection(Option<Id<'a>>, String, XRequestId),
     #[error("invalid param")]
     InvalidParam {
         req_id: Id<'a>,
@@ -61,7 +61,7 @@ pub enum Error<'a> {
     #[error("not enough arguments")]
     NotEnoughArguments(Id<'a>),
     #[error("backend timeout")]
-    Timeout(Id<'a>),
+    Timeout(Id<'a>, XRequestId),
     #[error("forward error")]
     Forward(#[from] awc::error::SendRequestError),
     #[error("streaming error")]
@@ -115,12 +115,6 @@ pub(super) struct RpcErrorOwned {
 impl From<serde_json::Error> for Error<'_> {
     fn from(_err: serde_json::Error) -> Self {
         Error::Parsing(None)
-    }
-}
-
-impl From<awc::error::PayloadError> for Error<'_> {
-    fn from(err: awc::error::PayloadError) -> Self {
-        Error::Streaming(err)
     }
 }
 
@@ -293,11 +287,13 @@ impl<'a> Serialize for EncodedAccountData<'a> {
 impl ResponseError for Error<'_> {
     fn error_response(&self) -> HttpResponse {
         match self {
-            Error::InvalidRequest(req_id, msg) => HttpResponse::Ok()
+            Error::InvalidRequest(req_id, msg, xrid) => HttpResponse::Ok()
                 .content_type("application/json")
+                .append_header(xrid.as_header_tuple())
                 .json(&ErrorResponse::invalid_request(req_id.clone(), *msg)),
-            Error::WAFRejection(req_id, msg) => HttpResponse::Ok()
+            Error::WAFRejection(req_id, msg, xrid) => HttpResponse::Ok()
                 .content_type("application/json")
+                .append_header(xrid.as_header_tuple())
                 .json(&ErrorResponse::waf_rejection(req_id.clone(), msg)),
             Error::InvalidParam {
                 req_id,
@@ -315,15 +311,16 @@ impl ResponseError for Error<'_> {
             Error::NotEnoughArguments(req_id) => HttpResponse::Ok()
                 .content_type("application/json")
                 .json(&ErrorResponse::not_enough_arguments(req_id.clone())),
-            Error::Timeout(req_id) => HttpResponse::Ok()
+            Error::Timeout(req_id, xrid) => HttpResponse::Ok()
                 .content_type("application/json")
+                .append_header(xrid.as_header_tuple())
                 .json(&ErrorResponse::gateway_timeout(Some(req_id.clone()))),
             Error::Forward(_) => HttpResponse::Ok()
                 .content_type("application/json")
                 .json(&ErrorResponse::gateway_timeout(None)),
             Error::Streaming(_) => HttpResponse::Ok()
                 .content_type("application/json")
-                .json(&ErrorResponse::gateway_timeout(None)),
+                .json(&ErrorResponse::streaming_error(None)),
         }
     }
 }
@@ -419,6 +416,18 @@ impl<'a> ErrorResponse<'a> {
             },
         }
     }
+
+    fn streaming_error(id: Option<Id<'a>>) -> ErrorResponse<'a> {
+        ErrorResponse {
+            jsonrpc: "2.0",
+            id,
+            error: RpcError {
+                code: -33001,
+                message: "Streaming error".into(),
+                data: None,
+            },
+        }
+    }
 }
 
 impl<'a> HasOwner for Result<CachedResponse, Error<'a>> {
@@ -474,7 +483,7 @@ pub(super) fn account_response<'a, 'b>(
         return Ok(HttpResponse::Ok()
             .append_header(("x-cache-status", "hit"))
             .append_header(("x-cache-type", "lru"))
-            .append_header(("X-Request-ID", xrid.0.as_str()))
+            .append_header(xrid.as_header_tuple())
             .content_type("application/json")
             .body(body));
     }
@@ -496,7 +505,9 @@ pub(super) fn account_response<'a, 'b>(
             })
             .transpose()
             .map_err(|_| Error::InvalidRequest(Some(req_id.clone()),
-                    Some("Encoded binary (base 58) data should be less than 128 bytes, please use Base64 encoding.")))?
+                    Some("Encoded binary (base 58) data should be less than 128 bytes, please use Base64 encoding."),
+                    xrid.clone()
+                    ))?
             .unwrap_or_else(|| EncodedAccountContext::empty(&ctx));
     let timer = metrics()
         .serialization_time
@@ -532,7 +543,7 @@ pub(super) fn account_response<'a, 'b>(
     Ok(HttpResponse::Ok()
         .append_header(("x-cache-status", "hit"))
         .append_header(("x-cache-type", "data"))
-        .append_header(("X-Request-ID", xrid.0.as_str()))
+        .append_header(xrid.as_header_tuple())
         .content_type("application/json")
         .body(body))
 }
@@ -673,7 +684,7 @@ pub(super) fn program_accounts_response<'a>(
     Ok(HttpResponse::Ok()
         .append_header(("x-cache-status", "hit"))
         .append_header(("x-cache-type", "data"))
-        .append_header(("X-Request-ID", xrid.0.as_str()))
+        .append_header(xrid.as_header_tuple())
         .content_type("application/json")
         .body(body))
 }

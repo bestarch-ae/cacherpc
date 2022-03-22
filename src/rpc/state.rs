@@ -195,7 +195,7 @@ impl State {
                 .post(&self.rpc_url)
                 .timeout(timeout)
                 .append_header(("X-Cache-Request-Method", req.method))
-                .append_header(("X-Request-ID", xrid.0.as_str()));
+                .append_header(xrid.as_header_tuple());
             metrics()
                 .backend_requests_count
                 .with_label_values(&[req.method])
@@ -211,7 +211,7 @@ impl State {
                     }
                     None => {
                         warn!(?req, error=%err, "reporting gateway timeout");
-                        break Err(Error::Timeout(req.id.clone()));
+                        break Err(Error::Timeout(req.id.clone(), xrid.clone()));
                     }
                 },
             }
@@ -378,7 +378,7 @@ impl State {
         let mut response = HttpResponse::Ok();
         response
             .append_header(("x-cache-status", "miss"))
-            .append_header(("X-Request-ID", xrid.0.as_str()))
+            .append_header(xrid.as_header_tuple())
             .content_type("application/json");
 
         let resp = resp.map_err(|err| {
