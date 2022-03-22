@@ -168,7 +168,7 @@ pub async fn rpc_handler(
             }
             method => {
                 metrics().request_types(method).inc();
-                tracing::info!(%method, id=?req.id, "handling uncacheable method");
+                tracing::info!(%method, id=?req.id, "handling passthrough method");
                 request_header = Some(("X-Cache-Request-Method", method.to_string()));
             }
         }
@@ -192,7 +192,7 @@ pub async fn rpc_handler(
             }
             request = request.append_header((X_REQUEST_ID_NAME, xreqid.as_str()));
             let resp = request.send_body(body.clone()).await.map_err(|error| {
-                error!(%error, id="error while streaming response for uncacheable request");
+                error!(%error, id="error while streaming response for passthrough request");
                 metrics().streaming_errors.inc();
                 error
             });
@@ -222,7 +222,7 @@ pub async fn rpc_handler(
                         None => {
                             let mut error_stream = error.into_body();
                             use actix_web::body::MessageBody;
-                            warn!("uncacheable request error, retries exceeded: {:?}", err);
+                            warn!("passthrough request error, retries exceeded: {:?}", err);
                             while let Some(chunk) = futures_util::future::poll_fn(|cx| {
                                 std::pin::Pin::new(&mut error_stream).poll_next(cx)
                             })
