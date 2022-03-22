@@ -10,6 +10,7 @@ variables:
   CARGO_HOME: /cache/cacherpc/.cargo
   CARGO_TARGET_DIR: "/cache/cacherpc/$CI_COMMIT_REF_SLUG/$CI_JOB_NAME"
   CARGO_TARGET_DIR_MASTER: "/cache/cacherpc/master/$CI_JOB_NAME"
+  STAND: tt_dev
 
 stages:
   - pre_build
@@ -32,7 +33,7 @@ include:
     file: 'vars/upver-tag-naming.yml'
   - project: 'shared/tasks'
     ref: master
-    file: 'notify/up-version.yml'
+    file: 'notify/up-version-consul.yml'
   - project: 'shared/tasks'
     ref: master
     file: 'notify/send-failed.yml'
@@ -48,6 +49,12 @@ include:
   - project: 'shared/tasks'
     ref: 'master'
     file: 'upload/github_binary.yml'
+  - project: 'shared/tasks'   
+    ref: 'master'
+    file: 'docker/docker-rust.yml'                  ### build
+  - project: 'shared/tasks'
+    ref: 'master'
+    file: 'deploy/with-ansible-dev.yml'             ### deploy_dev
 
 create_build_image:
   stage: pre_build
@@ -126,85 +133,40 @@ build_artifact:
       - ./${UPLOAD_ARTIFACT}
     expire_in: 1 day
 
-build_docker:
-  stage: build
-  tags: [docker_19_cache]
-  before_script:
-    - docker login -u $REGISTRY_LOGIN -p $REGISTRY_PASS
-    - apk update && apk add git make curl
-  script:
-    - PIPELINE_ID_VERSION=$(curl --user "$REPO_LOGIN:$REPO_PASS" https://$REPO_SRV/repository/$ARTIFACTS_PATH/$APPNAME_SHORT/pipelin-id/$CI_PIPELINE_ID/$VERSION_FILE)
-    - tar -xzf rpm-source.tar.gz
-    - >
-      docker build
-      --build-arg BIN_NAME=${BIN_NAME}
-      --tag $REGISTRY_PROJECT:$PIPELINE_ID_VERSION
-      --tag $REGISTRY_PROJECT:latest
-      -f Dockerfile.dist
-      .
-    - docker push $REGISTRY_PROJECT:$PIPELINE_ID_VERSION
-    - docker push $REGISTRY_PROJECT:latest
-#  only:
-#    - tags
-#    - develop
-#    - master
-#    - web
+deploy_dev:
+  tags: [tt_deploy_dev]
+  variables:
+    LIMIT_HOST: "ad-pub-cacher-13.tt-int.net,ad-pub-cacher-15.tt-int.net"
+    REMOTE_USER: "ci_ssh_solana_cacherpc"
+    APP_PATH: $BIN_PATH
+    APP_USER: sol
 
-deploy_dev_aws:
-  stage: deploy_dev
-  image: gableroux/ansible:2.10.7
-  tags: [docker19_hetz_nocache]
-  before_script:
-    - eval $(ssh-agent -s)
-    - mkdir ~/.ssh/
-    - chmod 700 ~/.ssh
-    - '[[ -f /.dockerenv ]] && echo -e "Host *\n\tStrictHostKeyChecking no\n\n" > ~/.ssh/config'
-    - echo "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
-    - chmod 644 ~/.ssh/known_hosts
-    - echo "$DEPLOY_SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add - > /dev/null
-    - apk update && apk add git make curl
-  script:
-    - PIPELINE_ID_VERSION=$(curl --user "$REPO_LOGIN:$REPO_PASS" https://$REPO_SRV/repository/$ARTIFACTS_PATH/$APPNAME_SHORT/pipelin-id/$CI_PIPELINE_ID/$VERSION_FILE)
-    - git clone https://git.zubr.dev/shared/ci-scripts.git
-    - cd ci-scripts/deploy/cacherpc
-    - ansible --version
-    - ansible-playbook -i tt_stg -e "install_version=${PIPELINE_ID_VERSION}" --private-key ~/.ssh/id_rsa deploy.yml
-  only:
-    - develop
-    - master
-    - tags
-    - web
-
-deploy_dev_aws_cacher_13:
-  extends: .deploy_dev_aws_not_master
+deploy_dev_13_not_master:
+  extends: .deploy_dev
+  tags: [tt_deploy_dev]
   variables:
     LIMIT_HOST: "ad-pub-cacher-13.tt-int.net"
-
-deploy_dev_aws_cacher_15:
-  extends: .deploy_dev_aws_not_master
-  variables:
-    LIMIT_HOST: "ad-pub-cacher-15.tt-int.net"
-
-.deploy_dev_aws_not_master:
-  stage: deploy_dev
-  image: gableroux/ansible:2.10.7
-  tags: [docker19_hetz_nocache]
-  before_script:
-    - eval $(ssh-agent -s)
-    - mkdir ~/.ssh/
-    - chmod 700 ~/.ssh
-    - '[[ -f /.dockerenv ]] && echo -e "Host *\n\tStrictHostKeyChecking no\n\n" > ~/.ssh/config'
-    - echo "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
-    - chmod 644 ~/.ssh/known_hosts
-    - echo "$DEPLOY_SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add - > /dev/null
-    - apk update && apk add git make curl
-  script:
-    - PIPELINE_ID_VERSION=$(curl --user "$REPO_LOGIN:$REPO_PASS" https://$REPO_SRV/repository/$ARTIFACTS_PATH/$APPNAME_SHORT/pipelin-id/$CI_PIPELINE_ID/$VERSION_FILE)
-    - git clone https://git.zubr.dev/shared/ci-scripts.git
-    - cd ci-scripts/deploy/cacherpc
-    - ansible --version
-    - ansible-playbook -i tt_stg -e "install_version=${PIPELINE_ID_VERSION}" --limit ${LIMIT_HOST} --private-key ~/.ssh/id_rsa deploy.yml
+    REMOTE_USER: "ci_ssh_solana_cacherpc"
+    APP_PATH: $BIN_PATH
+    APP_USER: sol
+  only:
   when: manual
   except:
     - master
-    - tags
+    - tags    
+
+deploy_dev_15_not_master:
+  extends: .deploy_dev 
+  tags: [tt_deploy_dev]
+  variables:
+    LIMIT_HOST: "ad-pub-cacher-15.tt-int.net"
+    REMOTE_USER: "ci_ssh_solana_cacherpc"
+    APP_PATH: $BIN_PATH
+    APP_USER: sol
+  only:
+  when: manual
+  except:
+    - master
+    - tags    
+
+

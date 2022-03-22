@@ -2,7 +2,7 @@ use actix_http::header::{Header, HeaderName, HeaderValue, InvalidHeaderValue, Tr
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use smallvec::SmallVec;
-use std::fmt;
+use std::fmt::{self, Display};
 
 use crate::filter::{Filter, Filters};
 use crate::types::{AccountInfo, Commitment, Encoding, Pubkey, Slot, SolanaContext};
@@ -37,6 +37,7 @@ pub(super) struct GetProgramAccounts {
     pub(super) valid_filters: bool,
 }
 
+#[derive(Debug, Default, Clone)]
 pub struct XRequestId(pub String);
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -45,6 +46,13 @@ pub enum Id<'a> {
     Null,
     Num(u64),
     Str(&'a str),
+}
+
+#[derive(Debug)]
+pub enum IdOwned {
+    Null,
+    Num(u64),
+    Str(String),
 }
 
 #[derive(Deserialize, Debug)]
@@ -146,6 +154,12 @@ impl Default for AccountInfoConfig {
     }
 }
 
+impl Display for XRequestId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", X_REQUEST_ID_NAME, self.0)
+    }
+}
+
 impl TryIntoHeaderValue for XRequestId {
     type Error = InvalidHeaderValue;
     fn try_into_value(self) -> Result<actix_http::header::HeaderValue, Self::Error> {
@@ -153,7 +167,7 @@ impl TryIntoHeaderValue for XRequestId {
     }
 }
 
-const X_REQUEST_ID_NAME: &str = "X-Request-ID";
+pub const X_REQUEST_ID_NAME: &str = "X-Request-ID";
 impl Header for XRequestId {
     fn name() -> HeaderName {
         HeaderName::from_static(X_REQUEST_ID_NAME)
@@ -165,6 +179,12 @@ impl Header for XRequestId {
             .and_then(|v| v.to_str().map(ToOwned::to_owned).ok())
             .unwrap_or_else(generate_request_id);
         Ok(Self(id))
+    }
+}
+
+impl XRequestId {
+    pub fn as_header_tuple(&self) -> (&'static str, &str) {
+        (X_REQUEST_ID_NAME, self.0.as_str())
     }
 }
 
@@ -214,6 +234,16 @@ impl fmt::Display for GetProgramAccounts {
             self.pubkey,
             self.commitment()
         )
+    }
+}
+
+impl<'a> From<Id<'a>> for IdOwned {
+    fn from(id: Id<'a>) -> Self {
+        match id {
+            Id::Null => IdOwned::Null,
+            Id::Num(num) => IdOwned::Num(num),
+            Id::Str(s) => IdOwned::Str(s.to_owned()),
+        }
     }
 }
 

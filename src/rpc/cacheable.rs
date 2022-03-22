@@ -47,6 +47,7 @@ pub(super) trait Cacheable: Sized + 'static {
     fn get_limit(state: &State) -> &SemaphoreQueue;
     fn get_timeout(state: &State) -> Duration;
     fn get_backoff(state: &State) -> u64;
+    fn identifier(&self) -> String;
 
     fn is_cacheable(&self, state: &State) -> Result<(), UncacheableReason>;
     // method to check whether cached entry has corresponding websocket subscription
@@ -68,8 +69,12 @@ pub(super) trait Cacheable: Sized + 'static {
 
     fn sub_descriptor(&self) -> SubDescriptor;
 
-    fn handle_parse_error(&self, err: Error<'_>) {
-        tracing::error!(error = %err, "failed to parse response");
+    fn handle_parse_error(&self, error: Error<'_>) {
+        tracing::error!(
+            %error,
+            pubkey=%self.identifier(),
+            "failed to parse request result after streaming"
+        );
     }
 
     // Metrics
@@ -127,6 +132,10 @@ impl Cacheable for GetAccountInfo {
 
     fn get_limit(state: &State) -> &SemaphoreQueue {
         state.account_info_request_limit.as_ref()
+    }
+
+    fn identifier(&self) -> String {
+        self.pubkey.to_string()
     }
 
     // for getAccountInfo requests, we don't need to subscribe in case if the owner program exists,
@@ -261,6 +270,10 @@ impl Cacheable for GetProgramAccounts {
         state.config.load().timeouts.program_accounts_backoff
     }
 
+    fn identifier(&self) -> String {
+        self.pubkey.to_string()
+    }
+
     fn has_active_subscription(&self, state: &State, _owner: Option<Pubkey>) -> SubscriptionActive {
         state.subscription_active(Subscription::Program(self.pubkey), self.commitment(), None)
     }
@@ -326,7 +339,7 @@ impl Cacheable for GetProgramAccounts {
                         }))
                     }
                     Err(ProgramAccountsResponseError::Base58) => {
-                        Some(Err(base58_error(id.clone())))
+                        Some(Err(base58_error(id.clone(), xrid.clone())))
                     }
                     Err(_) => None,
                 }
@@ -407,9 +420,10 @@ impl Cacheable for GetProgramAccounts {
     }
 }
 
-fn base58_error(id: Id<'_>) -> Error<'_> {
+fn base58_error(id: Id<'_>, xrid: XRequestId) -> Error<'_> {
     Error::InvalidRequest(
         Some(id),
         Some("Encoded binary (base 58) data should be less than 128 bytes, please use Base64 encoding."),
+        xrid
     )
 }
