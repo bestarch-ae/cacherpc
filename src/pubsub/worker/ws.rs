@@ -80,7 +80,14 @@ impl AccountUpdateManager {
                 if let Some((req, _time)) = self.inflight.remove(&id) {
                     match req {
                         InflightRequest::Sub(sub, commitment) => {
-                            warn!(self.actor_id, request_id = id, error = ?error, key = %sub.key(), commitment = ?commitment, "subscribe failed");
+                            warn!(
+                                actor=%self.actor_id,
+                                request_id=id,
+                                %error,
+                                key=%sub.key(),
+                                ?commitment,
+                                "subscription attempt failed"
+                            );
                             metrics()
                                 .subscribe_errors
                                 .with_label_values(&[&self.actor_name])
@@ -92,7 +99,14 @@ impl AccountUpdateManager {
                             self.purge_key(ctx, &sub, commitment);
                         }
                         InflightRequest::Unsub(sub, commitment) => {
-                            warn!(self.actor_id, request_id = id, error = ?error, key = %sub.key(), commitment = ?commitment, "unsubscribe failed");
+                            warn!(
+                                actor=%self.actor_id,
+                                request_id=id,
+                                %error,
+                                key=%sub.key(),
+                                ?commitment,
+                                "unsubscribe attempt failed"
+                            );
                             metrics()
                                 .unsubscribe_errors
                                 .with_label_values(&[&self.actor_name])
@@ -110,7 +124,12 @@ impl AccountUpdateManager {
                             // called from `Purge` command, which calls it for us
                         }
                         InflightRequest::SlotSub(_) => {
-                            warn!(self.actor_id, request_id = id, error = ?error, "slot subscribe failed");
+                            warn!(
+                                actor=self.actor_id,
+                                request_id=id,
+                                %error,
+                                "slot subscription failed"
+                            );
                         }
                     }
                 }
@@ -153,9 +172,14 @@ impl AccountUpdateManager {
                                 .with_label_values(&[&self.actor_name])
                                 .set(self.sub_to_id.len() as i64);
 
-                            info
-                                !(self.actor_id, message = "subscribed to stream",
-                                sub_id = sub_id, sub = %sub, commitment = ?commitment, time = ?sent_at.elapsed());
+                            info!(
+                                actor=%self.actor_id,
+                                %sub_id,
+                                pubkey=%sub.key(),
+                                ?commitment,
+                                time=?sent_at.elapsed(),
+                                "subscription is successful"
+                            );
                             metrics()
                                 .time_to_subscribe
                                 .with_label_values(&[&self.actor_name])
@@ -175,12 +199,12 @@ impl AccountUpdateManager {
                                         self.active_accounts.remove(&(sub.key(), commitment));
                                     }
                                     info!(
-                                        self.actor_id,
-                                        message = "unsubscribed from stream",
-                                        sub_id = sub_id,
-                                        key = %sub.key(),
-                                        sub = %sub,
-                                        time = ?sent_at.elapsed(),
+                                        actor=%self.actor_id,
+                                        %sub_id,
+                                        pubkey=%sub.key(),
+                                        ?commitment,
+                                        time=?sent_at.elapsed(),
+                                        "unsubscription is successful"
                                     );
                                     metrics()
                                         .subscriptions_active
@@ -194,8 +218,12 @@ impl AccountUpdateManager {
                                 // no need to call `purge_key` as unsubscription request can only be
                                 // called from `Purge` command, which calls it for us
                                 } else {
-                                    warn
-                                        !(self.actor_id, sub = %sub, commitment = ?commitment, "unsubscribe for unknown subscription");
+                                    warn!(
+                                        actor=%self.actor_id,
+                                        sub=%sub,
+                                        ?commitment,
+                                        "unsubscribed from unknown subscription"
+                                    );
                                 }
                                 metrics()
                                     .id_sub_entries
@@ -207,11 +235,11 @@ impl AccountUpdateManager {
                                     .with_label_values(&[&self.actor_name])
                                     .set(self.sub_to_id.len() as i64);
                             } else {
-                                warn!(self.actor_id, message = "unsubscribe failed", key = %sub.key());
+                                warn!(actor=%self.actor_id, pubkey=%sub.key(), "unsubscription failed");
                             }
                         }
                         InflightRequest::SlotSub(_) => {
-                            info!(self.actor_id, message = "subscribed to slots");
+                            info!(actor=%self.actor_id, "subscribed to slot updates");
                         }
                     }
                 }
@@ -238,9 +266,9 @@ impl AccountUpdateManager {
                                 .insert(sub.key(), params.result, *commitment, true);
                         } else {
                             warn!(
-                                self.actor_id,
-                                message = "unknown subscription",
-                                sub = params.subscription
+                                actor=%self.actor_id,
+                                sub=%params.subscription,
+                                "received account notification for unknown subscription",
                             );
                         }
                         metrics()
@@ -277,7 +305,7 @@ impl AccountUpdateManager {
 
                             if let Some(meta) = self.subs.get_mut(&(*program_sub, *commitment)) {
                                 if meta.first_slot.is_none() {
-                                    info!(program = %program_key, slot, "first update for program");
+                                    info!(program=%program_key, slot, "received first ws update for program");
                                     meta.first_slot.replace(slot);
                                 }
                             }
@@ -330,9 +358,9 @@ impl AccountUpdateManager {
                             }
                         } else {
                             warn!(
-                                self.actor_id,
-                                message = "unknown subscription",
-                                sub = params.subscription
+                                actor=%self.actor_id,
+                                sub=%params.subscription,
+                                "received program notification for unknown subscription",
                             );
                         }
                         metrics()
@@ -364,9 +392,8 @@ impl AccountUpdateManager {
                     }
                     _ => {
                         warn!(
-                            self.actor_id,
-                            message = "unknown notification",
-                            method = method
+                            actor=%self.actor_id,
+                            "received slot notification for unknown subscription",
                         );
                     }
                 }
@@ -389,8 +416,12 @@ impl StreamHandler<Result<awc::ws::Frame, awc::error::WsProtocolError>> for Acco
 
         let item = match item {
             Ok(item) => item,
-            Err(err) => {
-                error!(self.actor_id, error = %err, "websocket read error");
+            Err(error) => {
+                error!(
+                    actor=self.actor_id,
+                    %error,
+                    "actor is terminating websocket connection due to read error"
+                );
                 metrics()
                     .websocket_errors
                     .with_label_values(&[&self.actor_name, "read"])
@@ -417,17 +448,17 @@ impl StreamHandler<Result<awc::ws::Frame, awc::error::WsProtocolError>> for Acco
                 }
                 Frame::Text(text) => {
                     metrics().bytes_received.with_label_values(&[&self.actor_name]).inc_by(text.len() as u64);
-                    self.process_ws_message(ctx, &text).map_err(|err| {
-                            error!(error = %err, bytes = ?text, "error while parsing message");
-                            err
-                        })?
+                    self.process_ws_message(ctx, &text).map_err(|error| {
+                        error!(%error, bytes=?text, "error while parsing message");
+                        error
+                    })?
                 }
                 Frame::Close(reason) => {
-                    warn!(self.actor_id, reason = ?reason, "websocket closing");
+                    warn!(actor=self.actor_id, ?reason, "websocket connection is terminated by server");
                     ctx.stop();
                 }
                 Frame::Binary(msg) => {
-                    warn!(self.actor_id, msg = ?msg, "unexpected binary message");
+                    warn!(actor=self.actor_id, msg = ?msg, "unexpected binary message");
                 }
                 Frame::Continuation(msg) => match msg {
                     ws ::Item::FirstText(bytes) => {
@@ -466,7 +497,10 @@ impl StreamHandler<Result<awc::ws::Frame, awc::error::WsProtocolError>> for Acco
     }
 
     fn started(&mut self, _ctx: &mut Context<Self>) {
-        info!(self.actor_id, "websocket connected");
+        info!(
+            actor=%self.actor_id,
+            "established websocket connection"
+        );
         // subscribe to slots
         let request_id = self.next_request_id();
         let request = serde_json::json!({
@@ -486,7 +520,7 @@ impl StreamHandler<Result<awc::ws::Frame, awc::error::WsProtocolError>> for Acco
         let _ = self.send(&request);
 
         // restore subscriptions
-        info!(self.actor_id, "adding subscriptions");
+        info!(actor = self.actor_id, "adding subscriptions");
         let subs_len = self.subs.len();
         let subs = std::mem::replace(&mut self.subs, HashMap::with_capacity(subs_len));
 
@@ -498,15 +532,15 @@ impl StreamHandler<Result<awc::ws::Frame, awc::error::WsProtocolError>> for Acco
     }
 
     fn finished(&mut self, _: &mut Context<Self>) {
-        info!(self.actor_id, "websocket stream finished");
+        info!(actor = self.actor_id, "websocket connection aborted");
         // no need to restart actor here, as there's a lot of other
         // ways to detect stream termination and restart actor
     }
 }
 
 impl actix::io::WriteHandler<awc::error::WsProtocolError> for AccountUpdateManager {
-    fn error(&mut self, err: awc::error::WsProtocolError, _ctx: &mut Self::Context) -> Running {
-        error!(self.actor_id, message = "websocket write error", error = ?err);
+    fn error(&mut self, error: awc::error::WsProtocolError, _ctx: &mut Self::Context) -> Running {
+        error!(actor=self.actor_id, %error, "actor is terminating websocket connection due to write error");
         metrics()
             .websocket_errors
             .with_label_values(&[&self.actor_name, "write"])
@@ -515,6 +549,6 @@ impl actix::io::WriteHandler<awc::error::WsProtocolError> for AccountUpdateManag
     }
 
     fn finished(&mut self, _ctx: &mut Self::Context) {
-        info!(self.actor_id, "writer closed");
+        info!(actor=%self.actor_id, "websocket writer closed");
     }
 }

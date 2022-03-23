@@ -8,13 +8,13 @@ use bytes::Bytes;
 use futures_util::stream::StreamExt;
 use serde::Deserialize;
 use serde_json::value::RawValue;
-use tracing::{error, info, warn};
+use tracing::{error, warn};
 
 use crate::metrics::rpc_metrics as metrics;
 use crate::rpc::request::{GetAccountInfo, GetProgramAccounts};
 use crate::rpc::response::identity_response;
 
-use super::request::{Id, Request, XRequestId};
+use super::request::{Id, Request, XRequestId, X_REQUEST_ID_NAME};
 use super::response::Error;
 use super::state::State;
 use super::{backoff_settings, config};
@@ -74,9 +74,14 @@ pub async fn rpc_handler(
     body: Bytes,
     app_state: web::Data<State>,
 ) -> Result<HttpResponse, Error<'static>> {
+    let xrid = xrid.into_inner();
+
     let req: OneOrMany<'_> = match serde_json::from_slice(&body) {
         Ok(val) => val,
-        Err(_) => return Ok(Error::InvalidRequest(None, Some("Invalid request")).error_response()),
+        Err(_) => {
+            warn!(xrequestid=%xrid, "invalid request, couldn't parse");
+            return Ok(Error::InvalidRequest(None, Some("Invalid request"), xrid).error_response());
+        }
     };
 
     config::check_config_change(&app_state).await;
@@ -92,7 +97,7 @@ pub async fn rpc_handler(
                     .eval::<(bool, String)>()
             });
 
-            let (ok, err) = match res {
+            let (ok, error) = match res {
                 Ok(tuple) => tuple,
                 Err(e) => {
                     tracing::error!(%e, "Error occured during WAF rules evaluation");
@@ -104,15 +109,14 @@ pub async fn rpc_handler(
                 }
             };
             if !ok {
-                info!(%err, "Request was rejected due to WAF rule violation");
+                warn!(%error, "Request was rejected due to WAF rule violation");
                 metrics().waf_rejections.inc();
-                return Ok(Error::WAFRejection(Some(r.id.clone()), err).error_response());
+                return Ok(Error::WAFRejection(Some(r.id.clone()), error, xrid).error_response());
             }
         }
     }
 
     let mut id = Id::Null;
-    let xrid = xrid.into_inner();
 
     // extra header for passthrough requests
     let mut request_header = None;
@@ -121,7 +125,7 @@ pub async fn rpc_handler(
         id = req.id.clone();
 
         if req.jsonrpc != "2.0" {
-            return Ok(Error::InvalidRequest(Some(id), None).error_response());
+            return Ok(Error::InvalidRequest(Some(id), None, xrid).error_response());
         }
 
         macro_rules! observe {
@@ -140,12 +144,14 @@ pub async fn rpc_handler(
         let arc_state = app_state.clone().into_inner();
         match req.method {
             "getAccountInfo" => {
+                tracing::info!(method=%req.method, id=?req.id, "handling cacheable method");
                 return observe!(
                     req.method,
                     arc_state.process_request::<GetAccountInfo>(req, xrid)
                 );
             }
             "getProgramAccounts" => {
+                tracing::info!(method=%req.method, id=?req.id, "handling cacheable method");
                 return observe!(
                     req.method,
                     arc_state.process_request::<GetProgramAccounts>(req, xrid)
@@ -162,6 +168,7 @@ pub async fn rpc_handler(
             }
             method => {
                 metrics().request_types(method).inc();
+                tracing::info!(%method, id=?req.id, "handling uncacheable method");
                 request_header = Some(("X-Cache-Request-Method", method.to_string()));
             }
         }
@@ -171,11 +178,11 @@ pub async fn rpc_handler(
 
     let client = app_state.client.clone();
     let url = app_state.rpc_url.clone();
-    let error = Error::Timeout(id).error_response();
+    let error = Error::Timeout(id, xrid.clone()).error_response();
 
     let xreqid = xrid.0.clone();
     let stream = stream_generator::generate_stream(move |mut stream| async move {
-        let mut backoff = backoff_settings(30);
+        let mut backoff = backoff_settings(crate::PASSTHROUGH_BACKOFF);
         let total = metrics().passthrough_total_time.start_timer();
         loop {
             let request_time = metrics().passthrough_request_time.start_timer();
@@ -183,11 +190,11 @@ pub async fn rpc_handler(
             if let Some(header) = request_header.as_ref() {
                 request = request.append_header(header.clone());
             }
-            request = request.append_header(("X-Request-ID", xreqid.as_str()));
-            let resp = request.send_body(body.clone()).await.map_err(|err| {
-                error!(error = %err, "error while streaming response");
+            request = request.append_header((X_REQUEST_ID_NAME, xreqid.as_str()));
+            let resp = request.send_body(body.clone()).await.map_err(|error| {
+                error!(%error, id="error while streaming response for uncacheable request");
                 metrics().streaming_errors.inc();
-                err
+                error
             });
             metrics()
                 .backend_requests_count
@@ -215,7 +222,7 @@ pub async fn rpc_handler(
                         None => {
                             let mut error_stream = error.into_body();
                             use actix_web::body::MessageBody;
-                            warn!("request error: {:?}", err);
+                            warn!("uncacheable request error, retries exceeded: {:?}", err);
                             while let Some(chunk) = futures_util::future::poll_fn(|cx| {
                                 std::pin::Pin::new(&mut error_stream).poll_next(cx)
                             })
@@ -236,7 +243,7 @@ pub async fn rpc_handler(
 
     Ok(HttpResponse::Ok()
         .content_type("application/json")
-        .append_header(("X-Request-ID", xrid.0.as_str()))
+        .append_header(xrid.as_header_tuple())
         .streaming(Box::pin(stream)))
 }
 
