@@ -12,13 +12,13 @@ use arc_swap::ArcSwap;
 use awc::Client;
 use backoff::backoff::Backoff;
 use bytes::Bytes;
-use futures_util::stream::{Stream, StreamExt, TryStreamExt};
+use futures_util::stream::{Stream, StreamExt};
 use lru::LruCache;
 use mlua::{Lua, LuaOptions, StdLib};
 use serde::Serialize;
 use serde_json::value::RawValue;
 use tokio::sync::{watch, Notify};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use crate::metrics::rpc_metrics as metrics;
 use crate::pubsub::manager::PubSubManager;
@@ -322,12 +322,25 @@ impl State {
                 self.reset(request.sub_descriptor(), owner);
                 if request.has_active_subscription(&self, owner).await {
                     T::cache_hit_counter().inc();
+                    tracing::info!(id=?raw_request.id, method=%raw_request.method, "got cache hit for request");
                     return data.map(|data| data.response);
                 } else {
+                    tracing::info!(
+                        id=?raw_request.id,
+                        method=%raw_request.method,
+                        "got cache miss for request due to inactive subscription"
+                    );
                     (true, false)
                 }
             }
-            Ok(None) => (true, true),
+            Ok(None) => {
+                tracing::info!(
+                    id=?raw_request.id,
+                    method=%raw_request.method,
+                    "data for request is not present in cache"
+                );
+                (true, true)
+            }
             Err(reason) => {
                 let data = reason
                     .can_use_cache()
@@ -335,10 +348,17 @@ impl State {
                     .flatten();
 
                 if let Some(data) = data {
+                    tracing::info!(id=?raw_request.id, method=%raw_request.method, "got cache hit for request");
                     T::cache_hit_counter().inc();
                     self.reset(request.sub_descriptor(), data.owner());
                     return data.map(|data| data.response);
                 }
+                tracing::info!(
+                    id=?raw_request.id,
+                    method=%raw_request.method,
+                    reason=%reason.as_str(),
+                    "request is uncacheable"
+                );
 
                 metrics()
                     .response_uncacheable
@@ -357,6 +377,11 @@ impl State {
         );
         tokio::pin!(wait_for_response);
 
+        tracing::info!(
+            id=?raw_request.id,
+            %request,
+            "forwarding cacheable request to validator"
+        );
         let resp = loop {
             let notified = self.map_updated.notified();
             tokio::select! {
@@ -381,12 +406,6 @@ impl State {
             .append_header(xrid.as_header_tuple())
             .content_type("application/json");
 
-        let resp = resp.map_err(|err| {
-            error!(error = %err, "error while streaming response");
-            metrics().streaming_errors.inc();
-            err
-        });
-
         if is_cacheable {
             // If gPA already has active subscription, then we shouldn't overwrite existing account
             // entries. For gAI, if we had active subscription, then we wouldn't even make it here
@@ -399,7 +418,16 @@ impl State {
                     tokio::pin!(incoming);
 
                     while let Some(bytes) = incoming.next().await {
-                        let bytes = bytes.map_err(Error::Streaming)?;
+                        let bytes = bytes.map_err(|error| {
+                            error!(
+                                %error,
+                                method=%T::REQUEST_TYPE,
+                                pubkey=%request.identifier(),
+                                "cacheable request streaming error"
+                            );
+                            metrics().streaming_errors.inc();
+                            Error::Streaming(error)
+                        })?;
                         stream.send(Ok::<Bytes, Error<'_>>(bytes)).await;
                     }
                 }
@@ -413,7 +441,11 @@ impl State {
                         if this.is_caching_allowed()
                             && request.put_into_cache(&this, data, overwrite)
                         {
-                            debug!(%request, "cached for key");
+                            info!(
+                                method=%T::REQUEST_TYPE,
+                                pubkey=%request.identifier(),
+                                "cached request result after streaming"
+                            );
                             this.map_updated.notify_waiters();
                             this.subscribe(request.sub_descriptor(), owner);
                         }
@@ -423,7 +455,12 @@ impl State {
                             .backend_errors
                             .with_label_values(&[T::REQUEST_TYPE])
                             .inc();
-                        info!(%request, ?error, "can't cache for key");
+                        warn!(
+                            method=%T::REQUEST_TYPE,
+                            pubkey=%request.identifier(),
+                            ?error,
+                            "cannot cache request result, error during streaming"
+                        );
                     }
                     Err(err) => request.handle_parse_error(err.into()),
                 }
