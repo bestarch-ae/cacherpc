@@ -23,7 +23,7 @@ use tracing::{error, info, warn};
 use crate::metrics::rpc_metrics as metrics;
 use crate::pubsub::manager::PubSubManager;
 use crate::pubsub::subscription::{Subscription, SubscriptionActive};
-use crate::rpc::request::Flatten;
+use crate::rpc::request::{Flatten, IdOwned};
 use crate::types::{
     AccountContext, AccountsDb, BytesChain, Commitment, ProgramAccountsDb, Pubkey, SemaphoreQueue,
 };
@@ -178,7 +178,7 @@ impl State {
             let _permit = match limit.acquire().await {
                 Some(permit) => permit, // on success will move out of wait queue
                 None => {
-                    warn!(?req, "wait queue on request type has been filled up");
+                    warn!(id=?req.id, method=%req.method, "wait queue on request type has been filled up");
                     return Err(Error::Internal(
                         Some(req.id.clone()),
                         Cow::from("Wait limit for RPC requests has been exhausted"),
@@ -210,7 +210,7 @@ impl State {
                         tokio::time::sleep(duration).await;
                     }
                     None => {
-                        warn!(?req, error=%err, "reporting gateway timeout");
+                        warn!(id=?req.id, method=%req.method, error=%err, "reporting gateway timeout for request");
                         break Err(Error::Timeout(req.id.clone(), xrid.clone()));
                     }
                 },
@@ -379,7 +379,7 @@ impl State {
 
         tracing::info!(
             id=?raw_request.id,
-            %request,
+            method=%T::REQUEST_TYPE,
             "forwarding cacheable request to validator"
         );
         let resp = loop {
@@ -406,6 +406,7 @@ impl State {
             .append_header(xrid.as_header_tuple())
             .content_type("application/json");
 
+        let id = IdOwned::from(raw_request.id.clone());
         if is_cacheable {
             // If gPA already has active subscription, then we shouldn't overwrite existing account
             // entries. For gAI, if we had active subscription, then we wouldn't even make it here
@@ -420,6 +421,7 @@ impl State {
                     while let Some(bytes) = incoming.next().await {
                         let bytes = bytes.map_err(|error| {
                             error!(
+                                ?id,
                                 %error,
                                 method=%T::REQUEST_TYPE,
                                 pubkey=%request.identifier(),
@@ -430,6 +432,11 @@ impl State {
                         })?;
                         stream.send(Ok::<Bytes, Error<'_>>(bytes)).await;
                     }
+                    info!(
+                        ?id,
+                        method=%T::REQUEST_TYPE,
+                        "response streaming completed for request"
+                    );
                 }
 
                 let resp = serde_json::from_reader(bytes_chain)
@@ -442,6 +449,7 @@ impl State {
                             && request.put_into_cache(&this, data, overwrite)
                         {
                             info!(
+                                ?id,
                                 method=%T::REQUEST_TYPE,
                                 pubkey=%request.identifier(),
                                 "cached request result after streaming"
@@ -456,6 +464,7 @@ impl State {
                             .with_label_values(&[T::REQUEST_TYPE])
                             .inc();
                         warn!(
+                            ?id,
                             method=%T::REQUEST_TYPE,
                             pubkey=%request.identifier(),
                             ?error,

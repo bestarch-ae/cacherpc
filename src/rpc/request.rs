@@ -48,6 +48,13 @@ pub enum Id<'a> {
     Str(&'a str),
 }
 
+#[derive(Debug)]
+pub enum IdOwned {
+    Null,
+    Num(u64),
+    Str(String),
+}
+
 #[derive(Deserialize, Debug)]
 pub(super) struct AccountAndPubkey {
     pub(super) account: AccountInfo,
@@ -227,6 +234,16 @@ impl fmt::Display for GetProgramAccounts {
             self.pubkey,
             self.commitment()
         )
+    }
+}
+
+impl<'a> From<Id<'a>> for IdOwned {
+    fn from(id: Id<'a>) -> Self {
+        match id {
+            Id::Null => IdOwned::Null,
+            Id::Num(num) => IdOwned::Num(num),
+            Id::Str(s) => IdOwned::Str(s.to_owned()),
+        }
     }
 }
 
