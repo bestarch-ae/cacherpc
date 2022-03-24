@@ -14,7 +14,7 @@ use crate::metrics::rpc_metrics as metrics;
 use crate::rpc::request::{GetAccountInfo, GetProgramAccounts};
 use crate::rpc::response::identity_response;
 
-use super::request::{Id, Request, XRequestId, X_REQUEST_ID_NAME};
+use super::request::{Id, IdOwned, Request, XRequestId, X_REQUEST_ID_NAME};
 use super::response::Error;
 use super::state::State;
 use super::{backoff_settings, config};
@@ -99,8 +99,8 @@ pub async fn rpc_handler(
 
             let (ok, error) = match res {
                 Ok(tuple) => tuple,
-                Err(e) => {
-                    tracing::error!(%e, "Error occured during WAF rules evaluation");
+                Err(error) => {
+                    tracing::error!(%error, id=?r.id, "Error occured during WAF rules evaluation");
                     return Ok(Error::Internal(
                         Some(r.id.clone()),
                         Cow::from("WAF internal error"),
@@ -109,7 +109,7 @@ pub async fn rpc_handler(
                 }
             };
             if !ok {
-                warn!(%error, "Request was rejected due to WAF rule violation");
+                warn!(id=?r.id, %error, "Request was rejected due to WAF rule violation");
                 metrics().waf_rejections.inc();
                 return Ok(Error::WAFRejection(Some(r.id.clone()), error, xrid).error_response());
             }
@@ -168,7 +168,7 @@ pub async fn rpc_handler(
             }
             method => {
                 metrics().request_types(method).inc();
-                tracing::info!(%method, id=?req.id, "handling uncacheable method");
+                tracing::info!(%method, id=?req.id, "handling passthrough method");
                 request_header = Some(("X-Cache-Request-Method", method.to_string()));
             }
         }
@@ -178,9 +178,10 @@ pub async fn rpc_handler(
 
     let client = app_state.client.clone();
     let url = app_state.rpc_url.clone();
-    let error = Error::Timeout(id, xrid.clone()).error_response();
+    let error = Error::Timeout(id.clone(), xrid.clone()).error_response();
 
     let xreqid = xrid.0.clone();
+    let id = IdOwned::from(id);
     let stream = stream_generator::generate_stream(move |mut stream| async move {
         let mut backoff = backoff_settings(crate::PASSTHROUGH_BACKOFF);
         let total = metrics().passthrough_total_time.start_timer();
@@ -192,7 +193,7 @@ pub async fn rpc_handler(
             }
             request = request.append_header((X_REQUEST_ID_NAME, xreqid.as_str()));
             let resp = request.send_body(body.clone()).await.map_err(|error| {
-                error!(%error, id="error while streaming response for uncacheable request");
+                error!(%error, ?id, "error while streaming response for passthrough request");
                 metrics().streaming_errors.inc();
                 error
             });
@@ -209,6 +210,7 @@ pub async fn rpc_handler(
                     while let Some(chunk) = resp.next().await {
                         stream.send(chunk).await;
                     }
+                    tracing::info!(?id, "finished streaming passthrough request");
                     forward_response_time.observe_duration();
                     break;
                 }
@@ -222,7 +224,7 @@ pub async fn rpc_handler(
                         None => {
                             let mut error_stream = error.into_body();
                             use actix_web::body::MessageBody;
-                            warn!("uncacheable request error, retries exceeded: {:?}", err);
+                            warn!(error=%err, ?id, "passthrough request error, retries exceeded");
                             while let Some(chunk) = futures_util::future::poll_fn(|cx| {
                                 std::pin::Pin::new(&mut error_stream).poll_next(cx)
                             })
