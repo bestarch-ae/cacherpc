@@ -271,6 +271,7 @@ async fn run(options: cli::Options) -> Result<()> {
         let addr = stream.peer_addr().unwrap();
         tracing::info!(ip = %addr.ip(), port = %addr.port(), "got incomming connection");
     })
+    .keep_alive(Duration::from_secs(90))
     .bind(bind_addr)
     .with_context(|| format!("failed to bind to {}", bind_addr))?
     .run()
