@@ -57,6 +57,7 @@ async fn main() -> Result<()> {
             use tracing::Level;
             match level.to_lowercase().as_str() {
                 "debug" => Level::DEBUG,
+                "trace" => Level::TRACE,
                 "warn" => Level::WARN,
                 "error" => Level::ERROR,
                 _ => Level::INFO,
@@ -264,6 +265,11 @@ async fn run(options: cli::Options) -> Result<()> {
                     .route(web::post().to(rpc::handler::bad_content_type_handler)),
             )
             .service(web::resource("/metrics").route(web::get().to(rpc::metrics_handler)))
+    })
+    .on_connect(|c, _| {
+        let stream = c.downcast_ref::<actix_web::rt::net::TcpStream>().unwrap();
+        let addr = stream.peer_addr().unwrap();
+        tracing::info!(ip = %addr.ip(), port = %addr.port(), "got incomming connection");
     })
     .bind(bind_addr)
     .with_context(|| format!("failed to bind to {}", bind_addr))?
