@@ -269,9 +269,10 @@ async fn run(options: cli::Options) -> Result<()> {
     .on_connect(|c, _| {
         let stream = c.downcast_ref::<actix_web::rt::net::TcpStream>().unwrap();
         let addr = stream.peer_addr().unwrap();
-        tracing::info!(ip = %addr.ip(), port = %addr.port(), "got incomming connection");
+        tracing::debug!(ip = %addr.ip(), port = %addr.port(), "got incomming connection");
     })
-    .keep_alive(Duration::from_secs(90))
+    .keep_alive(options.keep_alive)
+    .client_request_timeout(Duration::ZERO)
     .bind(bind_addr)
     .with_context(|| format!("failed to bind to {}", bind_addr))?
     .run()
