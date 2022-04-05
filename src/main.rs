@@ -1,5 +1,6 @@
 use actix_web::http::header;
 use cache_rpc::control::{handle_command, run_control_interface, ControlState, RpcConfigSender};
+use cache_rpc::CACHER_LOG_LEVEL;
 use either::Either;
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -50,18 +51,35 @@ async fn main() -> Result<()> {
     };
     let (writer, _guard) = tracing_appender::non_blocking(writer);
 
+    let level = std::env::var(CACHER_LOG_LEVEL)
+        .ok()
+        .map(|level| {
+            use tracing::Level;
+            match level.to_lowercase().as_str() {
+                "debug" => Level::DEBUG,
+                "trace" => Level::TRACE,
+                "warn" => Level::WARN,
+                "error" => Level::ERROR,
+                _ => Level::INFO,
+            }
+        })
+        .unwrap_or(tracing::Level::INFO);
     match options.log_format {
         cli::LogFormat::Json => {
             let subscriber = fmt::Subscriber::builder()
                 .with_thread_names(true)
                 .with_writer(writer)
+                .with_max_level(level)
                 .with_timer(fmt::time::ChronoLocal::rfc3339())
                 .json()
                 .finish();
             tracing::subscriber::set_global_default(subscriber).unwrap();
         }
         cli::LogFormat::Plain => {
-            let subscriber = fmt::Subscriber::builder().with_writer(writer).finish();
+            let subscriber = fmt::Subscriber::builder()
+                .with_max_level(level)
+                .with_writer(writer)
+                .finish();
             tracing::subscriber::set_global_default(subscriber).unwrap();
         }
     };
@@ -69,7 +87,7 @@ async fn main() -> Result<()> {
     let span = tracing::span!(tracing::Level::INFO, "global", version = %metrics::version());
     let _enter = span.enter();
 
-    info!(?options, "configuration options");
+    info!(?options, "started cache-rpc with configuration");
 
     run(options).await?;
     Ok(())
@@ -248,6 +266,13 @@ async fn run(options: cli::Options) -> Result<()> {
             )
             .service(web::resource("/metrics").route(web::get().to(rpc::metrics_handler)))
     })
+    .on_connect(|c, _| {
+        let stream = c.downcast_ref::<actix_web::rt::net::TcpStream>().unwrap();
+        let addr = stream.peer_addr().unwrap();
+        tracing::debug!(ip = %addr.ip(), port = %addr.port(), "got incomming connection");
+    })
+    .keep_alive(options.keep_alive)
+    .client_request_timeout(Duration::ZERO)
     .bind(bind_addr)
     .with_context(|| format!("failed to bind to {}", bind_addr))?
     .run()

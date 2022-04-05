@@ -128,6 +128,13 @@ pub struct Options {
         parse(try_from_str = parse_identity)
     )]
     pub identity: Option<String>,
+    #[structopt(
+        long = "keep-alive",
+        help = "time duration, after which connection to server will be aborted, if no data is received over it",
+        default_value = "30s",
+        parse(try_from_str = humantime::parse_duration)
+    )]
+    pub keep_alive: Duration,
 }
 
 #[derive(Debug)]

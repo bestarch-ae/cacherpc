@@ -35,10 +35,10 @@ pub struct Timeouts {
 impl Default for Timeouts {
     fn default() -> Self {
         Self {
-            account_info_request: 30,
-            program_accounts_request: 60,
-            account_info_backoff: 30,
-            program_accounts_backoff: 60,
+            account_info_request: crate::DEFAULT_GAI_TIMEOUT,
+            program_accounts_request: crate::DEFAULT_GPA_TIMEOUT,
+            account_info_backoff: crate::DEFAULT_GAI_BACKOFF,
+            program_accounts_backoff: crate::DEFAULT_GPA_BACKOFF,
         }
     }
 }

@@ -187,15 +187,18 @@ impl AccountUpdateManager {
                     .send(awc::ws::Message::Ping(b"hello?".as_ref().into()))
                     .is_err()
                 {
-                    warn!(actor_id = actor.actor_id, "failed to send ping");
+                    warn!(
+                        actor = actor.actor_id,
+                        "failed to send websocket healthcheck ping, will terminate actor"
+                    );
                     ctx.stop();
                 }
 
                 let elapsed = actor.last_received_at.elapsed();
                 if elapsed > WEBSOCKET_PING_TIMEOUT {
                     warn!(
-                        actor_id = actor.actor_id,
-                        "no messages received in {:?}, assume connection lost ({:?})",
+                        actor=actor.actor_id,
+                        "no messages received in {:?}, assume connection lost ({:?}), terminating actor",
                         elapsed,
                         actor.last_received_at
                     );
@@ -226,7 +229,7 @@ impl AccountUpdateManager {
                     .set(actor.inflight.len() as i64);
                 if dead_requests > DEAD_REQUEST_LIMIT {
                     warn!(
-                        message = "too many dead requests, disconnecting",
+                        message = "too many dead requests, disconnecting from websocket server",
                         count = dead_requests
                     );
                     ctx.stop();
@@ -248,7 +251,10 @@ impl AccountUpdateManager {
             .map(|diff| diff > self.config.slot_distance as u64)
             .unwrap_or(false);
         if behind {
-            error!("websocket slot behind rpc, stopping");
+            error!(
+                actor=%self.actor_id,
+                "websocket slot behind rpc, terminating websocket connection"
+            );
             ctx.stop()
         }
     }
@@ -334,11 +340,14 @@ impl AccountUpdateManager {
                 .write(actixws::Message::Ping(b"check connection".as_ref().into()))
                 .is_err()
             {
-                error!(actor_id, "failed to send check msg");
+                error!(
+                    actor = actor_id,
+                    "failed to send healthcheck message to websocket server, terminating actor"
+                );
                 ctx.stop();
                 return;
             };
-            info!(actor_id, message = "websocket ping sent");
+            debug!(actor = actor_id, "websocket ping sent");
 
             ctx.add_stream(stream);
 
@@ -351,7 +360,10 @@ impl AccountUpdateManager {
                 }
             }
 
-            info!(actor_id, message = "websocket stream added");
+            info!(
+                actor = actor_id,
+                "websocket data stream has been added to actor"
+            );
             metrics()
                 .websocket_connected
                 .with_label_values(&[&actor.actor_name])
@@ -359,7 +371,10 @@ impl AccountUpdateManager {
             actor.last_received_at = Instant::now();
         });
         ctx.wait(fut);
-        info!(self.actor_id, message = "connection future complete");
+        debug!(
+            actor = self.actor_id,
+            message = "websocket connection future complete"
+        );
         self.update_status();
     }
 
@@ -520,7 +535,7 @@ impl AccountUpdateManager {
                 ctx.cancel_future(handle);
             }
             None => {
-                debug!(key = %sub.key(), "filter added");
+                debug!(pubkey=%sub.key(), "new filter added for program");
                 metrics()
                     .filters
                     .with_label_values(&[&self.actor_name])
@@ -687,6 +702,7 @@ impl Handler<ForceReconnect> for AccountUpdateManager {
 
     fn handle(&mut self, _: ForceReconnect, ctx: &mut Self::Context) -> Self::Result {
         // will restart actor, and reestablish connection along with resetting cache
+        tracing::warn!(actor=%self.actor_id, "forcing websocket reconnection on actor");
         ctx.stop();
     }
 }
