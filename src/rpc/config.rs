@@ -113,15 +113,27 @@ pub(super) async fn check_config_change(state: &web::Data<State>) {
     use futures_util::FutureExt;
     // apply new config (if any)
     {
-        let mut rx = state.config_watch.borrow_mut();
-        if rx.changed().now_or_never().is_some() {
-            apply_config(state, rx.borrow().clone()).await;
+        let config = {
+            let mut rx = state.config_watch.borrow_mut();
+            if rx.changed().now_or_never().is_some() {
+                Some(rx.borrow().clone())
+            } else {
+                None
+            }
+        };
+        if let Some(config) = config {
+            apply_config(state, config).await;
         }
     }
     // apply new lua rules (if any)
     {
-        let mut rx = state.waf_watch.borrow_mut();
-        if rx.changed().now_or_never().is_some() {
+        let changed = state
+            .waf_watch
+            .borrow_mut()
+            .changed()
+            .now_or_never()
+            .is_some();
+        if changed {
             if let Some(ref waf) = state.waf {
                 if let Err(err) = waf.reload() {
                     warn!(error = %err, "coudn't read waf rules from file");

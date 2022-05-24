@@ -412,7 +412,8 @@ impl State {
             // entries. For gAI, if we had active subscription, then we wouldn't even make it here
             let overwrite = !request.has_active_subscription(&self, None).await;
             let this = Arc::clone(&self);
-            let stream = stream_generator::generate_try_stream(move |mut stream| async move {
+            let (stream, receiver) = tokio::sync::mpsc::channel(100);
+            actix_web::rt::spawn(async move {
                 let mut bytes_chain = BytesChain::new();
                 {
                     let incoming = collect_bytes(T::REQUEST_TYPE, resp, &mut bytes_chain);
@@ -430,7 +431,8 @@ impl State {
                             metrics().streaming_errors.inc();
                             Error::Streaming(error)
                         })?;
-                        stream.send(Ok::<Bytes, Error<'_>>(bytes)).await;
+                        // client can be already dead
+                        let _ = stream.send(Ok::<Bytes, Error<'_>>(bytes)).await;
                     }
                     info!(
                         ?id,
@@ -473,10 +475,10 @@ impl State {
                     }
                     Err(err) => request.handle_parse_error(err.into()),
                 }
-
-                Ok(())
+                Ok::<(), Error<'_>>(())
             });
-            Ok(response.streaming(Box::pin(stream)))
+            let receiver = tokio_stream::wrappers::ReceiverStream::new(receiver);
+            Ok(response.streaming(Box::pin(receiver)))
         } else {
             Ok(response.streaming(resp))
         }
