@@ -475,7 +475,7 @@ impl State {
                     }
                     Err(err) => request.handle_parse_error(err.into()),
                 }
-                Ok::<(), Error>(())
+                Ok::<(), Error<'_>>(())
             });
             let receiver = tokio_stream::wrappers::ReceiverStream::new(receiver);
             Ok(response.streaming(Box::pin(receiver)))
