@@ -12,6 +12,7 @@ use arc_swap::ArcSwap;
 use awc::Client;
 use backoff::backoff::Backoff;
 use bytes::Bytes;
+use dashmap::DashMap;
 use futures_util::stream::{Stream, StreamExt};
 use lru::LruCache;
 use mlua::{Lua, LuaOptions, StdLib};
@@ -39,6 +40,7 @@ pub struct State {
     pub accounts: AccountsDb,
     pub program_accounts: ProgramAccountsDb,
     pub client: Client,
+    pub executing_gpa: Arc<DashMap<u64, Arc<Notify>>>,
     pub pubsub: PubSubManager,
     pub rpc_url: String,
     pub map_updated: Arc<Notify>,
@@ -368,6 +370,40 @@ impl State {
             }
         };
 
+        if can_use_cache {
+            if let Some(progress) = request.in_progress(&self) {
+                info!(
+                    id=?raw_request.id,
+                    "request is already in progress, waiting for cache"
+                );
+                let timeout =
+                    Duration::from_secs(self.config.load().timeouts.in_progress_request_wait);
+                match tokio::time::timeout(timeout, progress.notified()).await {
+                    Ok(_) => {
+                        info!(
+                            id=?raw_request.id,
+                            "request finished, checking cache"
+                        );
+                        if let Some(data) =
+                            request.get_from_cache(&raw_request.id, Arc::clone(&self), &xrid)
+                        {
+                            T::cache_hit_counter().inc();
+                            T::cache_filled_counter().inc();
+                            self.reset(request.sub_descriptor(), data.owner());
+                            return data.map(|data| data.response);
+                        }
+                    }
+                    Err(error) => {
+                        error!(%error, id=?raw_request.id, "timeout on wait for executing request's response");
+                        return Err(Error::Timeout(raw_request.id, xrid));
+                    }
+                }
+            }
+        }
+
+        if is_cacheable {
+            request.track_execution(&self);
+        }
         let wait_for_response = self.request(
             &raw_request,
             T::get_limit(&self),
@@ -393,6 +429,7 @@ impl State {
                         T::cache_hit_counter().inc();
                         T::cache_filled_counter().inc();
                         self.reset(request.sub_descriptor(), data.owner());
+                        request.finish_execution(&self, false);
                         return data.map(|data| data.response);
                     }
                     continue;
@@ -429,6 +466,7 @@ impl State {
                                 "cacheable request streaming error"
                             );
                             metrics().streaming_errors.inc();
+                            request.finish_execution(&this, false);
                             Error::Streaming(error)
                         })?;
                         // client can be already dead
@@ -444,7 +482,7 @@ impl State {
                 let resp = serde_json::from_reader(bytes_chain)
                     .map(|wrap: Flatten<Response<T::ResponseData>>| wrap.inner);
 
-                match resp {
+                let notify = match resp {
                     Ok(Response::Result(data)) => {
                         let owner = data.owner();
                         if this.is_caching_allowed()
@@ -458,6 +496,9 @@ impl State {
                             );
                             this.map_updated.notify_waiters();
                             this.subscribe(request.sub_descriptor(), owner);
+                            true
+                        } else {
+                            false
                         }
                     }
                     Ok(Response::Error(error)) => {
@@ -472,9 +513,14 @@ impl State {
                             ?error,
                             "cannot cache request result, error during streaming"
                         );
+                        false
                     }
-                    Err(err) => request.handle_parse_error(err.into()),
-                }
+                    Err(err) => {
+                        request.handle_parse_error(err.into());
+                        false
+                    }
+                };
+                request.finish_execution(&this, notify);
                 Ok::<(), Error<'_>>(())
             });
             let receiver = tokio_stream::wrappers::ReceiverStream::new(receiver);

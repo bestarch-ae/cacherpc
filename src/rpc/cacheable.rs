@@ -1,10 +1,13 @@
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Duration;
 
 use prometheus::IntCounter;
 use serde::de::DeserializeOwned;
 use serde_json::value::RawValue;
+use tokio::sync::Notify;
 
 use crate::metrics::rpc_metrics as metrics;
 use crate::pubsub::subscription::{Subscription, SubscriptionActive};
@@ -52,6 +55,14 @@ pub(super) trait Cacheable: Sized + 'static {
     fn is_cacheable(&self, state: &State) -> Result<(), UncacheableReason>;
     // method to check whether cached entry has corresponding websocket subscription
     fn has_active_subscription(&self, state: &State, owner: Option<Pubkey>) -> SubscriptionActive;
+
+    fn in_progress(&self, _: &State) -> Option<Arc<Notify>> {
+        None
+    }
+
+    fn track_execution(&self, _: &State) {}
+
+    fn finish_execution(&self, _: &State, _: bool) {}
 
     fn get_from_cache<'a>(
         &mut self, // gPA may modify internal state of the request object
@@ -256,6 +267,41 @@ impl Cacheable for GetProgramAccounts {
             filters,
             valid_filters,
         })
+    }
+
+    fn in_progress(&self, state: &State) -> Option<Arc<Notify>> {
+        let mut hasher = DefaultHasher::new();
+        self.hash(&mut hasher);
+        let hash = hasher.finish();
+        state
+            .executing_gpa
+            .get(&hash)
+            .map(|r| Arc::clone(r.value()))
+    }
+
+    fn track_execution(&self, state: &State) {
+        let mut hasher = DefaultHasher::new();
+        self.hash(&mut hasher);
+        let hash = hasher.finish();
+        let progress = Arc::default();
+        if state.executing_gpa.insert(hash, progress).is_some() {
+            tracing::warn!(
+                "new execution tracking for gPA is being initialized while old one still exists"
+            );
+        }
+    }
+
+    fn finish_execution(&self, state: &State, notify: bool) {
+        let mut hasher = DefaultHasher::new();
+        self.hash(&mut hasher);
+        let hash = hasher.finish();
+        match state.executing_gpa.remove(&hash) {
+            Some((_, progress)) if notify => progress.notify_waiters(),
+            None => {
+                tracing::warn!(request=%self, "finished gPA execution that hasn't been tracked")
+            }
+            _ => (),
+        }
     }
 
     fn get_limit(state: &State) -> &SemaphoreQueue {
