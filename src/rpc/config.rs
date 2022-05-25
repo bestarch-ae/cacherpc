@@ -30,6 +30,7 @@ pub struct Timeouts {
     pub program_accounts_request: u64,
     pub account_info_backoff: u64,
     pub program_accounts_backoff: u64,
+    pub in_progress_request_wait: u64,
 }
 
 impl Default for Timeouts {
@@ -39,6 +40,7 @@ impl Default for Timeouts {
             program_accounts_request: crate::DEFAULT_GPA_TIMEOUT,
             account_info_backoff: crate::DEFAULT_GAI_BACKOFF,
             program_accounts_backoff: crate::DEFAULT_GPA_BACKOFF,
+            in_progress_request_wait: crate::IN_PROGRESS_REQUEST_WAIT_TIMEOUT,
         }
     }
 }

@@ -116,6 +116,7 @@ async fn config_read_loop(path: PathBuf, rpc: Arc<watch::Sender<rpc::Config>>) {
 async fn run(options: cli::Options) -> Result<()> {
     let accounts = AccountsDb::new();
     let program_accounts = ProgramAccountsDb::default();
+    let executing_gpa = Arc::default();
 
     let rpc_slot = Arc::new(AtomicU64::new(0));
     let _rpc_monitor = cache_rpc::rpc::monitor::RpcMonitor::init(
@@ -221,6 +222,7 @@ async fn run(options: cli::Options) -> Result<()> {
         let state = rpc::state::State {
             accounts: accounts.clone(),
             program_accounts: program_accounts.clone(),
+            executing_gpa: Arc::clone(&executing_gpa),
             client,
             pubsub: pubsub.clone(),
             rpc_url: rpc_url.clone(),

@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use smallvec::SmallVec;
 use std::fmt::{self, Display};
+use std::hash::Hash;
 
 use crate::filter::{Filter, Filters};
 use crate::types::{AccountInfo, Commitment, Encoding, Pubkey, Slot, SolanaContext};
@@ -90,7 +91,17 @@ pub(super) struct ProgramAccountsConfig {
     pub(super) with_context: Option<bool>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+impl Hash for GetProgramAccounts {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.pubkey.hash(state);
+        self.config.filters.hash(state);
+        if let Some(ref c) = self.config.commitment {
+            c.commitment.hash(state);
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone, Hash)]
 #[serde(from = "SmallVec<[Filter; 3]>")]
 pub(super) enum MaybeFilters {
     Valid(Filters),
