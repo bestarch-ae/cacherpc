@@ -5,7 +5,7 @@ variables:
   RPM_DEB_REPO_PATH: dev-cacherpc-apt
 
   BIN_NAME: cache-rpc
-  BIN_PATH: /usr/sbin
+  BIN_PATH: /opt/cacherpc-bin/
   BUILD_IMAGE: $REGISTRY_PROJECT:build-$CI_COMMIT_REF_SLUG
   CARGO_HOME: /cache/cacherpc/.cargo
   CARGO_TARGET_DIR: "/cache/cacherpc/$CI_COMMIT_REF_SLUG/$CI_JOB_NAME"
@@ -54,7 +54,7 @@ include:
     file: 'docker/docker-rust.yml'                  ### build
   - project: 'shared/tasks'
     ref: 'master'
-    file: 'deploy/with-ansible-dev.yml'             ### deploy_dev
+    file: 'deploy/with-ansible-dev-v2.yml'             ### deploy_dev
 
 create_build_image:
   stage: pre_build
